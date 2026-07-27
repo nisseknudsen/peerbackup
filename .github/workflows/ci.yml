@@ -21,7 +21,7 @@ jobs:
     name: shellcheck
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: shellcheck (warnings and above)
         run: |
           docker run --rm -v "$PWD:/mnt" koalaman/shellcheck:stable \
@@ -36,7 +36,7 @@ jobs:
     name: rust (fmt, clippy, tests)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -64,14 +64,14 @@ jobs:
     name: host tooling (no docker, no root)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - run: ./deploy/test-host-tooling.sh
 
   compose-e2e:
     name: compose + real restic + real rest-server
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: install restic (pinned, checksum verified)
         run: |
@@ -93,7 +93,7 @@ jobs:
     name: provisioning lifecycle (real loop devices)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # Runs as root on the runner rather than in a nested privileged container:
       # the runner's /tmp is real ext4, which is required because the test asserts
