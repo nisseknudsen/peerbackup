@@ -1,20 +1,14 @@
 //! The engine seam.
 //!
-//! peerbackup does not implement backup. It drives stock `restic`, which has
-//! years of people successfully restoring from it, and keeps its own code on the
-//! part nobody else has built: multi-peer bookkeeping, canary verification,
-//! evidence, and the recovery bundle.
+//! peerbackup drives stock `restic` rather than implementing backup, and keeps
+//! its own code on the parts nobody else has built: multi-peer bookkeeping,
+//! canary verification, evidence, recovery bundles.
 //!
-//! This trait is deliberately **domain-shaped**, not a mirror of restic's CLI.
-//! Four methods named for what peerbackup needs. Two consequences:
+//! The trait is domain-shaped, not a mirror of restic's CLI. Four methods named
+//! for what peerbackup needs, so swapping the engine touches one file and tests
+//! can inject faults at the boundary where the three-state model lives.
 //!
-//!   * Swapping the engine (rustic once it leaves beta, or a direct
-//!     implementation) touches one file rather than every caller.
-//!   * Tests can substitute a fake and inject faults at exactly the boundary
-//!     where the three-state model lives.
-//!
-//! The important asymmetry: `verify_subset` returns [`VerifyOutcome`], not
-//! `Result`. See [`outcome`] for why.
+//! `verify_subset` returns [`VerifyOutcome`], not `Result`. See [`outcome`].
 
 pub mod outcome;
 pub mod restic;
@@ -44,9 +38,8 @@ pub struct SnapshotMeta {
     pub paths: Vec<PathBuf>,
 }
 
-/// A file pulled back out of a repository, with the digest we computed on
-/// arrival. The digest is the point: a restore that produced bytes is not the
-/// same as a restore that produced the *right* bytes.
+/// A file pulled back out, with the digest computed on arrival. The digest is
+/// the point: bytes restored is not the same as the *right* bytes restored.
 #[derive(Debug, Clone)]
 pub struct RestoredFile {
     pub path: PathBuf,
@@ -54,11 +47,8 @@ pub struct RestoredFile {
     pub bytes: u64,
 }
 
-/// Something went wrong doing an operation whose failure is not a statement
-/// about data integrity (backup, restore, listing).
-///
-/// Verification does not use this type. It returns [`VerifyOutcome`], because
-/// "could not check" and "checked and it is bad" must not share an arm.
+/// A failed operation whose failure says nothing about data integrity.
+/// Verification does not use this: it returns [`VerifyOutcome`].
 #[derive(Debug, Clone)]
 pub struct EngineError {
     /// restic's message, already stripped of its Go trace.
@@ -80,12 +70,9 @@ impl std::error::Error for EngineError {}
 /// Options for taking a snapshot.
 #[derive(Debug, Clone, Default)]
 pub struct SnapshotOpts {
-    /// Cap upload throughput, in KiB/s. `None` means unlimited.
-    ///
-    /// This is on the seam rather than in a scheduler because a 300GB seed at
-    /// 40Mbps saturates a household uplink for seventeen hours, and the most
-    /// likely way this project dies is someone switching it off after a ruined
-    /// video call.
+    /// Cap upload throughput, KiB/s. On the seam because a 300GB seed saturates
+    /// a household uplink for ~17h at 40Mbps, and the likeliest way this project
+    /// dies is someone switching it off after a ruined video call.
     pub upload_limit_kib: Option<u32>,
     pub tags: Vec<String>,
 }

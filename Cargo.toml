@@ -4,3 +4,9 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+# restic's --json output nests objects. Hand-rolled extraction silently returned
+# an empty snapshot list for every real repository.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Every canary comparison depends on this being right. Not a thing to hand-roll.
+sha2 = "0.10"

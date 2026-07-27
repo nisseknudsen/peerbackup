@@ -1,18 +1,11 @@
-//! Turning restic's output into something the three-state model can use.
+//! Turning restic output into a verdict.
 //!
-//! Two jobs:
+//! Two jobs: strip the Go error-location trace (not a panic, but it reads like
+//! one), and decide whether a failure is evidence the *data* is damaged or only
+//! that we could not look at it. Calling a network blip corruption trains the
+//! user to ignore red, which destroys the only feature this product has.
 //!
-//! 1. **Strip the Go trace.** restic appends an error-location trace to ordinary
-//!    failures. It is not a panic, but it reads exactly like one, and showing it
-//!    to a user makes every routine error look like a crash.
-//!
-//! 2. **Classify.** Decide whether a failure is evidence that the *data* is
-//!    damaged, or merely that we could not look at it. Getting this wrong in the
-//!    permissive direction (calling a network blip corruption) trains the user
-//!    to ignore red, which destroys the product's only real feature.
-//!
-//! Every fixture in the tests below is verbatim output captured from restic
-//! 0.19.1 against rest-server 0.14.0 during the T1 spike. None of it is invented.
+//! Fixtures below are verbatim restic 0.19.1 output from the T1 spike.
 
 use super::outcome::{Cause, Corruption};
 

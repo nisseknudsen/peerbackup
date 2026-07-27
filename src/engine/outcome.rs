@@ -1,22 +1,10 @@
-//! The three-state verification outcome.
+//! Three-state verification outcome.
 //!
-//! This module exists because `Result` has two arms and this problem has three.
-//!
-//! A backup verification can end in three genuinely different states:
-//!
-//!   * **Good**          — we read the data back and it matched.
-//!   * **Bad**           — we read the data back and it did *not* match.
-//!   * **Indeterminate** — we could not read it back at all, so we learned nothing.
-//!
-//! If verification returned `Result<(), Error>`, the second and third collapse
-//! into the same arm and the first `?` in the call chain erases the difference.
-//! A friend's router rebooting would then look identical to a corrupted pack.
-//! The dashboard would go red, the user would learn that red means "probably
-//! nothing", and the one signal the whole product exists to provide would be
-//! worthless.
-//!
-//! So the outcome is a *value*, and the compiler makes every caller say what it
-//! does about all three.
+//! `Result` has two arms; this has three. Good (read it, matched), Bad (read it,
+//! did not match), Indeterminate (could not read it, learned nothing). With a
+//! `Result` the last two share an arm and the first `?` erases the difference,
+//! so a rebooting router looks like a corrupted pack. Making it a value means
+//! the compiler forces every caller to handle all three.
 
 use std::fmt;
 
