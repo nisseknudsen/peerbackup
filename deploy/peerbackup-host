@@ -1,0 +1,341 @@
+#!/usr/bin/env bash
+# peerbackup-host — provision and tear down storage grants for peers.
+#
+# This is what you run when a friend asks you to hold their backups. It creates
+# a preallocated disk image, mounts it, and hands the mounted directory to an
+# unprivileged rest-server container.
+#
+#   peerbackup-host provision <peer> <size>   e.g. provision nisse 500G
+#   peerbackup-host adduser   <peer> [pw]     create credential + restart + verify
+#   peerbackup-host release   <peer>          ordered teardown, destroys data
+#   peerbackup-host list                      grants, sizes, usage
+#   peerbackup-host guard                     fail-closed mountpoint check
+#   peerbackup-host doctor                    check the host is set up correctly
+#
+# Design notes that are load-bearing, not decoration:
+#
+#   * Images are PREALLOCATED, never sparse. A sparse image caps the inner
+#     filesystem but reserves no host blocks, so granting 500G to three friends
+#     on a 1T disk still lets the host fill up. fallocate, not truncate.
+#
+#   * Mounting needs CAP_SYS_ADMIN, which the internet-facing container must not
+#     have. So the host mounts; the container receives an already-mounted dir.
+#
+#   * `guard` is the fail-closed check. If Docker starts before the mounts
+#     settle, bind mounts resolve to ordinary directories on the root filesystem
+#     with no size limit, and the first symptom is a full disk. It runs as
+#     ExecStartPre so the container refuses to start instead.
+#
+#   * The MAINTENANCE RESERVE is reported here but enforced by the CLIENT.
+#     rest-server's --max-size is per instance, and one instance serves every
+#     grantee, so there is no server-side per-peer reserve. Both sides have to
+#     agree on the number, so this prints it.
+#
+# DRY_RUN=1 prints what would happen and touches nothing. Used by the tests.
+
+set -uo pipefail
+
+ROOT="${PEERBACKUP_ROOT:-/srv/peerbackup}"
+IMAGES="$ROOT/images"
+MNT="$ROOT/mnt"
+UNITS="${SYSTEMD_UNIT_DIR:-/etc/systemd/system}"
+RESERVE_PCT="${MAINTENANCE_RESERVE_PCT:-15}"
+# Never let grants consume the last of the host disk, even if each grant is legal.
+HOST_MARGIN_GB="${HOST_MARGIN_GB:-20}"
+DRY_RUN="${DRY_RUN:-0}"
+
+die()  { printf '\033[31merror:\033[0m %s\n' "$*" >&2; exit 1; }
+warn() { printf '\033[33mwarn:\033[0m %s\n' "$*" >&2; }
+info() { printf '%s\n' "$*"; }
+run()  { if [ "$DRY_RUN" = "1" ]; then printf '  would run: %s\n' "$*"; else eval "$@"; fi; }
+
+need_root() {
+  [ "$DRY_RUN" = "1" ] && return 0
+  [ "$(id -u)" -eq 0 ] || die "must run as root (mount, losetup and systemd all need it)"
+}
+
+# Parse 500G / 500GB / 512000M / 1T into bytes. Rejects anything else loudly,
+# because a silently misparsed size means a grant of the wrong magnitude.
+to_bytes() {
+  local s="${1^^}" n unit
+  n="${s%%[KMGT]*}"; unit="${s#"$n"}"; unit="${unit%B}"
+  case "$n" in ''|*[!0-9]*) die "bad size '$1' (use e.g. 500G)";; esac
+  case "$unit" in
+    K) echo $(( n * 1024 ));;
+    M) echo $(( n * 1024 * 1024 ));;
+    G) echo $(( n * 1024 * 1024 * 1024 ));;
+    T) echo $(( n * 1024 * 1024 * 1024 * 1024 ));;
+    '') echo "$n";;
+    *) die "bad size unit in '$1' (use K, M, G or T)";;
+  esac
+}
+
+human() { numfmt --to=iec --suffix=B "$1" 2>/dev/null || echo "${1}B"; }
+
+unit_name() { systemd-escape --path --suffix=mount "$MNT/$1"; }
+
+peer_valid() {
+  case "$1" in
+    ''|*[!a-zA-Z0-9_-]*) return 1;;
+    *) return 0;;
+  esac
+}
+
+# ------------------------------------------------------------------ provision
+cmd_provision() {
+  local peer="${1:-}" size="${2:-}"
+  [ -n "$peer" ] && [ -n "$size" ] || die "usage: peerbackup-host provision <peer> <size>"
+  peer_valid "$peer" || die "peer name must be [a-zA-Z0-9_-] only (it becomes a path and a unit name)"
+  need_root
+
+  local img="$IMAGES/$peer.img" dir="$MNT/$peer"
+  [ -e "$img" ] && die "$img already exists; use 'release $peer' first if you mean to replace it"
+
+  local bytes; bytes=$(to_bytes "$size")
+
+  # Admission control. Preallocation means the host must actually have the room
+  # right now, not eventually. Refuse rather than overcommit.
+  #
+  # This check runs in DRY_RUN too, deliberately. A dry run that skips the one
+  # safety check you would want before committing 500GB is not a dry run, it is
+  # a rehearsal of the happy path.
+  local probe="$IMAGES"
+  while [ ! -d "$probe" ] && [ "$probe" != "/" ]; do probe=$(dirname "$probe"); done
+  local avail_kb avail margin
+  avail_kb=$(df -Pk "$probe" 2>/dev/null | awk 'NR==2{print $4}')
+  avail=$(( ${avail_kb:-0} * 1024 ))
+  margin=$(( HOST_MARGIN_GB * 1024 * 1024 * 1024 ))
+  info "requested:      $(human "$bytes")"
+  info "host available: $(human "$avail")  (on $probe)"
+  info "safety margin:  $(human "$margin")"
+  if [ $(( bytes + margin )) -gt "$avail" ]; then
+    die "refusing to overcommit: $(human "$bytes") + $(human "$margin") margin exceeds $(human "$avail") available on $probe"
+  fi
+
+  run "mkdir -p '$IMAGES' '$MNT'"
+
+  info "allocating $img (preallocated, this is not instant)"
+  run "fallocate -l $bytes '$img'" || die "fallocate failed (filesystem may not support it; falling back to dd is NOT equivalent, investigate)"
+  # -m 0 drops ext4's default 5% root reservation. The peer paid for that space.
+  run "mkfs.ext4 -q -m 0 -F '$img'"
+  run "mkdir -p '$dir'"
+
+  local unit; unit=$(unit_name "$peer")
+  info "writing $UNITS/$unit"
+  if [ "$DRY_RUN" = "1" ]; then
+    printf '  would write mount unit for %s -> %s\n' "$img" "$dir"
+  else
+    cat > "$UNITS/$unit" <<EOF
+[Unit]
+Description=peerbackup storage grant for $peer
+Documentation=https://github.com/nisse/peerbackup
+
+[Mount]
+What=$img
+Where=$dir
+Type=ext4
+Options=loop,rw,noatime
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  fi
+
+  run "systemctl daemon-reload"
+  run "systemctl enable --now '$unit'"
+
+  info ""
+  info "grant created for '$peer'. Numbers that matter, all three of them:"
+  cmd_list "$peer"
+  info ""
+  info "next: create their credential"
+  info "  peerbackup-host adduser $peer"
+  info "(use that, not create_user directly: rest-server only reads the htpasswd"
+  info " file at startup, so a credential added without a restart returns 401)"
+}
+
+# -------------------------------------------------------------------- release
+cmd_release() {
+  local peer="${1:-}"
+  [ -n "$peer" ] || die "usage: peerbackup-host release <peer>"
+  peer_valid "$peer" || die "invalid peer name"
+  need_root
+
+  local img="$IMAGES/$peer.img" dir="$MNT/$peer" unit
+  unit=$(unit_name "$peer")
+  [ -e "$img" ] || [ -d "$dir" ] || die "no grant found for '$peer'"
+
+  warn "this destroys $peer's backups permanently. They cannot be recovered from here."
+  if [ "${FORCE:-0}" != "1" ] && [ "$DRY_RUN" != "1" ]; then
+    printf "type the peer name to confirm: "
+    read -r confirm
+    [ "$confirm" = "$peer" ] || die "aborted"
+  fi
+
+  # Order matters. `rm` on a mounted image is not a teardown: the space stays
+  # allocated to the open loop device and the mount keeps serving stale data.
+  run "systemctl disable --now '$unit' 2>/dev/null || true"
+  if mountpoint -q "$dir" 2>/dev/null; then
+    run "umount '$dir'" || die "umount failed; something still has $dir open (lsof +f -- $dir)"
+  fi
+  local loopdev
+  loopdev=$(losetup -j "$img" 2>/dev/null | cut -d: -f1)
+  if [ -n "$loopdev" ]; then
+    run "losetup -d '$loopdev'" || warn "could not detach $loopdev"
+  fi
+  run "rm -f '$img'"
+  run "rmdir '$dir' 2>/dev/null || true"
+  run "rm -f '$UNITS/$unit'"
+  run "systemctl daemon-reload"
+  info "grant for '$peer' released, capacity returned to the host"
+}
+
+# ----------------------------------------------------------------------- list
+cmd_list() {
+  local only="${1:-}"
+  [ -d "$MNT" ] || { info "no grants"; return 0; }
+  printf '%-14s %12s %12s %12s %12s  %s\n' PEER IMAGE USABLE RESERVE USED STATE
+  local found=0
+  for dir in "$MNT"/*; do
+    [ -d "$dir" ] || continue
+    local peer; peer=$(basename "$dir")
+    [ -n "$only" ] && [ "$peer" != "$only" ] && continue
+    found=1
+    local img="$IMAGES/$peer.img"
+    local imgsz=0 usable=0 used=0 reserve=0 state="NOT MOUNTED"
+    [ -f "$img" ] && imgsz=$(stat -c %s "$img" 2>/dev/null || echo 0)
+    if mountpoint -q "$dir" 2>/dev/null; then
+      state="mounted"
+      local kb; kb=$(df -Pk "$dir" 2>/dev/null | awk 'NR==2{print $2}')
+      usable=$(( ${kb:-0} * 1024 ))
+      kb=$(df -Pk "$dir" 2>/dev/null | awk 'NR==2{print $3}')
+      used=$(( ${kb:-0} * 1024 ))
+      reserve=$(( usable * RESERVE_PCT / 100 ))
+    fi
+    printf '%-14s %12s %12s %12s %12s  %s\n' \
+      "$peer" "$(human "$imgsz")" "$(human "$usable")" "$(human "$reserve")" "$(human "$used")" "$state"
+  done
+  [ "$found" = "0" ] && info "no grants"
+  info ""
+  info "USABLE is capacity after filesystem overhead, which is less than IMAGE."
+  info "RESERVE (${RESERVE_PCT}%) is headroom prune needs to repack. It is enforced by"
+  info "the CLIENT, not here: rest-server's --max-size is per instance, not per peer."
+  return 0
+}
+
+# ---------------------------------------------------------------------- guard
+# Fail-closed. Runs as ExecStartPre on the container unit.
+cmd_guard() {
+  local rc=0 checked=0
+  [ -d "$MNT" ] || die "$MNT does not exist; nothing provisioned"
+  for dir in "$MNT"/*; do
+    [ -d "$dir" ] || continue
+    checked=$((checked+1))
+    if mountpoint -q "$dir"; then
+      printf '  ok       %s\n' "$dir"
+    else
+      printf '  NOT MOUNTED  %s\n' "$dir" >&2
+      rc=1
+    fi
+  done
+  if [ "$checked" -eq 0 ]; then
+    die "no grant directories under $MNT; refusing to start a server with nothing to serve"
+  fi
+  if [ "$rc" -ne 0 ]; then
+    die "refusing to start: a grant directory is not a mountpoint, so writes would land on the host root filesystem with no quota"
+  fi
+  info "all $checked grant(s) mounted"
+}
+
+# --------------------------------------------------------------------- doctor
+cmd_doctor() {
+  local problems=0
+  command -v docker >/dev/null || { warn "docker not found"; problems=$((problems+1)); }
+  command -v fallocate >/dev/null || { warn "fallocate not found (util-linux)"; problems=$((problems+1)); }
+  command -v mkfs.ext4 >/dev/null || { warn "mkfs.ext4 not found (e2fsprogs)"; problems=$((problems+1)); }
+  command -v systemd-escape >/dev/null || { warn "systemd-escape not found"; problems=$((problems+1)); }
+  [ -d "$ROOT" ] || warn "$ROOT does not exist yet (provision will create it)"
+
+  # The gotcha that silently breaks quota monitoring: the rest-server image runs
+  # as uid 0 and creates repos 0700 root:root through the bind mount.
+  if [ -d "$MNT" ]; then
+    for dir in "$MNT"/*; do
+      [ -d "$dir" ] || continue
+      for repo in "$dir"/*; do
+        [ -d "$repo" ] || continue
+        if [ ! -r "$repo" ]; then
+          warn "$repo is not readable by $(id -un) — the container is probably running without --user, which breaks quota monitoring"
+          problems=$((problems+1))
+        fi
+        break
+      done
+    done
+  fi
+
+  if [ "$problems" -eq 0 ]; then info "host looks healthy"; else info "$problems problem(s) found"; fi
+  return 0
+}
+
+cmd_up()   { run "docker compose -f '$(dirname "$0")/compose.yml' up -d"; }
+cmd_down() { run "docker compose -f '$(dirname "$0")/compose.yml' down"; }
+
+# ------------------------------------------------------------------- adduser
+# rest-server loads .htpasswd ONCE at startup and never reloads it. Its own log
+# line says so: "Loaded htpasswd file /data/.htpasswd". A credential created
+# after the server is running returns 401 until the container restarts, which
+# looks exactly like a wrong password and sends both sides off debugging TLS.
+#
+# So this subcommand exists purely to make the correct sequence unavoidable:
+# create the user, restart, then verify the credential actually works before
+# handing it to anyone.
+cmd_adduser() {
+  local peer="${1:-}" pw="${2:-}" container="${PB_CONTAINER:-peerbackup-rest}"
+  [ -n "$peer" ] || die "usage: peerbackup-host adduser <peer> [password]"
+  peer_valid "$peer" || die "invalid peer name"
+
+  if [ -z "$pw" ]; then
+    pw=$(head -c 24 /dev/urandom | base64 | tr -d '/+=' | head -c 24)
+    info "generated password for '$peer': $pw"
+    info "send it over a channel you trust. It is not stored anywhere in plaintext."
+  fi
+
+  run "docker exec '$container' create_user '$peer' '$pw'"
+  info "restarting the server so it picks up the new credential (it only reads"
+  info "the htpasswd file at startup)"
+  run "docker restart '$container'"
+
+  if [ "$DRY_RUN" = "1" ]; then return 0; fi
+
+  local port="${PB_PORT:-8000}" code=""
+  for _ in $(seq 1 40); do
+    code=$(curl -s -o /dev/null -w '%{http_code}' -u "$peer:$pw" \
+      "http://127.0.0.1:$port/$peer/config" 2>/dev/null)
+    # 404 means authenticated but no repository yet, which is exactly right for
+    # a fresh grant. 200 means they already have one.
+    case "$code" in 404|200) break;; esac
+    sleep 0.5
+  done
+  case "$code" in
+    404|200) info "verified: credential for '$peer' authenticates (HTTP $code)";;
+    401)     die "credential still returns 401 after restart — check $ROOT/mnt/.htpasswd";;
+    *)       warn "could not verify credential (HTTP ${code:-no response}); check the server is up on port $port";;
+  esac
+}
+
+usage() {
+  sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'
+  exit "${1:-0}"
+}
+
+case "${1:-}" in
+  provision) shift; cmd_provision "$@";;
+  adduser)   shift; cmd_adduser "$@";;
+  release)   shift; cmd_release "$@";;
+  list)      shift; cmd_list "$@";;
+  guard)     shift; cmd_guard "$@";;
+  doctor)    shift; cmd_doctor "$@";;
+  up)        shift; cmd_up "$@";;
+  down)      shift; cmd_down "$@";;
+  -h|--help|help|'') usage 0;;
+  *) die "unknown command '$1' (try --help)";;
+esac
