@@ -38,6 +38,23 @@ worse than no dashboard.
 - Repositories stay readable by plain `restic`, so recovery never depends on
   peerbackup existing.
 
+## Why not just be a restic backend?
+
+restic has no plugin system; backends are compiled in. So the options are fork
+restic in Go, which breaks the promise that *stock* restic can open your
+repository during a disaster, or speak an existing protocol, which is what we do
+(REST, with a stock rest-server behind it).
+
+The tempting variant is a local fan-out shim: restic writes to peerbackup on
+localhost, peerbackup mirrors every write to all peers, chunking once instead of
+N times. It falls over on partial failure. Peer 2 accepts a pack and peer 3 is
+full: answer 200 and peer 3 is silently incomplete, answer 500 and restic
+rewrites to peers that already have it. That is consensus in the write path of a
+backup tool.
+
+Everything peerbackup adds sits above the data path anyway. A backend is a
+data-path component.
+
 ## Host side (works today)
 
 What a friend runs to hold your backups:
