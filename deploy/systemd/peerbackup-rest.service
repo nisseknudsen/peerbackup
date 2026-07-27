@@ -1,0 +1,53 @@
+# peerbackup peer host server.
+#
+# The important line in this file is ExecStartPre. Without it, a boot where
+# Docker wins the race against the loop mounts produces a server writing to
+# ordinary directories on the root filesystem with no quota at all, and the
+# first symptom is a full disk days later. The guard makes that failure loud
+# and immediate instead of silent and delayed.
+#
+# Install:
+#   sudo cp deploy/systemd/peerbackup-rest.service /etc/systemd/system/
+#   sudo cp deploy/peerbackup-host /usr/local/bin/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now peerbackup-rest
+#
+# Verify the guard actually works (do this once, it is the whole point):
+#   sudo systemctl mask srv-peerbackup-mnt-<peer>.mount
+#   sudo reboot
+#   systemctl status peerbackup-rest   # must be FAILED, not running
+#   sudo systemctl unmask srv-peerbackup-mnt-<peer>.mount
+
+[Unit]
+Description=peerbackup rest-server for peer grants
+Documentation=file:///usr/local/share/peerbackup/runbook.md
+After=docker.service network-online.target local-fs.target
+Requires=docker.service
+Wants=network-online.target
+
+# Hard dependency on every grant mount. Add one RequiresMountsFor per grant, or
+# leave the parent and rely on the guard. Both together is the belt-and-braces
+# arrangement the design asks for.
+RequiresMountsFor=/srv/peerbackup/mnt
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/usr/local/share/peerbackup
+
+Environment=PB_ROOT=/srv/peerbackup
+Environment=PB_PORT=8000
+# Must match the owner of the mounted grant directories, or the container
+# writes files the host owner cannot read. See docs/runbook.md.
+Environment=PB_UID=1000
+Environment=PB_GID=1000
+
+# FAIL CLOSED. If any grant directory is not a real mountpoint, refuse to start.
+ExecStartPre=/usr/local/bin/peerbackup-host guard
+
+ExecStart=/usr/bin/docker compose -f /usr/local/share/peerbackup/compose.yml up -d
+ExecStop=/usr/bin/docker compose -f /usr/local/share/peerbackup/compose.yml down
+
+TimeoutStartSec=120
+
+[Install]
+WantedBy=multi-user.target

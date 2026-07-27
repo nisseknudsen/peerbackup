@@ -1,0 +1,109 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+# Everything here runs against a REAL restic and a REAL rest-server. There are no
+# mocks in this pipeline on purpose: the product's central claim is that a printed
+# piece of paper plus stock restic recovers your data, and a claim like that is
+# worth exactly as much as the realism of the test behind it.
+
+env:
+  # Pinned, checksum-verified. A backup tool should not float its engine version.
+  RESTIC_VERSION: "0.19.1"
+  RESTIC_SHA256: "f415415624dcc452f2a02b8c33641791a8c6d6d3b65bbb3543fcf9a25151585c"
+
+jobs:
+  lint:
+    name: shellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck (warnings and above)
+        run: |
+          docker run --rm -v "$PWD:/mnt" koalaman/shellcheck:stable \
+            -S warning -f gcc \
+            deploy/peerbackup-host \
+            deploy/test-host-tooling.sh \
+            deploy/test-compose-e2e.sh \
+            deploy/test-provision-root.sh \
+            spike/lifecycle-spike.sh
+
+  rust:
+    name: rust (fmt, clippy, tests)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+
+      - name: install restic (the engine drives it; some tests spawn it)
+        run: |
+          set -euo pipefail
+          curl -sSLO "https://github.com/restic/restic/releases/download/v${RESTIC_VERSION}/restic_${RESTIC_VERSION}_linux_amd64.bz2"
+          echo "${RESTIC_SHA256}  restic_${RESTIC_VERSION}_linux_amd64.bz2" | sha256sum -c -
+          bunzip2 "restic_${RESTIC_VERSION}_linux_amd64.bz2"
+          sudo install -m 0755 "restic_${RESTIC_VERSION}_linux_amd64" /usr/local/bin/restic
+
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      # Bounded on purpose. The engine imposes deadlines precisely because restic
+      # retries transport failures forever; if a change removes them this job
+      # hangs rather than passing slowly, and the timeout turns that into a
+      # visible failure.
+      - name: cargo test
+        run: cargo test
+        timeout-minutes: 5
+
+  host-tooling:
+    name: host tooling (no docker, no root)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: ./deploy/test-host-tooling.sh
+
+  compose-e2e:
+    name: compose + real restic + real rest-server
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install restic (pinned, checksum verified)
+        run: |
+          set -euo pipefail
+          curl -sSLO "https://github.com/restic/restic/releases/download/v${RESTIC_VERSION}/restic_${RESTIC_VERSION}_linux_amd64.bz2"
+          echo "${RESTIC_SHA256}  restic_${RESTIC_VERSION}_linux_amd64.bz2" | sha256sum -c -
+          bunzip2 "restic_${RESTIC_VERSION}_linux_amd64.bz2"
+          sudo install -m 0755 "restic_${RESTIC_VERSION}_linux_amd64" /usr/local/bin/restic
+          restic version
+
+      - name: end-to-end against the real stack
+        run: ./deploy/test-compose-e2e.sh
+
+      - name: server logs on failure
+        if: failure()
+        run: docker logs peerbackup-rest || true
+
+  provision-root:
+    name: provisioning lifecycle (real loop devices)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Runs as root on the runner rather than in a nested privileged container:
+      # the runner's /tmp is real ext4, which is required because the test asserts
+      # that fallocate genuinely reserves blocks. On overlayfs it does not, and
+      # peerbackup-host is expected to refuse rather than create a fake quota.
+      - name: provisioning lifecycle
+        run: sudo -E ./deploy/test-provision-root.sh
+        env:
+          PB_TEST_ROOT: /tmp
+
+  # The full 2GB lifecycle spike is slow and lives in its own workflow. It runs on
+  # a schedule and on demand, not on every push, because it takes minutes rather
+  # than seconds. See .github/workflows/spike.yml.

@@ -75,7 +75,48 @@ runtime.doInit1
 peerbackup must strip lines matching `^(runtime|main)\.` and `^\s+/` before
 showing a user anything, or every ordinary error will read as a crash.
 
-**4. Capture exit codes without a pipe.**
+**4. rest-server reads `.htpasswd` ONCE at startup and never reloads it.**
+
+Its own log says so: `Loaded htpasswd file /data/.htpasswd`. A credential created
+while the server is running returns **401 until you restart the container**, which
+is indistinguishable from a wrong password. Both sides then go off debugging TLS
+and typos for an hour.
+
+Never call `create_user` directly. Use:
+
+```bash
+peerbackup-host adduser <peer> [password]
+```
+
+which creates the user, restarts the server, and then **verifies the credential
+actually authenticates** before telling you it worked. If it cannot verify, it
+says so rather than reporting success.
+
+**5. `mkfs.ext4` silently undoes `fallocate`.**
+
+This is the subtlest thing in the whole deployment and it defeats the entire
+quota model. `mkfs.ext4` issues discards by default, which on a file-backed image
+punches holes straight through the preallocation:
+
+```
+after fallocate:           allocated = 64M
+after mkfs.ext4 (default): allocated = 4.5M   <- preallocation destroyed
+after mkfs -E nodiscard:   allocated = 64M
+```
+
+A sparse image caps the *inner* filesystem but reserves nothing on the host, so
+three 500G grants on a 1T disk still let the host fill up. Always:
+
+```bash
+mkfs.ext4 -q -m 0 -E nodiscard -F image.img
+```
+
+`peerbackup-host provision` does this and then **verifies the final allocated
+size after mkfs**, refusing to create the grant if the image came out sparse.
+Verifying right after `fallocate` is not enough: the check passes and the very
+next command invalidates it. Check the state you are actually shipping.
+
+**6. Capture exit codes without a pipe.**
 
 `restic ... | tail -5` makes `$?` the exit code of `tail`, and `tail -5` also
 shows only the Go trace, hiding the real error above it. Redirect to a file,
@@ -166,10 +207,29 @@ docker run -d --name peerbackup-rest \
 `/data/nisse` is reachable only by the `nisse` credential. Per-peer quota comes
 from that subdirectory being its own mount; `--max-size` is a global backstop.
 
-Create a credential per grantee:
+Create a credential per grantee. **Use `adduser`, not `create_user`** (gotcha 4):
 
 ```bash
-docker exec -it peerbackup-rest create_user nisse
+peerbackup-host adduser nisse            # generates a password
+peerbackup-host adduser nisse hunter2    # or supply one
+```
+
+It creates the user, restarts the server so the credential is actually loaded,
+and verifies it authenticates before reporting success.
+
+### 6. Verify the whole thing
+
+```bash
+peerbackup-host doctor        # host prerequisites and the --user ownership check
+peerbackup-host list          # image size, usable capacity, reserve, used
+peerbackup-host guard         # must pass; this is what ExecStartPre runs
+```
+
+Two test suites ship with the repo and neither needs root:
+
+```bash
+./deploy/test-host-tooling.sh   # 39 assertions: parsing, refusals, fail-closed guard
+./deploy/test-compose-e2e.sh    # 17 assertions: real server, real restic, real isolation
 ```
 
 ### 5. Teardown, when someone stops hosting
