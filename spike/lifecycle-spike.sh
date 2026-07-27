@@ -336,4 +336,5 @@ if [ "$FAIL" -eq 0 ]; then
 else
   printf '\n  \033[31mVERDICT: %d assumption(s) in the design are WRONG. Read the log.\033[0m\n' "$FAIL"
 fi
-exit $([ "$FAIL" -eq 0 ] && echo 0 || echo 1)
+[ "$FAIL" -eq 0 ] || exit 1
+exit 0

@@ -1,0 +1,72 @@
+name: Lifecycle spike
+
+# The full vertical spike: ~2GB of real data, five interrupted prunes, append-only
+# and quota-exhaustion checks. It answers the question that could invalidate the
+# retention design, so it must keep passing as restic and rest-server move.
+#
+# It is slow (minutes, not seconds), so it does not gate every push. Weekly plus
+# on demand is enough to catch an upstream regression before it reaches a peer.
+
+on:
+  schedule:
+    - cron: "17 4 * * 1"    # Mondays, 04:17 UTC
+  workflow_dispatch:
+    inputs:
+      restic_version:
+        description: "restic version to test against (default: the pinned one)"
+        required: false
+        default: ""
+
+env:
+  RESTIC_VERSION: "0.19.1"
+  RESTIC_SHA256: "f415415624dcc452f2a02b8c33641791a8c6d6d3b65bbb3543fcf9a25151585c"
+
+jobs:
+  spike:
+    name: interrupted prune, append-only, quota exhaustion
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: resolve restic version
+        id: ver
+        run: |
+          set -euo pipefail
+          v="${{ github.event.inputs.restic_version }}"
+          if [ -n "$v" ]; then
+            echo "version=$v"      >> "$GITHUB_OUTPUT"
+            echo "verify=false"    >> "$GITHUB_OUTPUT"
+            echo "::notice::testing against restic $v (checksum NOT verified, manual override)"
+          else
+            echo "version=${RESTIC_VERSION}" >> "$GITHUB_OUTPUT"
+            echo "verify=true"               >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: install restic
+        run: |
+          set -euo pipefail
+          V="${{ steps.ver.outputs.version }}"
+          curl -sSLO "https://github.com/restic/restic/releases/download/v${V}/restic_${V}_linux_amd64.bz2"
+          if [ "${{ steps.ver.outputs.verify }}" = "true" ]; then
+            echo "${RESTIC_SHA256}  restic_${V}_linux_amd64.bz2" | sha256sum -c -
+          else
+            curl -sSL "https://github.com/restic/restic/releases/download/v${V}/SHA256SUMS" -o SHA256SUMS
+            grep "restic_${V}_linux_amd64.bz2" SHA256SUMS | sha256sum -c -
+          fi
+          bunzip2 "restic_${V}_linux_amd64.bz2"
+          sudo install -m 0755 "restic_${V}_linux_amd64" /usr/local/bin/restic
+          restic version
+
+      # Runs as root so the tmpfs ENOSPC phase is exercised rather than skipped.
+      # That phase checks a full backing store leaves the repository openable,
+      # which is the difference between a peer running out of space and a peer
+      # losing their data.
+      - name: full lifecycle spike
+        run: sudo -E ./spike/lifecycle-spike.sh /tmp/pb-spike
+        env:
+          RESTIC_BIN: /usr/local/bin/restic
+
+      - name: spike log on failure
+        if: failure()
+        run: tail -200 /tmp/pb-spike/spike.log || true

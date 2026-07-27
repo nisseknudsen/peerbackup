@@ -47,6 +47,9 @@ DRY_RUN="${DRY_RUN:-0}"
 die()  { printf '\033[31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 warn() { printf '\033[33mwarn:\033[0m %s\n' "$*" >&2; }
 info() { printf '%s\n' "$*"; }
+# Commands are passed as a single pre-quoted string so DRY_RUN can print exactly
+# what would run. eval is the point here, not an accident.
+# shellcheck disable=SC2294
 run()  { if [ "$DRY_RUN" = "1" ]; then printf '  would run: %s\n' "$*"; else eval "$@"; fi; }
 
 need_root() {
@@ -72,7 +75,13 @@ to_bytes() {
 
 human() { numfmt --to=iec --suffix=B "$1" 2>/dev/null || echo "${1}B"; }
 
-unit_name() { systemd-escape --path --suffix=mount "$MNT/$1"; }
+unit_name() {
+  command -v systemd-escape >/dev/null 2>&1 \
+    || die "systemd-escape not found; cannot derive the mount unit name for '$1'"
+  local n; n=$(systemd-escape --path --suffix=mount "$MNT/$1")
+  [ -n "$n" ] || die "systemd-escape produced an empty unit name for '$MNT/$1'"
+  echo "$n"
+}
 
 peer_valid() {
   case "$1" in
@@ -112,12 +121,54 @@ cmd_provision() {
     die "refusing to overcommit: $(human "$bytes") + $(human "$margin") margin exceeds $(human "$avail") available on $probe"
   fi
 
+  # Required tools, checked before we start creating things. systemd-escape in
+  # particular used to be missing silently: unit_name returned empty, the unit
+  # was written to a garbage path, and provision reported success on a grant
+  # that would never mount.
+  local missing=""
+  for t in fallocate mkfs.ext4 systemd-escape stat; do
+    command -v "$t" >/dev/null 2>&1 || missing="$missing $t"
+  done
+  [ -n "$missing" ] && die "missing required tool(s):$missing (need util-linux, e2fsprogs and systemd)"
+
   run "mkdir -p '$IMAGES' '$MNT'"
 
   info "allocating $img (preallocated, this is not instant)"
-  run "fallocate -l $bytes '$img'" || die "fallocate failed (filesystem may not support it; falling back to dd is NOT equivalent, investigate)"
+  run "fallocate -l $bytes '$img'" || die "fallocate failed (filesystem may not support preallocation; dd is NOT equivalent, investigate)"
+
   # -m 0 drops ext4's default 5% root reservation. The peer paid for that space.
-  run "mkfs.ext4 -q -m 0 -F '$img'"
+  #
+  # -E nodiscard is NOT optional and is the subtlest line in this file. mkfs.ext4
+  # issues discards by default, which on a file-backed image punches holes and
+  # silently undoes the fallocate above:
+  #
+  #     after fallocate:           allocated = 64M
+  #     after mkfs.ext4 (default): allocated = 4.5M   <- preallocation destroyed
+  #     after mkfs -E nodiscard:   allocated = 64M
+  #
+  # Without it every grant is sparse, and the host can be overcommitted by
+  # exactly the mechanism this design exists to prevent.
+  run "mkfs.ext4 -q -m 0 -E nodiscard -F '$img'"
+
+  # Verify the FINAL state, not an intermediate one. The first version of this
+  # check ran immediately after fallocate, passed, and was then invalidated by
+  # the very next command. Check what you are actually shipping.
+  if [ "$DRY_RUN" != "1" ]; then
+    local apparent allocated blk
+    apparent=$(stat -c %s "$img" 2>/dev/null || echo 0)
+    blk=$(stat -c %B "$img" 2>/dev/null || echo 512)
+    allocated=$(( $(stat -c %b "$img" 2>/dev/null || echo 0) * blk ))
+    if [ "$allocated" -lt $(( apparent / 2 )) ]; then
+      rm -f "$img"
+      die "refusing to create a sparse grant: only $(human "$allocated") of $(human "$apparent") is actually allocated.
+       A sparse image is not a quota. The host can still be filled by other grants.
+       Either $IMAGES is on a filesystem that does not really preallocate
+       (overlayfs, tmpfs, some network mounts), or mkfs discarded the allocation.
+       Put $IMAGES on ext4, xfs or btrfs on real block storage."
+    fi
+    info "preallocation verified after mkfs: $(human "$allocated") reserved on the host"
+  fi
+
   run "mkdir -p '$dir'"
 
   local unit; unit=$(unit_name "$peer")

@@ -72,7 +72,8 @@ fi
 hdr "GUARD — fail closed (the most important behaviour in this file)"
 
 # 1. No grant directories at all: must refuse, not shrug.
-rm -rf "$PEERBACKUP_ROOT/mnt"; mkdir -p "$PEERBACKUP_ROOT/mnt"
+# ${var:?} so an unset PEERBACKUP_ROOT aborts instead of rm -rf /mnt.
+rm -rf "${PEERBACKUP_ROOT:?}/mnt"; mkdir -p "$PEERBACKUP_ROOT/mnt"
 if "$HOST" guard >/dev/null 2>&1; then
   bad "guard PASSED with zero grants — would start a server with nothing mounted"
 else

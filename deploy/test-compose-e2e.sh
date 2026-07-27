@@ -16,7 +16,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 RESTIC="${RESTIC_BIN:-restic}"
 export PB_ROOT="${PB_ROOT:-/tmp/pb-e2e}"
 export PB_PORT="${PB_PORT:-8011}"
-export PB_UID="$(id -u)" PB_GID="$(id -g)"
+PB_UID="$(id -u)"; PB_GID="$(id -g)"; export PB_UID PB_GID
 BASE="http://127.0.0.1:$PB_PORT"
 
 PASS=0; FAIL=0
