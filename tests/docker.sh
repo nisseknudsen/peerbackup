@@ -99,8 +99,19 @@ pb -v "$WORK/data:$WORK/data:ro" -v "$WORK/other:$WORK/other:ro" \
    "$IMAGE" backup 2>&1 | grep -q "done" && ok "backup completes" || bad "backup failed"
 
 hdr "verify and status through the container"
-pb "$IMAGE" verify 2>&1 | grep -q matches && ok "verify passes" || bad "verify failed"
-pb "$IMAGE" status 2>&1 | grep -qE "alice .*ok" && ok "status reports ok" || bad "status not ok"
+VOUT=$(pb "$IMAGE" verify 2>&1)
+echo "$VOUT" | grep -q matches && ok "verify passes" || { bad "verify failed"; echo "$VOUT" | sed 's/^/      /'; }
+
+SOUT=$(pb "$IMAGE" status 2>&1)
+if echo "$SOUT" | grep -qE "alice +ok"; then
+  ok "status reports ok"
+else
+  bad "status not ok"
+  echo "$VOUT" | sed 's/^/      verify: /'
+  echo "$SOUT" | sed 's/^/      status: /'
+  echo "      evidence:"
+  sed 's/^/        /' "$WORK/state/evidence.jsonl" 2>/dev/null | tail -6
+fi
 
 hdr "paths are recorded as they are on the host"
 # The whole reason for the same-path rule. If this shows container-internal
