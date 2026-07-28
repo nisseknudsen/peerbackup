@@ -1,6 +1,11 @@
 # Hosting backups for a peer
 
-Setup instructions for a machine that stores someone else's backups.
+Setup instructions for a machine that stores someone else's backups, with a
+fixed size limit per peer enforced by the filesystem.
+
+For a quicker setup with no root and a shared size limit, see
+[../docker/README.md](../docker/README.md). Come back here when you want a limit
+one peer cannot consume on behalf of the others.
 
 ## Requirements
 

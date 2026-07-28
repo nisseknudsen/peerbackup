@@ -124,6 +124,19 @@ configuration.
 
 ### Hosting backups for someone else
 
+The quickest setup is a compose file and no root:
+
+```sh
+cd docker
+PB_DATA=/srv/peerbackup-data PB_UID=$(id -u) PB_GID=$(id -g) \
+  docker compose -f compose.host.yml up -d
+docker exec -it peerbackup-rest create_user alice
+docker restart peerbackup-rest
+```
+
+The size limit there is shared across all peers rather than being per peer. For
+a hard per-peer limit enforced by the filesystem:
+
 ```sh
 sudo peerbackup-host provision alice 500G   # reserve space
 sudo peerbackup-host adduser alice          # create their login
@@ -131,7 +144,8 @@ sudo peerbackup-host list                   # show allowances and usage
 sudo peerbackup-host release alice          # give the space back
 ```
 
-Full setup instructions, including TLS: [docs/runbook.md](docs/runbook.md).
+Both are described in [docker/README.md](docker/README.md); the second is
+covered in full, including TLS and systemd, in [docs/runbook.md](docs/runbook.md).
 
 ## Configuration
 

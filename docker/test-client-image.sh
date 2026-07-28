@@ -9,7 +9,7 @@ set -uo pipefail
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
 WORK="${WORK:-/tmp/pb-docker-e2e}"
 PORT="${PORT:-8023}"
-SERVER=pb-docker-server
+SERVER=peerbackup-rest   # the name compose.host.yml uses
 IMAGE="${IMAGE:-peerbackup:test}"
 
 PASS=0; FAIL=0
@@ -17,8 +17,11 @@ ok()  { printf '  \033[32mPASS\033[0m  %s\n' "$*"; PASS=$((PASS+1)); }
 bad() { printf '  \033[31mFAIL\033[0m  %s\n' "$*"; FAIL=$((FAIL+1)); }
 hdr() { printf '\n\033[1m=== %s ===\033[0m\n' "$*"; }
 
+HOST_COMPOSE="$HERE/docker/compose.host.yml"
+
 cleanup() {
-  docker rm -f "$SERVER" >/dev/null 2>&1 || true
+  docker compose -f "$HOST_COMPOSE" down -v >/dev/null 2>&1 || true
+  docker rm -f "$SERVER" peerbackup-maint >/dev/null 2>&1 || true
   # Some steps run as other uids and leave files this user cannot delete.
   [ -d "$WORK" ] && docker run --rm -v "$WORK:/w" alpine:3.20 \
     sh -c 'rm -rf /w/* /w/.[!.]* 2>/dev/null' >/dev/null 2>&1 || true
@@ -45,14 +48,21 @@ echo "in the unmounted one"     > "$WORK/other/missed.txt"
 docker build -q -f docker/Dockerfile -t "$IMAGE" "$HERE" >/dev/null || { echo "build failed"; exit 1; }
 ok "image built"
 
-docker run -d --name "$SERVER" -p "127.0.0.1:$PORT:8000" \
-  --user "$(id -u):$(id -g)" \
-  -e OPTIONS="--private-repos --append-only" \
-  -v "$WORK/srv:/data" restic/rest-server:0.14.0 >/dev/null
-for _ in $(seq 1 40); do curl -s -o /dev/null "http://127.0.0.1:$PORT/" && break; sleep 0.25; done
+# Started exactly as docker/README.md instructs, so the documented host setup
+# is covered rather than described.
+PB_DATA="$WORK/srv" PB_PORT="$PORT" PB_UID="$(id -u)" PB_GID="$(id -g)" \
+  docker compose -f "$HOST_COMPOSE" up -d >/dev/null 2>&1
+for _ in $(seq 1 60); do curl -s -o /dev/null "http://127.0.0.1:$PORT/" && break; sleep 0.25; done
+docker ps --filter "name=$SERVER" --format '{{.Status}}' | grep -q Up \
+  && ok "host compose file starts a server" || { bad "host compose failed"; docker compose -f "$HOST_COMPOSE" logs | tail -5; exit 1; }
+
 docker exec "$SERVER" create_user me pw >/dev/null 2>&1
 docker restart "$SERVER" >/dev/null 2>&1; sleep 2
-ok "rest-server running"
+ok "login created"
+
+# The host must be able to read what it is storing.
+[ -r "$WORK/srv" ] && ok "stored data is readable by the host owner" \
+  || bad "stored data is root-owned; PB_UID/PB_GID not applied"
 
 hdr "init and configure"
 pb "$IMAGE" init >/dev/null 2>&1 && ok "init through the container" || bad "init failed"

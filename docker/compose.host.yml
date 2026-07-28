@@ -1,0 +1,56 @@
+# Hosting backups for a peer, without root.
+#
+# Self-contained: `docker compose -f docker/compose.host.yml up -d` is enough.
+#
+# The size limit here is applied by rest-server, not the kernel, and is shared
+# across every peer on this server rather than being per-peer. If you need a
+# hard per-peer limit, use the provisioning tooling instead; see
+# docs/runbook.md. Both are documented in docker/README.md.
+
+services:
+  rest-server:
+    image: restic/rest-server:0.14.0
+    container_name: peerbackup-rest
+    restart: unless-stopped
+
+    # Match whoever owns PB_DATA on the host, or the stored files end up owned
+    # by root and you cannot inspect or delete your own data without sudo.
+    user: "${PB_UID:-1000}:${PB_GID:-1000}"
+
+    ports:
+      - "${PB_PORT:-8000}:8000"
+
+    environment:
+      #   --private-repos  confines each login to its own subdirectory, so one
+      #                    peer cannot read or write another's backups
+      #   --append-only    accepts new backups, refuses deletion. Protects the
+      #                    stored history if a peer's machine is compromised.
+      #                    Their cleanup then needs a maintenance window; see
+      #                    docker/README.md.
+      #   --max-size       total bytes across all peers on this server
+      OPTIONS: >-
+        --private-repos
+        --append-only
+        --max-size ${PB_MAX_SIZE:-536870912000}
+        ${PB_EXTRA_OPTIONS:-}
+
+    volumes:
+      - "${PB_DATA:-./peerbackup-data}:/data"
+      # TLS: put fullchain.pem and privkey.pem here, then set
+      # PB_EXTRA_OPTIONS="--tls --tls-cert /certs/fullchain.pem --tls-key /certs/privkey.pem"
+      # - "${PB_CERTS:-./certs}:/certs:ro"
+
+    healthcheck:
+      # rest-server answers 404 on /, which is a running server declining to
+      # list the root. Any HTTP response means it is up.
+      test: ["CMD-SHELL", "wget -q -O /dev/null -T 3 http://127.0.0.1:8000/ || [ $? -eq 8 ]"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
