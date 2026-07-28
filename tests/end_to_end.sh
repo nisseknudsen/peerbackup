@@ -80,7 +80,7 @@ hdr "passwords are not printed"
 
 hdr "backup"
 OUT=$("$BIN" backup 2>&1)
-echo "$OUT" | grep -q done && ok "backup completed" || { bad "backup failed"; echo "$OUT" | sed 's/^/      /'; }
+echo "$OUT" | grep -q "done" && ok "backup completed" || { bad "backup failed"; echo "$OUT" | sed 's/^/      /'; }
 
 hdr "verify"
 OUT=$("$BIN" verify 2>&1)
