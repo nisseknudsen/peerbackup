@@ -29,6 +29,8 @@ pub struct ResticEngine {
     pub verify_timeout: Duration,
     pub restore_timeout: Duration,
     pub list_timeout: Duration,
+    /// How long to spend deciding whether a peer is reachable at all.
+    pub probe_timeout: Duration,
 }
 
 impl ResticEngine {
@@ -39,6 +41,7 @@ impl ResticEngine {
     pub const DEFAULT_VERIFY_TIMEOUT: Duration = Duration::from_secs(3600);
     pub const DEFAULT_RESTORE_TIMEOUT: Duration = Duration::from_secs(1800);
     pub const DEFAULT_LIST_TIMEOUT: Duration = Duration::from_secs(120);
+    pub const DEFAULT_PROBE_TIMEOUT: Duration = Duration::from_secs(20);
 
     pub fn new(repo_url: impl Into<String>, password_file: impl Into<PathBuf>) -> Self {
         Self {
@@ -49,6 +52,22 @@ impl ResticEngine {
             verify_timeout: Self::DEFAULT_VERIFY_TIMEOUT,
             restore_timeout: Self::DEFAULT_RESTORE_TIMEOUT,
             list_timeout: Self::DEFAULT_LIST_TIMEOUT,
+            probe_timeout: Self::DEFAULT_PROBE_TIMEOUT,
+        }
+    }
+
+    /// Quick check that the peer answers, before starting anything expensive.
+    ///
+    /// Without this, verifying an unreachable peer waits out the full
+    /// verification timeout, because restic keeps retrying. An hour of nothing
+    /// happening is not something anyone will sit through, and the answer is
+    /// known within seconds anyway.
+    ///
+    /// Returns `None` when the peer responded.
+    pub fn probe(&self) -> Option<Cause> {
+        match self.run(&["cat", "config"], Some(self.probe_timeout)) {
+            Ok(_) => None,
+            Err(e) => Some(e.cause),
         }
     }
 
@@ -86,6 +105,12 @@ impl ResticEngine {
             Ok(Some(out)) if out.status.success() => Ok(out),
             Ok(Some(out)) => Err(self.to_engine_error(&out)),
         }
+    }
+
+    /// Create the repository. Not on the trait: it is setup, not a backup
+    /// operation, and only `peer add` ever calls it.
+    pub fn init_repo(&self) -> Result<(), EngineError> {
+        self.run(&["init"], Some(self.list_timeout)).map(|_| ())
     }
 
     fn to_engine_error(&self, out: &Output) -> EngineError {
@@ -168,6 +193,19 @@ impl BackupEngine for ResticEngine {
             sha256,
             bytes,
         })
+    }
+
+    fn restore_all(&self, snapshot: &SnapshotId, target: &Path) -> Result<(), EngineError> {
+        self.run(
+            &[
+                "restore",
+                &snapshot.0,
+                "--target",
+                &target.display().to_string(),
+            ],
+            Some(self.restore_timeout),
+        )?;
+        Ok(())
     }
 
     fn verify_subset(&self, percent: u8) -> VerifyOutcome {

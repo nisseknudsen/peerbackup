@@ -1,19 +1,135 @@
-//! peerbackup — friend-to-friend homeserver backup with proof of restorability.
-//!
-//! Only the restic wrapper exists so far. This is a placeholder so `cargo run`
-//! says something true rather than pretending to be finished.
-
-// The seam is built ahead of its callers on purpose: it is the spine the client
-// hangs off, and the eng review put it first so the three-state model is
-// enforced by the compiler before anything depends on it. Dead-code warnings
-// here are expected until the client lands.
-#[allow(dead_code)]
+mod cli;
+mod config;
 mod engine;
+mod state;
+
+use std::path::PathBuf;
+
+use clap::{Parser, Subcommand};
+
+#[derive(Parser)]
+#[command(
+    name = "peerbackup",
+    about = "Back up your server to your friends' servers",
+    version
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Create the config file and test files
+    Init,
+
+    /// Add, list and remove the friends you back up to
+    #[command(subcommand)]
+    Peer(PeerCmd),
+
+    /// Send a backup to every peer
+    Backup {
+        /// Only back up to this peer
+        #[arg(long)]
+        peer: Option<String>,
+    },
+
+    /// Check that what is stored can still be read back
+    Verify {
+        /// Only check this peer
+        #[arg(long)]
+        peer: Option<String>,
+    },
+
+    /// Show whether your backups are in good shape
+    Status,
+
+    /// List the backups stored on a peer
+    Snapshots {
+        /// Peer name
+        peer: String,
+    },
+
+    /// Get your data back from a peer
+    Restore {
+        /// Peer name
+        peer: String,
+        /// Where to put the restored files
+        target: PathBuf,
+        /// Which backup to restore (default: the most recent)
+        #[arg(long)]
+        snapshot: Option<String>,
+    },
+
+    /// Manage the file that lets you recover without this program
+    #[command(subcommand)]
+    Recovery(RecoveryCmd),
+}
+
+#[derive(Subcommand)]
+enum PeerCmd {
+    /// Add a peer and check that backups to it work
+    Add {
+        /// Short name, e.g. alice
+        name: String,
+        /// Repository URL, e.g. rest:https://me:pw@alice.example.org:8000/me/
+        url: String,
+        /// Certificate file, if they use a self-signed one
+        #[arg(long)]
+        cacert: Option<PathBuf>,
+    },
+    /// List your peers
+    List,
+    /// Stop backing up to a peer
+    Remove {
+        /// Peer name
+        name: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum RecoveryCmd {
+    /// Write out repository details and passwords
+    Export {
+        /// Where to write it (default: alongside your other peerbackup files)
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// Check the exported file still matches your peers
+    Check,
+}
 
 fn main() {
-    println!("peerbackup {}", env!("CARGO_PKG_VERSION"));
-    println!("engine seam: restic subprocess, three-state verification");
-    println!();
-    println!("Not yet implemented: peer config, canary corpus, evidence store,");
-    println!("recovery bundle, status dashboard. See TODOS.md and the design doc.");
+    let cli = Cli::parse();
+
+    let nag_after = matches!(
+        cli.command,
+        Command::Status | Command::Backup { .. } | Command::Peer(_)
+    );
+
+    let result = match cli.command {
+        Command::Init => cli::init(),
+        Command::Peer(PeerCmd::Add { name, url, cacert }) => cli::peer_add(&name, &url, cacert),
+        Command::Peer(PeerCmd::List) => cli::peer_list(),
+        Command::Peer(PeerCmd::Remove { name }) => cli::peer_remove(&name),
+        Command::Backup { peer } => cli::backup(peer.as_deref()),
+        Command::Verify { peer } => cli::verify(peer.as_deref()),
+        Command::Status => cli::status_cmd(),
+        Command::Snapshots { peer } => cli::snapshots(&peer),
+        Command::Restore {
+            peer,
+            target,
+            snapshot,
+        } => cli::restore(&peer, &target, snapshot.as_deref()),
+        Command::Recovery(RecoveryCmd::Export { out }) => cli::recovery_export(out),
+        Command::Recovery(RecoveryCmd::Check) => cli::recovery_check(),
+    };
+
+    if let Err(e) = result {
+        eprintln!("error: {e}");
+        std::process::exit(1);
+    }
+    if nag_after {
+        cli::warn_if_recovery_stale();
+    }
 }

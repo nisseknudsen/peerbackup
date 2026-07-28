@@ -60,6 +60,31 @@ jobs:
         run: cargo test
         timeout-minutes: 5
 
+  client-e2e:
+    name: client lifecycle + disaster recovery
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: install restic
+        run: |
+          set -euo pipefail
+          curl -sSLO "https://github.com/restic/restic/releases/download/v${RESTIC_VERSION}/restic_${RESTIC_VERSION}_linux_amd64.bz2"
+          echo "${RESTIC_SHA256}  restic_${RESTIC_VERSION}_linux_amd64.bz2" | sha256sum -c -
+          bunzip2 "restic_${RESTIC_VERSION}_linux_amd64.bz2"
+          sudo install -m 0755 "restic_${RESTIC_VERSION}_linux_amd64" /usr/local/bin/restic
+
+      - run: cargo build
+      # Ends by deleting every peerbackup file and restoring with restic alone.
+      - run: ./tests/end_to_end.sh
+        timeout-minutes: 10
+
+      - name: server logs on failure
+        if: failure()
+        run: docker logs pb-e2e-client || true
+
   host-tooling:
     name: host tooling (no docker, no root)
     runs-on: ubuntu-latest

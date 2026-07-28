@@ -78,6 +78,13 @@ impl BackupEngine for FakeEngine {
         })
     }
 
+    fn restore_all(&self, snapshot: &SnapshotId, _target: &Path) -> Result<(), EngineError> {
+        self.calls
+            .borrow_mut()
+            .push(format!("restore_all({snapshot})"));
+        Ok(())
+    }
+
     fn verify_subset(&self, percent: u8) -> VerifyOutcome {
         self.calls
             .borrow_mut()

@@ -98,6 +98,9 @@ pub enum VerifyOutcome {
     Indeterminate(Cause),
 }
 
+// The CLI matches on the variants directly; these are the API for anything that
+// wants a yes/no without pattern matching, and the tests pin their behaviour.
+#[allow(dead_code)]
 impl VerifyOutcome {
     /// True only for `Good`. Written out rather than derived so that adding a
     /// future variant is a compile error here instead of a silent green.

@@ -22,9 +22,17 @@ pub use outcome::{Cause, VerifyOutcome};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnapshotId(pub String);
 
+impl SnapshotId {
+    /// restic reports the full 64-character id after a backup but shows the
+    /// first 8 everywhere else. Match what people see in `snapshots`.
+    pub fn short(&self) -> &str {
+        &self.0[..self.0.len().min(8)]
+    }
+}
+
 impl std::fmt::Display for SnapshotId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
+        write!(f, "{}", self.short())
     }
 }
 
@@ -40,6 +48,9 @@ pub struct SnapshotMeta {
 
 /// A file pulled back out, with the digest computed on arrival. The digest is
 /// the point: bytes restored is not the same as the *right* bytes restored.
+///
+/// `path` and `bytes` are for reporting; only `sha256` is compared today.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct RestoredFile {
     pub path: PathBuf,
@@ -48,6 +59,10 @@ pub struct RestoredFile {
 }
 
 /// A failed operation whose failure says nothing about data integrity.
+///
+/// `exit_code` is kept for diagnostics even though nothing branches on it yet;
+/// restic's codes are part of the contract this wrapper depends on.
+#[allow(dead_code)]
 /// Verification does not use this: it returns [`VerifyOutcome`].
 #[derive(Debug, Clone)]
 pub struct EngineError {
@@ -91,6 +106,9 @@ pub trait BackupEngine {
         path: &Path,
         target: &Path,
     ) -> Result<RestoredFile, EngineError>;
+
+    /// Restore an entire snapshot. This is the disaster operation.
+    fn restore_all(&self, snapshot: &SnapshotId, target: &Path) -> Result<(), EngineError>;
 
     /// Read back `percent` of the repository's pack data and verify it.
     ///
