@@ -1,11 +1,11 @@
-# Hosting backups for a peer, without root.
+# Hosting backups for peers.
 #
-# Self-contained: `docker compose -f docker/compose.host.yml up -d` is enough.
+# `docker compose up -d` is enough for a basic setup, or use
+# `peerbackup-host quickstart <peer>` which does this plus creating a login.
 #
-# The size limit here is applied by rest-server, not the kernel, and is shared
-# across every peer on this server rather than being per-peer. If you need a
-# hard per-peer limit, use the provisioning tooling instead; see
-# docs/runbook.md. Both are documented in docker/README.md.
+# By default the size limit is applied by rest-server and shared across all
+# peers. Pointing PB_DATA at provisioned per-peer volumes gives each peer its
+# own filesystem-enforced limit instead; see docs/runbook.md.
 
 services:
   rest-server:
@@ -26,7 +26,7 @@ services:
       #   --append-only    accepts new backups, refuses deletion. Protects the
       #                    stored history if a peer's machine is compromised.
       #                    Their cleanup then needs a maintenance window; see
-      #                    docker/README.md.
+      #                    the README.
       #   --max-size       total bytes across all peers on this server
       OPTIONS: >-
         --private-repos

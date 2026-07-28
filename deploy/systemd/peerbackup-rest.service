@@ -34,7 +34,7 @@ Type=oneshot
 RemainAfterExit=yes
 WorkingDirectory=/usr/local/share/peerbackup
 
-Environment=PB_ROOT=/srv/peerbackup
+Environment=PB_DATA=/srv/peerbackup/mnt
 Environment=PB_PORT=8000
 # Must match the owner of the mounted grant directories, or the container
 # writes files the host owner cannot read. See docs/runbook.md.

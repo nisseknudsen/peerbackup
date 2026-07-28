@@ -82,6 +82,77 @@ pub fn init() -> Res {
     Ok(())
 }
 
+/// Everything needed to start backing up, in one command.
+///
+/// Equivalent to `init`, adding the directories to the config, then `peer add`.
+/// Split out because four steps before the first backup is three too many.
+pub fn connect(url: &str, sources: &[PathBuf], name: Option<&str>) -> Res {
+    if !Config::path().exists() {
+        let cfg = Config::default();
+        cfg.save().map_err(err("could not write config"))?;
+        Canary::create().map_err(err("could not create test files"))?;
+    }
+
+    if sources.is_empty() {
+        return Err("say what to back up, e.g. --source /srv/data".into());
+    }
+    check_sources(sources)?;
+
+    let mut cfg = Config::load().map_err(err("could not read config"))?;
+    for s in sources {
+        let abs = s
+            .canonicalize()
+            .map_err(|e| format!("{}: {e}", s.display()))?;
+        if !cfg.settings.sources.contains(&abs) {
+            cfg.settings.sources.push(abs);
+        }
+    }
+    cfg.save().map_err(err("could not save config"))?;
+
+    let name = match name {
+        Some(n) => n.to_string(),
+        None => peer_name_from_url(url).ok_or(
+            "could not work out a name for this peer from the URL; pass --name, e.g. --name alice",
+        )?,
+    };
+    peer_add(&name, url, None)?;
+
+    println!();
+    println!("Backing up:");
+    for s in &Config::load().map_err(err("config"))?.settings.sources {
+        println!("  {}", s.display());
+    }
+    println!();
+    println!("Run `peerbackup backup` whenever you want to send a backup,");
+    println!("and `peerbackup recovery export` to save the details you would");
+    println!("need to restore without this program.");
+    Ok(())
+}
+
+/// Short peer name from a URL host, when one can be derived sensibly.
+///
+/// Returns `None` for bare IP addresses rather than naming a peer "192".
+fn peer_name_from_url(url: &str) -> Option<String> {
+    let after_scheme = url.split("://").nth(1).unwrap_or(url);
+    let host = after_scheme
+        .rsplit('@')
+        .next()
+        .unwrap_or(after_scheme)
+        .split(['/', ':'])
+        .next()
+        .unwrap_or("peer");
+    let first = host.split('.').next().unwrap_or("peer");
+    let cleaned: String = first
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .collect();
+    if cleaned.is_empty() || cleaned.chars().all(|c| c.is_ascii_digit()) {
+        None
+    } else {
+        Some(cleaned)
+    }
+}
+
 // ----------------------------------------------------------------------- peer
 
 /// Add a peer and prove the whole path works before trusting it.
@@ -659,6 +730,20 @@ mod tests {
         assert!(!out.contains("hunter2"), "password leaked: {out}");
         assert!(out.contains("alice.example.org"));
         assert!(out.contains("me"));
+    }
+
+    #[test]
+    fn peer_names_come_from_the_url_host() {
+        assert_eq!(
+            peer_name_from_url("rest:https://me:pw@alice.example.org:8000/me/").as_deref(),
+            Some("alice")
+        );
+        assert_eq!(
+            peer_name_from_url("rest:http://homeserver:8000/me/").as_deref(),
+            Some("homeserver")
+        );
+        // A bare IP yields no useful name, so ask instead of calling it "192".
+        assert_eq!(peer_name_from_url("rest:http://192.168.1.5:8000/me/"), None);
     }
 
     #[test]

@@ -20,6 +20,18 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Set up everything and connect to a peer, in one step
+    Connect {
+        /// Repository URL your peer gave you
+        url: String,
+        /// A directory to back up. Repeat for more than one.
+        #[arg(long = "source", required = true)]
+        sources: Vec<PathBuf>,
+        /// Short name for this peer (default: taken from the URL)
+        #[arg(long)]
+        name: Option<String>,
+    },
+
     /// Create the config file and test files
     Init,
 
@@ -104,10 +116,11 @@ fn main() {
 
     let nag_after = matches!(
         cli.command,
-        Command::Status | Command::Backup { .. } | Command::Peer(_)
+        Command::Status | Command::Backup { .. } | Command::Peer(_) | Command::Connect { .. }
     );
 
     let result = match cli.command {
+        Command::Connect { url, sources, name } => cli::connect(&url, &sources, name.as_deref()),
         Command::Init => cli::init(),
         Command::Peer(PeerCmd::Add { name, url, cacert }) => cli::peer_add(&name, &url, cacert),
         Command::Peer(PeerCmd::List) => cli::peer_list(),

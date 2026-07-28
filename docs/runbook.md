@@ -3,9 +3,9 @@
 Setup instructions for a machine that stores someone else's backups, with a
 fixed size limit per peer enforced by the filesystem.
 
-For a quicker setup with no root and a shared size limit, see
-[../docker/README.md](../docker/README.md). Come back here when you want a limit
-one peer cannot consume on behalf of the others.
+For a quicker setup with no root and a shared size limit, run
+`peerbackup-host quickstart <peer>`; see the README. Come back here when you
+want a limit one peer cannot consume on behalf of the others.
 
 ## Requirements
 
@@ -39,7 +39,7 @@ below it.
 ```sh
 sudo install -m 0755 deploy/peerbackup-host /usr/local/bin/
 sudo mkdir -p /usr/local/share/peerbackup
-sudo cp deploy/compose.yml /usr/local/share/peerbackup/
+sudo cp compose.yml /usr/local/share/peerbackup/
 sudo cp deploy/systemd/peerbackup-rest.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now peerbackup-rest

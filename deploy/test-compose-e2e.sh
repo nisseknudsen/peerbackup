@@ -14,6 +14,7 @@ set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 RESTIC="${RESTIC_BIN:-restic}"
 export PB_ROOT="${PB_ROOT:-/tmp/pb-e2e}"
+export PB_DATA="$PB_ROOT/mnt"
 export PB_PORT="${PB_PORT:-8011}"
 PB_UID="$(id -u)"; PB_GID="$(id -g)"; export PB_UID PB_GID
 BASE="http://127.0.0.1:$PB_PORT"
@@ -23,7 +24,7 @@ ok()  { printf '  \033[32mPASS\033[0m  %s\n' "$*"; PASS=$((PASS+1)); }
 bad() { printf '  \033[31mFAIL\033[0m  %s\n' "$*"; FAIL=$((FAIL+1)); }
 hdr() { printf '\n\033[1m=== %s ===\033[0m\n' "$*"; }
 
-cleanup() { docker compose -f "$HERE/compose.yml" down -v >/dev/null 2>&1 || true; }
+cleanup() { docker compose -f "$HERE/../compose.yml" down -v >/dev/null 2>&1 || true; }
 trap cleanup EXIT
 
 command -v docker >/dev/null || { echo "docker required"; exit 1; }
@@ -34,9 +35,9 @@ cleanup
 rm -rf "$PB_ROOT"; mkdir -p "$PB_ROOT/mnt/alice" "$PB_ROOT/mnt/bob" "$PB_ROOT/src"
 echo "peerbackup e2e payload" > "$PB_ROOT/src/f.txt"
 
-docker compose -f "$HERE/compose.yml" config >/dev/null 2>&1 \
+docker compose -f "$HERE/../compose.yml" config >/dev/null 2>&1 \
   && ok "compose.yml parses and interpolates" || bad "compose.yml invalid"
-docker compose -f "$HERE/compose.yml" up -d >/dev/null 2>&1
+docker compose -f "$HERE/../compose.yml" up -d >/dev/null 2>&1
 for _ in $(seq 1 40); do
   curl -s -o /dev/null "$BASE/" 2>/dev/null && break
   sleep 0.25

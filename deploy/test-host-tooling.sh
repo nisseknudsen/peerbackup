@@ -152,7 +152,7 @@ else
 fi
 
 hdr "compose.yml"
-COMPOSE="$(dirname "$0")/compose.yml"
+COMPOSE="$(dirname "$0")/../compose.yml"
 grep -q 'user:' "$COMPOSE" && ok "compose sets user (host can read its own data)" \
   || bad "compose missing user: — repos will be root-owned 0700"
 grep -q 'OPTIONS:' "$COMPOSE" && ok "compose configures via OPTIONS env, not command args" \

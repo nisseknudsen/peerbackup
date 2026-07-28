@@ -1,6 +1,6 @@
 # Client image: peerbackup plus restic, statically linked, no runtime deps.
 #
-# Read docker/README.md before using this. Source directories must be mounted at
+# Read the Docker section of README.md before using this. Source directories must be mounted at
 # the same paths they have on the host, because those paths are recorded in the
 # backup and appear in your recovery instructions. peerbackup refuses to run if
 # a configured source is missing, so a forgotten mount fails immediately rather

@@ -32,7 +32,7 @@ jobs:
             deploy/test-provision-root.sh \
             spike/lifecycle-spike.sh \
             tests/end_to_end.sh \
-            docker/test-client-image.sh
+            tests/docker.sh
 
   rust:
     name: rust (fmt, clippy, tests)
@@ -94,7 +94,7 @@ jobs:
       - uses: actions/checkout@v5
       # Builds the image and checks the failure Docker makes easy: a source
       # directory that was never mounted.
-      - run: ./docker/test-client-image.sh
+      - run: ./tests/docker.sh
         timeout-minutes: 15
 
   host-tooling:

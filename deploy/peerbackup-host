@@ -5,6 +5,7 @@
 # a preallocated disk image, mounts it, and hands the mounted directory to an
 # unprivileged rest-server container.
 #
+#   peerbackup-host quickstart <peer>         start a server and add a peer
 #   peerbackup-host provision <peer> <size>   e.g. provision nisse 500G
 #   peerbackup-host adduser   <peer> [pw]     create credential + restart + verify
 #   peerbackup-host release   <peer>          ordered teardown, destroys data
@@ -43,6 +44,9 @@ RESERVE_PCT="${MAINTENANCE_RESERVE_PCT:-15}"
 # Never let grants consume the last of the host disk, even if each grant is legal.
 HOST_MARGIN_GB="${HOST_MARGIN_GB:-20}"
 DRY_RUN="${DRY_RUN:-0}"
+# Set by adduser when it generates a password, so quickstart can print a URL
+# the peer can paste directly.
+GENERATED_PW=""
 
 die()  { printf '\033[31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 warn() { printf '\033[33mwarn:\033[0m %s\n' "$*" >&2; }
@@ -327,8 +331,57 @@ cmd_doctor() {
   return 0
 }
 
-cmd_up()   { run "docker compose -f '$(dirname "$0")/compose.yml' up -d"; }
-cmd_down() { run "docker compose -f '$(dirname "$0")/compose.yml' down"; }
+# ------------------------------------------------------------------ quickstart
+# Start a server and hand back a URL, in one command and without root.
+#
+# Uses a plain directory rather than a preallocated image, so the size limit is
+# rest-server's and is shared across all peers. `provision` is the version with
+# a per-peer limit the kernel enforces.
+cmd_quickstart() {
+  local peer="${1:-}" port="${PB_PORT:-8000}" data="${PB_DATA:-/srv/peerbackup-data}"
+  local container="${PB_CONTAINER:-peerbackup-rest}"
+  [ -n "$peer" ] || die "usage: peerbackup-host quickstart <peer-name>"
+  peer_valid "$peer" || die "peer name must be [a-zA-Z0-9_-] only"
+  command -v docker >/dev/null || die "docker is required"
+
+  mkdir -p "$data" 2>/dev/null || die "cannot create $data (pick another with PB_DATA=)"
+  [ -w "$data" ] || die "$data is not writable by $(id -un)"
+
+  if docker ps -a --format '{{.Names}}' | grep -qx "$container"; then
+    info "server already running, adding a peer to it"
+  else
+    info "starting the server on port $port"
+    run "docker run -d --name '$container' --restart unless-stopped \
+      --user '$(id -u):$(id -g)' \
+      -p '$port:8000' \
+      -v '$data:/data' \
+      -e OPTIONS='--private-repos --append-only --max-size ${PB_MAX_SIZE:-536870912000}' \
+      restic/rest-server:0.14.0" >/dev/null
+    for _ in $(seq 1 60); do
+      curl -s -o /dev/null "http://127.0.0.1:$port/" 2>/dev/null && break
+      sleep 0.25
+    done
+  fi
+
+  GENERATED_PW=""
+  QUIET=1 PB_PORT="$port" PB_CONTAINER="$container" cmd_adduser "$peer" >/dev/null \
+    || die "could not create the login for '$peer'"
+
+  local host; host=$(hostname -f 2>/dev/null || hostname)
+  info ""
+  info "Ready. Send this to $peer, over something you trust:"
+  info ""
+  info "  rest:http://$peer:${GENERATED_PW:-<password>}@$host:$port/$peer/"
+  info ""
+  info "They run:  peerbackup connect '<that url>' --source /path/to/back/up"
+  info ""
+  info "Storage:   $data"
+  info "Port $port must reach this machine. Use TLS if it is exposed to the"
+  info "internet: see the README."
+}
+
+cmd_up()   { run "docker compose -f '$(dirname "$0")/../compose.yml' up -d"; }
+cmd_down() { run "docker compose -f '$(dirname "$0")/../compose.yml' down"; }
 
 # ------------------------------------------------------------------- adduser
 # rest-server loads .htpasswd ONCE at startup and never reloads it. Its own log
@@ -346,13 +399,18 @@ cmd_adduser() {
 
   if [ -z "$pw" ]; then
     pw=$(head -c 24 /dev/urandom | base64 | tr -d '/+=' | head -c 24)
-    info "generated password for '$peer': $pw"
-    info "send it over a channel you trust. It is not stored anywhere in plaintext."
+    GENERATED_PW="$pw"
+    if [ "${QUIET:-0}" != "1" ]; then
+      info "generated password for '$peer': $pw"
+      info "send it over a channel you trust. It is not stored anywhere in plaintext."
+    fi
   fi
 
   run "docker exec '$container' create_user '$peer' '$pw'"
-  info "restarting the server so it picks up the new credential (it only reads"
-  info "the htpasswd file at startup)"
+  if [ "${QUIET:-0}" != "1" ]; then
+    info "restarting the server so it picks up the new credential (it only reads"
+    info "the htpasswd file at startup)"
+  fi
   run "docker restart '$container'"
 
   if [ "$DRY_RUN" = "1" ]; then return 0; fi
@@ -367,7 +425,9 @@ cmd_adduser() {
     sleep 0.5
   done
   case "$code" in
-    404|200) info "verified: credential for '$peer' authenticates (HTTP $code)";;
+    404|200)
+      [ "${QUIET:-0}" = "1" ] || info "verified: credential for '$peer' authenticates (HTTP $code)"
+      ;;
     401)     die "credential still returns 401 after restart — check $ROOT/mnt/.htpasswd";;
     *)       warn "could not verify credential (HTTP ${code:-no response}); check the server is up on port $port";;
   esac
@@ -379,6 +439,7 @@ usage() {
 }
 
 case "${1:-}" in
+  quickstart) shift; cmd_quickstart "$@";;
   provision) shift; cmd_provision "$@";;
   adduser)   shift; cmd_adduser "$@";;
   release)   shift; cmd_release "$@";;

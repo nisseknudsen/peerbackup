@@ -17,7 +17,7 @@ ok()  { printf '  \033[32mPASS\033[0m  %s\n' "$*"; PASS=$((PASS+1)); }
 bad() { printf '  \033[31mFAIL\033[0m  %s\n' "$*"; FAIL=$((FAIL+1)); }
 hdr() { printf '\n\033[1m=== %s ===\033[0m\n' "$*"; }
 
-HOST_COMPOSE="$HERE/docker/compose.host.yml"
+HOST_COMPOSE="$HERE/compose.yml"
 
 cleanup() {
   docker compose -f "$HOST_COMPOSE" down -v >/dev/null 2>&1 || true
@@ -30,7 +30,7 @@ trap cleanup EXIT
 
 command -v docker >/dev/null || { echo "docker required"; exit 1; }
 
-# Run the client exactly the way docker/README.md tells people to.
+# Run the client exactly the way the README tells people to.
 pb() {
   docker run --rm --network host \
     --user "$(id -u):$(id -g)" \
@@ -45,11 +45,11 @@ rm -rf "$WORK"; mkdir -p "$WORK"/{cfg,state,srv,data,other}
 echo "in the mounted directory" > "$WORK/data/kept.txt"
 echo "in the unmounted one"     > "$WORK/other/missed.txt"
 
-docker build -q -f docker/Dockerfile -t "$IMAGE" "$HERE" >/dev/null || { echo "build failed"; exit 1; }
+docker build -q -f "$HERE/Dockerfile" -t "$IMAGE" "$HERE" >/dev/null || { echo "build failed"; exit 1; }
 ok "image built"
 
-# Started exactly as docker/README.md instructs, so the documented host setup
-# is covered rather than described.
+# Started exactly as the README instructs, so the documented host setup is
+# covered rather than described.
 PB_DATA="$WORK/srv" PB_PORT="$PORT" PB_UID="$(id -u)" PB_GID="$(id -g)" \
   docker compose -f "$HOST_COMPOSE" up -d >/dev/null 2>&1
 for _ in $(seq 1 60); do curl -s -o /dev/null "http://127.0.0.1:$PORT/" && break; sleep 0.25; done
