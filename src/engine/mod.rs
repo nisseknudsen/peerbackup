@@ -82,6 +82,16 @@ impl std::fmt::Display for EngineError {
 
 impl std::error::Error for EngineError {}
 
+/// Result of a snapshot, including whether restic managed to read everything.
+#[derive(Debug, Clone)]
+pub struct Snapshot {
+    pub id: SnapshotId,
+    /// restic exits 0 and saves a snapshot even when a source could not be
+    /// read, printing only a warning. Silently backing up less than asked is
+    /// exactly the failure this product exists to catch, so it is surfaced.
+    pub incomplete: bool,
+}
+
 /// Options for taking a snapshot.
 #[derive(Debug, Clone, Default)]
 pub struct SnapshotOpts {
@@ -95,8 +105,7 @@ pub struct SnapshotOpts {
 /// What peerbackup needs a backup engine to do. All four methods, no more.
 pub trait BackupEngine {
     /// Take a snapshot of `sources`.
-    fn snapshot(&self, sources: &[PathBuf], opts: &SnapshotOpts)
-    -> Result<SnapshotId, EngineError>;
+    fn snapshot(&self, sources: &[PathBuf], opts: &SnapshotOpts) -> Result<Snapshot, EngineError>;
 
     /// Restore a single path out of a snapshot into `target`, returning its
     /// digest so the caller can compare against a snapshot-time value.

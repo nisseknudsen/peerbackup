@@ -133,7 +133,7 @@ pub fn peer_add(name: &str, url: &str, ca_cert: Option<PathBuf>) -> Res {
             },
         )
         .map_err(|e| format!("upload failed: {e}"))?;
-    println!("  uploaded ({snap})");
+    println!("  uploaded ({})", snap.id);
 
     println!("Downloading it again to check...");
     let file = canary
@@ -142,7 +142,7 @@ pub fn peer_add(name: &str, url: &str, ca_cert: Option<PathBuf>) -> Res {
     let tmp = std::env::temp_dir().join(format!("peerbackup-check-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp);
     let got = engine
-        .restore_path(&snap, &file.path, &tmp)
+        .restore_path(&snap.id, &file.path, &tmp)
         .map_err(|e| format!("download failed: {e}"))?;
     let ok = got.sha256 == file.sha256;
     let _ = std::fs::remove_dir_all(&tmp);
@@ -216,6 +216,8 @@ pub fn backup(only: Option<&str>) -> Res {
         ));
     }
 
+    check_sources(&cfg.settings.sources)?;
+
     let sources = cfg.backup_sources(&canary_dir());
     let opts = SnapshotOpts {
         upload_limit_kib: (cfg.settings.upload_limit_kib > 0)
@@ -230,8 +232,24 @@ pub fn backup(only: Option<&str>) -> Res {
         print!("{}: backing up... ", peer.name);
         io::stdout().flush().ok();
         match engine_for(peer).snapshot(&sources, &opts) {
-            Ok(id) => {
-                println!("done ({id})");
+            Ok(snap) if snap.incomplete => {
+                // restic exits 0 and saves a snapshot even when it could not
+                // read a source, printing one warning line. Treating that as
+                // success would mean reporting a backup that is missing data.
+                println!("INCOMPLETE ({})", snap.id);
+                println!("  restic could not read everything it was asked to back up.");
+                println!("  Check the paths in `sources` and their permissions.");
+                record(
+                    &peer.name,
+                    Kind::Backup,
+                    Verdict::Unknown,
+                    Some("restic could not read all sources".into()),
+                    None,
+                );
+                failed += 1;
+            }
+            Ok(snap) => {
+                println!("done ({})", snap.id);
                 record(&peer.name, Kind::Backup, Verdict::Good, None, None);
             }
             Err(e) => {
@@ -252,6 +270,33 @@ pub fn backup(only: Option<&str>) -> Res {
         return Err(format!("{failed} of {} peers failed", peers.len()));
     }
     Ok(())
+}
+
+/// Refuse to back up when a configured source is missing or unreadable.
+///
+/// restic would carry on, save a snapshot, exit 0 and print a single warning,
+/// so without this a forgotten bind mount or an unmounted disk produces a
+/// backup that silently lacks the data you care about.
+fn check_sources(sources: &[PathBuf]) -> Res {
+    let mut bad = Vec::new();
+    for s in sources {
+        match std::fs::metadata(s) {
+            Err(e) => bad.push(format!("{}: {e}", s.display())),
+            Ok(_) if std::fs::read_dir(s).is_err() && std::fs::File::open(s).is_err() => {
+                bad.push(format!("{}: not readable", s.display()))
+            }
+            Ok(_) => {}
+        }
+    }
+    if bad.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "these directories are missing or unreadable, so a backup would silently \
+         leave them out:\n  {}\n\nIf you are running in a container, check that each \
+         one is bind-mounted at the same path.",
+        bad.join("\n  ")
+    ))
 }
 
 // --------------------------------------------------------------------- verify
@@ -593,6 +638,26 @@ mod tests {
         assert!(!out.contains("hunter2"), "password leaked: {out}");
         assert!(out.contains("alice.example.org"));
         assert!(out.contains("me"));
+    }
+
+    #[test]
+    fn missing_sources_are_refused() {
+        // restic would save a snapshot anyway, exit 0, and print one warning.
+        let missing = PathBuf::from("/definitely/not/here");
+        let e = check_sources(&[missing]).unwrap_err();
+        assert!(e.contains("missing or unreadable"), "{e}");
+        assert!(e.contains("bind-mounted"), "should mention mounts: {e}");
+    }
+
+    #[test]
+    fn existing_sources_pass() {
+        assert!(check_sources(&[std::env::temp_dir()]).is_ok());
+    }
+
+    #[test]
+    fn one_bad_source_among_good_ones_still_refuses() {
+        let sources = vec![std::env::temp_dir(), PathBuf::from("/nope/nope")];
+        assert!(check_sources(&sources).is_err());
     }
 
     #[test]

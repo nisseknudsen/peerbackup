@@ -14,7 +14,9 @@ use sha2::{Digest, Sha256};
 
 use super::outcome::{Cause, VerifyOutcome};
 use super::restic_error::{Classified, classify, strip_go_trace};
-use super::{BackupEngine, EngineError, RestoredFile, SnapshotId, SnapshotMeta, SnapshotOpts};
+use super::{
+    BackupEngine, EngineError, RestoredFile, Snapshot, SnapshotId, SnapshotMeta, SnapshotOpts,
+};
 
 /// A peer's repository.
 #[derive(Debug, Clone)]
@@ -133,11 +135,7 @@ impl ResticEngine {
 }
 
 impl BackupEngine for ResticEngine {
-    fn snapshot(
-        &self,
-        sources: &[PathBuf],
-        opts: &SnapshotOpts,
-    ) -> Result<SnapshotId, EngineError> {
+    fn snapshot(&self, sources: &[PathBuf], opts: &SnapshotOpts) -> Result<Snapshot, EngineError> {
         let mut args: Vec<String> = vec!["backup".into(), "--json".into()];
         if let Some(kib) = opts.upload_limit_kib {
             args.extend(["--limit-upload".into(), kib.to_string()]);
@@ -150,12 +148,20 @@ impl BackupEngine for ResticEngine {
         let refs: Vec<&str> = args.iter().map(String::as_str).collect();
         let out = self.run(&refs, None)?;
 
-        parse_snapshot_id(&String::from_utf8_lossy(&out.stdout)).ok_or_else(|| EngineError {
-            message: "backup reported success but emitted no snapshot_id".into(),
-            exit_code: out.status.code(),
-            cause: Cause::Unclassified {
-                detail: "no snapshot_id in the --json summary".into(),
-            },
+        let combined = combined_output(&out);
+        let id = parse_snapshot_id(&String::from_utf8_lossy(&out.stdout)).ok_or_else(|| {
+            EngineError {
+                message: "backup reported success but emitted no snapshot_id".into(),
+                exit_code: out.status.code(),
+                cause: Cause::Unclassified {
+                    detail: "no snapshot_id in the --json summary".into(),
+                },
+            }
+        })?;
+        Ok(Snapshot {
+            id,
+            incomplete: combined.contains("could not be read")
+                || combined.contains("error_count") && !combined.contains("\"error_count\":0"),
         })
     }
 

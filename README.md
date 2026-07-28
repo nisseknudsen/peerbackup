@@ -46,6 +46,20 @@ cargo build --release
 sudo install -m 0755 target/release/peerbackup /usr/local/bin/
 ```
 
+Alternatively run the client from a container, which avoids installing Rust or
+restic. Source directories must be mounted at the same paths they have on the
+host, because those paths are recorded in the backup; see
+[docker/README.md](docker/README.md).
+
+```sh
+docker build -f docker/Dockerfile -t peerbackup .
+docker run --rm \
+  -v ~/.config/peerbackup:/config \
+  -v ~/.local/share/peerbackup:/state \
+  -v /srv/data:/srv/data:ro \
+  peerbackup backup
+```
+
 To host backups for others, also install the host tooling:
 
 ```sh
@@ -210,6 +224,7 @@ Integration tests use a real rest-server and a real restic. None require root:
 
 ```sh
 ./tests/end_to_end.sh                             # full client lifecycle
+./docker/test-client-image.sh                     # client container image
 ./deploy/test-host-tooling.sh                     # host tooling
 ./deploy/test-compose-e2e.sh                      # container and isolation
 ./deploy/test-provision-root.sh --in-container    # storage provisioning

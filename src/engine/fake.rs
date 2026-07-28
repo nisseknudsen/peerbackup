@@ -8,14 +8,16 @@ use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 
 use super::outcome::VerifyOutcome;
-use super::{BackupEngine, EngineError, RestoredFile, SnapshotId, SnapshotMeta, SnapshotOpts};
+use super::{
+    BackupEngine, EngineError, RestoredFile, Snapshot, SnapshotId, SnapshotMeta, SnapshotOpts,
+};
 
 /// Scripted engine. Each call pops the next queued response; when the queue is
 /// empty the configured default is returned.
 pub struct FakeEngine {
     pub verify_queue: RefCell<Vec<VerifyOutcome>>,
     pub verify_default: VerifyOutcome,
-    pub snapshot_result: RefCell<Option<Result<SnapshotId, EngineError>>>,
+    pub snapshot_result: RefCell<Option<Result<Snapshot, EngineError>>>,
     pub calls: RefCell<Vec<String>>,
 }
 
@@ -46,11 +48,7 @@ impl FakeEngine {
 }
 
 impl BackupEngine for FakeEngine {
-    fn snapshot(
-        &self,
-        sources: &[PathBuf],
-        opts: &SnapshotOpts,
-    ) -> Result<SnapshotId, EngineError> {
+    fn snapshot(&self, sources: &[PathBuf], opts: &SnapshotOpts) -> Result<Snapshot, EngineError> {
         self.calls.borrow_mut().push(format!(
             "snapshot({} sources, limit={:?})",
             sources.len(),
@@ -58,7 +56,10 @@ impl BackupEngine for FakeEngine {
         ));
         match self.snapshot_result.borrow_mut().take() {
             Some(r) => r,
-            None => Ok(SnapshotId("fake0001".into())),
+            None => Ok(Snapshot {
+                id: SnapshotId("fake0001".into()),
+                incomplete: false,
+            }),
         }
     }
 

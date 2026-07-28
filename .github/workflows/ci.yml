@@ -31,7 +31,8 @@ jobs:
             deploy/test-compose-e2e.sh \
             deploy/test-provision-root.sh \
             spike/lifecycle-spike.sh \
-            tests/end_to_end.sh
+            tests/end_to_end.sh \
+            docker/test-client-image.sh
 
   rust:
     name: rust (fmt, clippy, tests)
@@ -85,6 +86,16 @@ jobs:
       - name: server logs on failure
         if: failure()
         run: docker logs pb-e2e-client || true
+
+  client-image:
+    name: client container image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      # Builds the image and checks the failure Docker makes easy: a source
+      # directory that was never mounted.
+      - run: ./docker/test-client-image.sh
+        timeout-minutes: 15
 
   host-tooling:
     name: host tooling (no docker, no root)
