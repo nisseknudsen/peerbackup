@@ -18,7 +18,7 @@ services:
     user: "${PB_UID:-1000}:${PB_GID:-1000}"
 
     ports:
-      - "${PB_PORT:-8000}:8000"
+      - "${PB_PORT:-51515}:8000"
 
     environment:
       #   --private-repos  confines each login to its own subdirectory, so one
@@ -35,7 +35,7 @@ services:
         ${PB_EXTRA_OPTIONS:-}
 
     volumes:
-      - "${PB_DATA:-./peerbackup-data}:/data"
+      - "${PB_DATA:-${HOME}/.local/share/peerbackup-data}:/data"
       # TLS: put fullchain.pem and privkey.pem here, then set
       # PB_EXTRA_OPTIONS="--tls --tls-cert /certs/fullchain.pem --tls-key /certs/privkey.pem"
       # - "${PB_CERTS:-./certs}:/certs:ro"

@@ -27,11 +27,12 @@ Starts a server in Docker and prints a URL to send them:
 ```
 Ready. Send this to alice, over something you trust:
 
-  rest:http://alice:nq7Y7PYN44nqKG83mNc9@your-host:8000/alice/
+  rest:http://alice:nq7Y7PYN44nqKG83mNc9@your-host:51515/alice/
 ```
 
-No root, no systemd. Storage defaults to `/srv/peerbackup-data`; override with
-`PB_DATA=`. Forward port 8000 to the machine.
+No root, no systemd. Storage goes to `~/.local/share/peerbackup-data`; change it
+with `PB_DATA=`. Forward port 51515 to the machine, or pick another with
+`PB_PORT=`.
 
 ### Send: back up to that URL
 
@@ -52,7 +53,7 @@ peerbackup status      # is everything still fine?
 ```sh
 # Host
 docker run -d --name peerbackup-rest --restart unless-stopped \
-  --user "$(id -u):$(id -g)" -p 8000:8000 \
+  --user "$(id -u):$(id -g)" -p 51515:8000 \
   -v /srv/peerbackup-data:/data \
   -e OPTIONS="--private-repos --append-only" \
   restic/rest-server:0.14.0 \
@@ -252,8 +253,8 @@ Restored files appear under their original paths, so this produces
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `PB_DATA` | `./peerbackup-data` | Where backups are stored |
-| `PB_PORT` | `8000` | Published port |
+| `PB_DATA` | `~/.local/share/peerbackup-data` | Where backups are stored |
+| `PB_PORT` | `51515` | Published port |
 | `PB_UID` / `PB_GID` | `1000` | Owner of the stored files |
 | `PB_MAX_SIZE` | `536870912000` | Total bytes, all peers |
 | `PB_EXTRA_OPTIONS` | empty | Extra rest-server flags, e.g. TLS |
@@ -266,8 +267,8 @@ you open a window:
 ```sh
 docker compose down
 docker run --rm -d --name peerbackup-maint \
-  --user "$(id -u):$(id -g)" -p 8000:8000 \
-  -v /srv/peerbackup-data:/data \
+  --user "$(id -u):$(id -g)" -p 51515:8000 \
+  -v ~/.local/share/peerbackup-data:/data \
   -e OPTIONS="--private-repos" restic/rest-server:0.14.0
 # peer runs their cleanup, then:
 docker rm -f peerbackup-maint

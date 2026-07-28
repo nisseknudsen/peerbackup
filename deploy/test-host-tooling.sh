@@ -151,6 +151,41 @@ else
   bad "release proceeded without correct confirmation: $out"
 fi
 
+hdr "quickstart defaults and failure reporting"
+# The first command a new user runs. It must not need root, and it must never
+# print a URL when the server is not actually up.
+grep -q 'DEFAULT_DATA=.*XDG_DATA_HOME' "$HOST" \
+  && ok "default storage is under the user's home, not /srv" \
+  || bad "default storage path needs root"
+grep -q 'DEFAULT_PORT=51515' "$HOST" \
+  && ok "default port is out of the commonly-used range" \
+  || bad "default port is likely to collide"
+
+# An exec carrying only redirections applies them to the whole shell. Having
+# that swallow every later error is how a failed start once printed a URL.
+# Skip comments: the warning about this pattern contains the pattern. The
+# equivalent check for compose.yml made the same mistake first.
+if grep -vE '^\s*#' "$HOST" | grep -qE 'exec [0-9]>&-\s+2>/dev/null'; then
+  bad "an exec redirection is silencing stderr for the rest of the script"
+else
+  ok "no exec redirection that would silence later errors"
+fi
+
+if command -v docker >/dev/null 2>&1; then
+  OUT=$(PB_DATA="$WORK/dies" PB_PORT=51599 PB_MAX_SIZE=not-a-number \
+        "$HOST" quickstart tester 2>&1)
+  if echo "$OUT" | grep -q "Ready. Send this"; then
+    bad "printed a peer URL even though the server failed to start"
+  else
+    ok "a server that fails to start does not print a URL"
+  fi
+  echo "$OUT" | grep -qi "could not start" && ok "says the server did not start" \
+    || bad "no clear message when the server fails"
+  docker rm -f peerbackup-rest >/dev/null 2>&1 || true
+else
+  printf '  \033[33mSKIP\033[0m  quickstart failure path (needs docker)\n'
+fi
+
 hdr "compose.yml"
 COMPOSE="$(dirname "$0")/../compose.yml"
 grep -q 'user:' "$COMPOSE" && ok "compose sets user (host can read its own data)" \
