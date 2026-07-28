@@ -371,7 +371,19 @@ cmd_quickstart() {
        Or pick another: PB_DATA=/path peerbackup-host quickstart $peer"
 
   if docker ps --format '{{.Names}}' | grep -qx "$container"; then
-    info "server already running, adding a peer to it"
+    # Being up is not the same as serving on the port we are about to hand out.
+    # A container left over from an earlier setup listens somewhere else, and
+    # skipping this check is how a URL that cannot work gets printed.
+    if ! curl -s -o /dev/null "http://127.0.0.1:$port/" 2>/dev/null; then
+      die "a container named '$container' is already running, but nothing answers
+       on port $port. It is probably left over from an earlier setup using a
+       different port or storage directory.
+
+       Look at it:  docker ps --filter name=$container
+       Remove it:   docker rm -f $container
+       Then run this again."
+    fi
+    info "server already running on port $port, adding a peer to it"
   else
     docker rm -f "$container" >/dev/null 2>&1 || true
     port_free "$port" || die "port $port is already in use on this machine
@@ -449,7 +461,14 @@ cmd_adduser() {
     fi
   fi
 
-  run "docker exec '$container' create_user '$peer' '$pw'"
+  local mk_out
+  if ! mk_out=$(docker exec "$container" create_user "$peer" "$pw" 2>&1); then
+    warn "$mk_out"
+    die "could not create the login for '$peer' on container '$container'.
+       If the message above mentions /data, the server's storage directory is
+       missing or not writable. Check what it is mounted on:
+         docker inspect -f '{{range .Mounts}}{{.Source}} -> {{.Destination}}{{end}}' $container"
+  fi
   if [ "${QUIET:-0}" != "1" ]; then
     info "restarting the server so it picks up the new credential (it only reads"
     info "the htpasswd file at startup)"
@@ -471,8 +490,12 @@ cmd_adduser() {
     404|200)
       [ "${QUIET:-0}" = "1" ] || info "verified: credential for '$peer' authenticates (HTTP $code)"
       ;;
-    401)     die "credential still returns 401 after restart — check $ROOT/mnt/.htpasswd";;
-    *)       warn "could not verify credential (HTTP ${code:-no response}); check the server is up on port $port";;
+    401)     die "the login for '$peer' still fails after a restart. The server is
+       running but does not accept it; check its htpasswd file.";;
+    *)       die "could not confirm the login for '$peer' works (HTTP ${code:-no response}).
+       Nothing is answering on port $port, so the server is not serving there.
+       Check it:   docker ps --filter name=$container
+       Remove it:  docker rm -f $container";;
   esac
 }
 

@@ -182,6 +182,40 @@ if command -v docker >/dev/null 2>&1; then
   echo "$OUT" | grep -qi "could not start" && ok "says the server did not start" \
     || bad "no clear message when the server fails"
   docker rm -f peerbackup-rest >/dev/null 2>&1 || true
+
+  # A container that is up is not a server that works. Both of these printed a
+  # peer URL that could not possibly work, on a real first install.
+
+  # 1. Left over from an earlier setup, listening on a different port.
+  mkdir -p "$WORK/stale"
+  docker run -d --name peerbackup-rest --user "$(id -u):$(id -g)" -p 8099:8000 \
+    -v "$WORK/stale:/data" -e OPTIONS="--private-repos" \
+    restic/rest-server:0.14.0 >/dev/null 2>&1
+  sleep 2
+  OUT=$(PB_DATA="$WORK/d1" PB_PORT=51598 "$HOST" quickstart tester 2>&1)
+  if echo "$OUT" | grep -q "Ready. Send this"; then
+    bad "printed a URL while a stale container held the name"
+  else
+    ok "refuses when a container is up but not serving the expected port"
+  fi
+  echo "$OUT" | grep -q "docker rm -f" && ok "tells you how to clear the stale container" \
+    || bad "no remedy offered for the stale container"
+  docker rm -f peerbackup-rest >/dev/null 2>&1 || true
+
+  # 2. Running and reachable, but its storage was deleted underneath it.
+  mkdir -p "$WORK/vanish"
+  docker run -d --name peerbackup-rest --user "$(id -u):$(id -g)" -p 51597:8000 \
+    -v "$WORK/vanish:/data" -e OPTIONS="--private-repos" \
+    restic/rest-server:0.14.0 >/dev/null 2>&1
+  sleep 2
+  rm -rf "$WORK/vanish"
+  OUT=$(PB_DATA="$WORK/d2" PB_PORT=51597 "$HOST" quickstart tester 2>&1)
+  if echo "$OUT" | grep -q "Ready. Send this"; then
+    bad "printed a URL when the login could not be created"
+  else
+    ok "refuses when the login cannot be created"
+  fi
+  docker rm -f peerbackup-rest >/dev/null 2>&1 || true
 else
   printf '  \033[33mSKIP\033[0m  quickstart failure path (needs docker)\n'
 fi
