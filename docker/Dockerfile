@@ -29,12 +29,23 @@ COPY --from=build /src/target/x86_64-unknown-linux-musl/release/peerbackup /usr/
 
 # Config and recorded results live here. Both must be mounted, or every run
 # starts from nothing and status has no history to report.
+#
+# HOME and XDG_CACHE_HOME point into /state deliberately. restic keeps a cache
+# and locates it from HOME; with `--user` set to an id that has no entry in
+# /etc/passwd, HOME resolves to / and restic fails with
+# "mkdir /.cache: permission denied". Since people are told to pass their own
+# uid, that is the normal case, not an edge case. Putting the cache in a mounted
+# volume also means it survives between runs, which restic uses to avoid
+# re-reading unchanged data.
 ENV PEERBACKUP_CONFIG_DIR=/config \
-    PEERBACKUP_STATE_DIR=/state
+    PEERBACKUP_STATE_DIR=/state \
+    HOME=/state \
+    XDG_CACHE_HOME=/state/cache
 VOLUME ["/config", "/state"]
 
-# Runs as an ordinary user by default. Override with `--user` to match the
-# ownership of the files you are backing up.
+# A default for people who do not pass --user. Any uid works: nothing depends on
+# this account existing, because every writable path is an absolute one in a
+# mounted volume.
 RUN adduser -D -u 1000 peerbackup
 USER peerbackup
 

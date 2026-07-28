@@ -116,7 +116,28 @@ pub fn peer_add(name: &str, url: &str, ca_cert: Option<PathBuf>) -> Res {
             if e.message.contains("already initialized")
                 || e.message.contains("already exists") =>
         {
-            println!("  repository already exists, using it")
+            println!("  repository already exists, checking the password");
+            // A repository that exists but will not open is what you hit after
+            // losing your config: peerbackup generates a fresh password and
+            // restic answers "wrong password or no key found", which does not
+            // tell you what to do about it.
+            if let Some(cause) = engine.probe() {
+                let c = cause.to_string();
+                if c.contains("wrong password") || c.contains("no key found") {
+                    return Err(format!(
+                        "A backup repository already exists at this address, but the password \
+                         peerbackup generated does not open it.\n\n\
+                         If you are setting this peer up again after losing your configuration, \
+                         copy the password for this peer out of your recovery file into\n  {}\n\
+                         and run this command again.\n\n\
+                         If that password is gone, the data stored there cannot be decrypted; \
+                         ask your friend to release the space so you can start fresh.",
+                        secret.display()
+                    ));
+                }
+                return Err(format!("could not open the existing repository: {cause}"));
+            }
+            println!("  password accepted");
         }
         Err(e) => return Err(format!("could not create the repository: {e}")),
     }

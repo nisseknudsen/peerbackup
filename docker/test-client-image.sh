@@ -17,7 +17,12 @@ ok()  { printf '  \033[32mPASS\033[0m  %s\n' "$*"; PASS=$((PASS+1)); }
 bad() { printf '  \033[31mFAIL\033[0m  %s\n' "$*"; FAIL=$((FAIL+1)); }
 hdr() { printf '\n\033[1m=== %s ===\033[0m\n' "$*"; }
 
-cleanup() { docker rm -f "$SERVER" >/dev/null 2>&1 || true; }
+cleanup() {
+  docker rm -f "$SERVER" >/dev/null 2>&1 || true
+  # Some steps run as other uids and leave files this user cannot delete.
+  [ -d "$WORK" ] && docker run --rm -v "$WORK:/w" alpine:3.20 \
+    sh -c 'rm -rf /w/* /w/.[!.]* 2>/dev/null' >/dev/null 2>&1 || true
+}
 trap cleanup EXIT
 
 command -v docker >/dev/null || { echo "docker required"; exit 1; }
@@ -105,6 +110,43 @@ if [ -f "$WORK/restored/$WORK/data/kept.txt" ]; then
 else
   bad "restored tree does not use host paths"
   find "$WORK/restored" -type f 2>/dev/null | head -3 | sed 's/^/      /'
+fi
+
+hdr "works as a uid that is not in the image"
+# People are told to pass their own uid. If anything in the image assumes 1000,
+# or leaves HOME unset, restic fails with "mkdir /.cache: permission denied".
+# CI runs as 1001, which is how this was found.
+install -d -m 777 "$WORK/anyuid-cfg" "$WORK/anyuid-state"
+OUT=$(docker run --rm --network host --user "4242:4242" \
+      -v "$WORK/anyuid-cfg:/config" -v "$WORK/anyuid-state:/state" \
+      "$IMAGE" init 2>&1)
+if echo "$OUT" | grep -qi "permission denied"; then
+  bad "image assumes a specific uid: $OUT"
+else
+  ok "init works as an unknown uid"
+fi
+OUT=$(docker run --rm --network host --user "4242:4242" \
+      -v "$WORK/anyuid-cfg:/config" -v "$WORK/anyuid-state:/state" \
+      -v "$WORK/data:$WORK/data:ro" \
+      "$IMAGE" peer add alice "rest:http://me:pw@127.0.0.1:$PORT/me/anyuid/" 2>&1)
+if echo "$OUT" | grep -q "matches"; then
+  ok "restic works as an unknown uid (cache directory is writable)"
+else
+  bad "restic failed as an unknown uid: $(echo "$OUT" | tail -2)"
+fi
+
+hdr "re-adding a peer without the original password explains itself"
+install -d -m 777 "$WORK/lost-cfg" "$WORK/lost-state"
+docker run --rm --network host --user "$(id -u):$(id -g)" \
+  -v "$WORK/lost-cfg:/config" -v "$WORK/lost-state:/state" "$IMAGE" init >/dev/null 2>&1
+OUT=$(docker run --rm --network host --user "$(id -u):$(id -g)" \
+      -v "$WORK/lost-cfg:/config" -v "$WORK/lost-state:/state" \
+      -v "$WORK/data:$WORK/data:ro" \
+      "$IMAGE" peer add alice "rest:http://me:pw@127.0.0.1:$PORT/me/" 2>&1)
+if echo "$OUT" | grep -q "recovery file"; then
+  ok "points at the recovery file instead of relaying restic's error"
+else
+  bad "unhelpful error when the password does not match: $(echo "$OUT" | tail -2)"
 fi
 
 hdr "state persists between runs"

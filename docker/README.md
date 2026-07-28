@@ -87,10 +87,12 @@ ExecStart=/usr/bin/docker run --rm \
 
 ## File ownership
 
-The image runs as uid 1000. If the files you are backing up are owned by a
-different user, pass `--user` to match, or restic will not be able to read them.
-peerbackup reports unreadable sources as an error rather than backing up less
-than you asked for.
+Pass `--user` matching whoever owns the files you are backing up, or restic will
+not be able to read them. peerbackup reports unreadable sources as an error
+rather than backing up less than you asked for.
+
+Any uid works, including one that has no account inside the image. restic keeps
+a cache under `/state`, so it does not depend on a home directory existing.
 
 ## Restoring
 
