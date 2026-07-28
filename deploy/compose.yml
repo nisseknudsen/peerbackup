@@ -1,7 +1,6 @@
 # peerbackup peer host — the thing a friend actually runs.
 #
-# Three details here are load-bearing and were each learned the hard way in the
-# T1 spike (see docs/runbook.md):
+# Three things here are easy to get wrong (see docs/runbook.md):
 #
 #   1. `user:` is not optional. The image runs as uid 0 and creates repositories
 #      0700 root:root through the bind mount. Without this you cannot du, monitor

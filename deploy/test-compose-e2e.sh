@@ -4,8 +4,7 @@
 #
 # Unlike test-host-tooling.sh (pure logic, no docker), this brings up a real
 # rest-server and drives it with a real restic. It needs docker and a restic
-# binary but NOT root, so it runs in CI unchanged. This is the first half of
-# task T4 (the CI rig).
+# binary but NOT root, so it runs in CI unchanged.
 #
 # Run: ./deploy/test-compose-e2e.sh
 #      RESTIC_BIN=/path/to/restic ./deploy/test-compose-e2e.sh
@@ -118,12 +117,12 @@ grep -q '403' "$PB_ROOT/ao.out" && ok "prune failure carries HTTP 403" || bad "n
 "$RESTIC" -r "$A" check >/dev/null 2>&1 && ok "repo undamaged by the blocked prune" \
   || bad "repo damaged by a blocked prune"
 
-hdr "host-side ownership (task T14)"
+hdr "host-side file ownership"
 if du -sh "$PB_ROOT/mnt/alice" >/dev/null 2>&1 && [ -r "$PB_ROOT/mnt/alice" ]; then
   ok "host owner can read and du its own peer directory"
   printf '        %s\n' "$(ls -ld "$PB_ROOT/mnt/alice")"
 else
-  bad "host owner cannot read its own peer directory — the --user fix regressed"
+  bad "host owner cannot read its own peer directory — is the container running as root?"
 fi
 
 hdr "guard still fails closed on this layout"

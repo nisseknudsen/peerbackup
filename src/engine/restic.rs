@@ -193,9 +193,8 @@ impl BackupEngine for ResticEngine {
             return VerifyOutcome::Good { coverage_pct: pct };
         }
 
-        // A failed `check` is NOT automatically corruption: it also fails for
-        // full disks, dead peers and append-only refusals. Only the classifier
-        // decides.
+        // A failed `check` isn't automatically corruption: it also fails for full
+        // disks, dead peers and append-only refusals.
         match classify(out.status.code().unwrap_or(-1), &combined_output(&out)) {
             Classified::Damage(d) => VerifyOutcome::Bad(d),
             Classified::NoVerdict(c) => VerifyOutcome::Indeterminate(c),

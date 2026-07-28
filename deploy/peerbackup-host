@@ -12,7 +12,7 @@
 #   peerbackup-host guard                     fail-closed mountpoint check
 #   peerbackup-host doctor                    check the host is set up correctly
 #
-# Design notes that are load-bearing, not decoration:
+# A few things that are easy to get wrong:
 #
 #   * Images are PREALLOCATED, never sparse. A sparse image caps the inner
 #     filesystem but reserves no host blocks, so granting 500G to three friends

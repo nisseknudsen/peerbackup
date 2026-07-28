@@ -69,7 +69,7 @@ else
   ok "accepted legitimate peer name 'friend-a_1'"
 fi
 
-hdr "GUARD — fail closed (the most important behaviour in this file)"
+hdr "guard: refuses to start when storage is not mounted"
 
 # 1. No grant directories at all: must refuse, not shrug.
 # ${var:?} so an unset PEERBACKUP_ROOT aborts instead of rm -rf /mnt.
@@ -151,7 +151,7 @@ else
   bad "release proceeded without correct confirmation: $out"
 fi
 
-hdr "compose.yml — the three load-bearing details"
+hdr "compose.yml"
 COMPOSE="$(dirname "$0")/compose.yml"
 grep -q 'user:' "$COMPOSE" && ok "compose sets user (host can read its own data)" \
   || bad "compose missing user: — repos will be root-owned 0700"

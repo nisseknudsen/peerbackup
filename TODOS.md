@@ -47,7 +47,7 @@ they run sequentially but each holds its own index.
 **What:** re-run `spike/lifecycle-spike.sh` against a repository large enough that
 `prune` takes 10+ seconds, and land SIGKILLs in the late phase.
 
-**Why:** the T1 spike (2026-07-27) proved prune is crash-safe during *repack*:
+**Why:** the lifecycle spike showed prune is crash-safe during *repack*:
 three landed kills, all three repos reopened, checked clean, and restored the
 canary byte-identical. But every kill landed within 0.5s and prune finished by
 0.8s, so none reached the window between rewriting the index and deleting the

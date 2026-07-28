@@ -5,7 +5,7 @@
 //! that we could not look at it. Calling a network blip corruption trains the
 //! user to ignore red, which destroys the only feature this product has.
 //!
-//! Fixtures below are verbatim restic 0.19.1 output from the T1 spike.
+//! Fixtures below are real restic 0.19.1 output, not made up.
 
 use super::outcome::{Cause, Corruption};
 
@@ -160,7 +160,7 @@ fn extract_pack_id(s: &str) -> Option<String> {
 mod tests {
     use super::*;
 
-    // Verbatim from the T1 spike: restic 0.19.1, prune blocked by --append-only.
+    // Real output: restic 0.19.1, prune blocked by --append-only.
     const APPEND_ONLY: &str = r#"Remove(<snapshot/f77a5f056b>) failed: unexpected HTTP response (403): 403 Forbidden
 unable to remove snapshot/f77a5f056b3295baf18e3dc0c6c9c147d28a9586f456fe5f1d5987cd247056a2 from the repository
 [0:00] 0.00%  0 / 1 files deleted

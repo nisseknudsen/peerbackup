@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# peerbackup T1 — manual vertical lifecycle spike.
+# End-to-end check of restic + rest-server before relying on them.
 #
 # Purpose: answer the ONE question that could invalidate the retention design
 # before any Rust is written:
@@ -46,7 +46,7 @@ repo_url() { echo "rest:http://127.0.0.1:$PORT/spike/"; }
 # The restic/rest-server image is configured by ENV, not argv:
 #   DISABLE_AUTHENTICATION=1  -> passes --no-auth
 #   OPTIONS="..."             -> appended to the rest-server command line
-# Passing flags as docker args makes runc try to exec them. Learned the hard way.
+# Passing flags as docker args makes runc try to exec them.
 start_server() { # $1 = extra rest-server flags, $2 = data dir (default $SRV)
   local extra="${1:-}" datadir="${2:-$SRV}"
   docker rm -f "$CONTAINER" >/dev/null 2>&1 || true

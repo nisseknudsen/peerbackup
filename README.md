@@ -1,120 +1,118 @@
 # peerbackup
 
-Back up your homeserver to your friends' homeservers, and prove you can restore it.
+Back up your server to your friends' servers.
 
-Everyone needs a 3-2-1 backup strategy and nobody has the offsite copy. Meanwhile
-you and your friends all have idle terabytes in basements. peerbackup lets you
-reserve space for each other and, more importantly, tells you with evidence
-whether you could actually restore right now.
+If you run a homeserver, you probably have data you'd hate to lose and no copy of
+it anywhere but the house it lives in. Cloud storage fixes that for a monthly
+bill. Meanwhile you and your friends all have spare disk doing nothing.
 
-**Status: early. The host side works; the client is a seam and a plan.**
+peerbackup lets you trade space instead. You set aside 500GB for a friend, they
+set aside 500GB for you, and you each get an offsite backup for free. Your data
+is encrypted before it leaves your machine, so your friends can't read it, and
+after the first upload only the changes go over the wire.
 
-## What it is
+## Status
 
-peerbackup does not implement backup. Stock [`restic`](https://restic.net) does
-the encryption, chunking and dedup; stock
-[`rest-server`](https://github.com/restic/rest-server) receives it. peerbackup
-owns the parts nobody has built: multi-peer bookkeeping, canary verification,
-an evidence store, a recovery bundle, and a dashboard that never claims more
-than it checked.
+Early, and honest about it: **the receiving side works, the client doesn't exist
+yet.**
 
-The headline feature is proof. Every friend-backup arrangement runs on hope, and
-you find out on the worst day of your year. `status` answers three ways per peer:
+Today you can set up a machine to hold a friend's backups, and they can send
+backups to it with [restic](https://restic.net). That's a working offsite backup
+for one friend. What's missing is the peerbackup command that manages several
+friends at once, runs on a schedule, and checks your backups are still good.
 
-- `verified-good` — read back and matched, with the coverage percentage
-- `verified-bad` — read back and did not match
-- `unknown` — could not check, so nothing is claimed
+If that's enough for you, the setup below works right now.
 
-A network problem can never produce `verified-bad`. That distinction is enforced
-by the type system, not by convention, because a dashboard that cries wolf is
-worse than no dashboard.
+## How it works
 
-## Design constraints
+peerbackup doesn't do the backing up. [restic](https://restic.net) does, because
+it's been around for years and people restore from it every day. peerbackup
+handles the part restic doesn't: keeping track of several friends, making sure
+nobody runs out of space, and checking your backups regularly so you find out
+about a problem before you need the data.
 
-- No VPN. A peer is a URL, reachable by port forward or your own domain.
-- Trust is out-of-band. These are your friends; there is no defence against a
-  malicious peer, only against accidents, bitrot and dead disks.
-- N independent full replicas, one repository and key per peer. No erasure coding.
-- Repositories stay readable by plain `restic`, so recovery never depends on
-  peerbackup existing.
+Practically:
 
-## Why not just be a restic backend?
+- Your files are encrypted and split into chunks on your machine.
+- Those chunks go to a fixed-size area your friend set aside for you. They can't
+  read them, and you can't fill up their disk by accident.
+- Their server refuses deletes by default, so if your machine gets compromised
+  the attacker can't wipe your backup history.
+- Every so often peerbackup pulls some of it back down and checks it still
+  matches. That's the difference between believing you have a backup and knowing.
 
-restic has no plugin system; backends are compiled in. So the options are fork
-restic in Go, which breaks the promise that *stock* restic can open your
-repository during a disaster, or speak an existing protocol, which is what we do
-(REST, with a stock rest-server behind it).
+Because the storage is a normal restic repository, you can always get your data
+back with restic alone, even if peerbackup has vanished.
 
-The tempting variant is a local fan-out shim: restic writes to peerbackup on
-localhost, peerbackup mirrors every write to all peers, chunking once instead of
-N times. It falls over on partial failure. Peer 2 accepts a pack and peer 3 is
-full: answer 200 and peer 3 is silently incomplete, answer 500 and restic
-rewrites to peers that already have it. That is consensus in the write path of a
-backup tool.
+## Setting up a machine to hold backups
 
-Everything peerbackup adds sits above the data path anyway. A backend is a
-data-path component.
-
-## Host side (works today)
-
-What a friend runs to hold your backups:
+You need Linux, Docker, and some spare disk.
 
 ```bash
-sudo peerbackup-host provision nisse 500G   # preallocated image + mount unit
-sudo peerbackup-host adduser   nisse        # credential, restart, verify
-sudo peerbackup-host list                   # image / usable / reserve / used
-sudo peerbackup-host release   nisse        # ordered teardown
+# Set aside 500GB for a friend
+sudo peerbackup-host provision alice 500G
+
+# Give them a login
+sudo peerbackup-host adduser alice
+
+# Check on things later
+sudo peerbackup-host list
 ```
 
-Per-peer quota is a preallocated disk image mounted on the host and bind-mounted
-into an unprivileged container, so `ENOSPC` lands per peer at the kernel. The
-container refuses to start if any grant directory is not really a mountpoint:
-that failure is otherwise silent, and the first symptom is a full disk.
+Your friend then points restic at your server and backs up as normal. Full
+walkthrough, including TLS and how to give the space back:
+**[docs/runbook.md](docs/runbook.md)**.
 
-See [`docs/runbook.md`](docs/runbook.md) for setup and the traps.
-
-## Tests
+## Sending backups (for now, by hand)
 
 ```bash
-cargo test                        # engine seam
-./deploy/test-host-tooling.sh     # provisioning logic, no docker or root
-./deploy/test-compose-e2e.sh      # real rest-server + real restic
-./deploy/test-provision-root.sh --in-container   # real loop devices and quota
-./spike/lifecycle-spike.sh        # ~2GB, interrupted prunes, slow
+export RESTIC_PASSWORD_FILE=~/.config/peerbackup/alice.pass
+R="rest:https://you:password@alice.example.org:8000/you/"
+
+restic -r "$R" init
+restic -r "$R" backup /srv/data
+restic -r "$R" snapshots
+restic -r "$R" restore latest --target /tmp/restore
 ```
 
-No mocks. The product's claim is that a printed page plus stock restic recovers
-your data, and that claim is worth exactly the realism of the test behind it.
+Keep that password somewhere other than the machine you're backing up. If the
+machine dies and the password dies with it, your backup is unreadable.
 
-## Things that cost us, so they may cost you
+## What it deliberately doesn't do
 
-Measured against restic 0.19.1 and rest-server 0.14.0:
+- **No VPN required.** A friend just needs a port open, or a domain pointing at
+  their box.
+- **No strangers.** This is for people you know. There's no defence against a
+  friend who actively lies to you, only against dead disks, bitrot and accidents.
+- **No clever storage tricks.** Three friends means three complete copies, not
+  fragments spread across a network.
 
-- **`mkfs.ext4` discards by default**, punching holes back through `fallocate`.
-  64M preallocated becomes 4.5M allocated. Use `-E nodiscard`, and verify the
-  allocation *after* mkfs, not before.
-- **rest-server reads `.htpasswd` once at startup.** A credential added later
-  returns 401 until you restart, which is indistinguishable from a wrong password.
-- **The rest-server image runs as uid 0** and creates repos `0700 root:root`
-  through bind mounts, so you cannot `du` your own data. Pass `--user`.
-- **restic retries transport failures forever.** A 1% check against an
-  unreachable peer ran 631 seconds. Anything scheduled needs its own deadline.
-- **restic appends a Go trace to ordinary errors.** It is not a panic but it
-  reads like one. Strip it, and never pipe restic through `tail` to catch an
-  error: the real message is *above* the trace.
-- **An interrupted prune leaves the repository restorable.** Verified across
-  three landed SIGKILLs, though only during the repack phase.
+## Why not write a restic backend instead?
 
-## Layout
+restic's backends are compiled in, so adding one means forking restic. Then your
+data would only be readable by your fork, which is a bad property for the thing
+you reach for after losing a machine.
 
+The other option is a shim that pretends to be a server and mirrors writes to
+every friend at once. Tempting, but it breaks down when one friend is full and
+another isn't: you either tell restic the write succeeded when it partly didn't,
+or you make it retry against friends who already have the data.
+
+## Building
+
+```bash
+cargo build
+cargo test
 ```
-src/engine/     the seam: trait, three-state outcome, restic driver
-deploy/         host provisioning, compose, systemd, tests
-spike/          the lifecycle spike that validated the design
-docs/runbook.md what a peer host actually runs
-TODOS.md        deferred work, with the reasoning kept
+
+The shell tooling has its own tests, none of which need root:
+
+```bash
+./deploy/test-host-tooling.sh
+./deploy/test-compose-e2e.sh                     # needs docker + restic
+./deploy/test-provision-root.sh --in-container   # needs docker
 ```
 
 ## License
 
-Not yet chosen.
+Not chosen yet.

@@ -92,8 +92,7 @@ pub enum VerifyOutcome {
     /// back, which is reported separately from canary success so the dashboard
     /// never implies more than was checked.
     Good { coverage_pct: u8 },
-    /// Verified bad. One corrupt pack reddens the whole peer, on purpose: a
-    /// backup with a known-bad blob is not a backup.
+    /// One corrupt pack reddens the whole peer, deliberately.
     Bad(Corruption),
     /// No verdict. Ages into `unknown` on the dashboard; never into red.
     Indeterminate(Cause),
@@ -106,10 +105,8 @@ impl VerifyOutcome {
         matches!(self, VerifyOutcome::Good { .. })
     }
 
-    /// True only when we have positive evidence of damage.
-    ///
-    /// This is the predicate that turns a peer red, so it must never be
-    /// satisfied by a network problem.
+    /// True only with positive evidence of damage. Turns a peer red, so it must
+    /// never be satisfied by a network problem.
     pub fn is_bad(&self) -> bool {
         matches!(self, VerifyOutcome::Bad(_))
     }

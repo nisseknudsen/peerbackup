@@ -1,8 +1,7 @@
 //! peerbackup — friend-to-friend homeserver backup with proof of restorability.
 //!
-//! Only the engine seam exists so far (task T3). The CLI is a placeholder that
-//! reports what is wired up, so `cargo run` says something honest rather than
-//! pretending to be finished.
+//! Only the restic wrapper exists so far. This is a placeholder so `cargo run`
+//! says something true rather than pretending to be finished.
 
 // The seam is built ahead of its callers on purpose: it is the spine the client
 // hangs off, and the eng review put it first so the three-state model is

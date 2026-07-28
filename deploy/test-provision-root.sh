@@ -93,8 +93,7 @@ IMG="$PEERBACKUP_ROOT/images/testpeer.img"
 [ -f "$IMG" ] && ok "image file created" || bad "no image file at $IMG"
 
 # Preallocated, not sparse: apparent size and allocated blocks must agree.
-# This is the whole point of using fallocate over truncate, so assert it rather
-# than trusting the flag.
+# fallocate can report success without reserving anything, so check the blocks.
 APPARENT=$(stat -c %s "$IMG" 2>/dev/null || echo 0)
 ALLOCATED=$(( $(stat -c %b "$IMG" 2>/dev/null || echo 0) * $(stat -c %B "$IMG" 2>/dev/null || echo 512) ))
 if [ "$APPARENT" -eq 67108864 ]; then ok "image apparent size is 64M"; else bad "apparent size $APPARENT, want 67108864"; fi

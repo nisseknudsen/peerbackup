@@ -1,289 +1,164 @@
-# peerbackup — peer host runbook
+# Holding backups for a friend
 
-What a friend actually runs to hold your backups, and what the T1 spike proved
-about it. Every command here was executed against stock `restic 0.19.1` and
-`restic/rest-server:0.14.0` on 2026-07-27.
+How to set up a machine so a friend can back up to it. Takes about ten minutes.
 
-Nothing in this document is aspirational. If it is written here, it ran.
+You need Linux with systemd, Docker, and enough free disk for whatever you're
+giving away.
 
----
-
-## What the spike verified
-
-Run it yourself: `./spike/lifecycle-spike.sh`
-(needs docker and a restic binary; set `RESTIC_BIN` if restic is not on `PATH`).
-
-| Assumption from design rev 5 | Result |
-|---|---|
-| An interrupted prune leaves the repo openable and restorable | **HOLDS** — 3/3 landed SIGKILLs survived: repo opened, `check` passed, canary restored byte-identical |
-| `--append-only` blocks prune, and fails loudly | **HOLDS** — exit code `3`, `403 Forbidden`, `failed to remove one or more snapshots` |
-| `--append-only` still allows new backups | **HOLDS** |
-| A repo survives hitting its size limit | **HOLDS** — `507 Insufficient Storage`, exit `1`, repo still opens and checks clean |
-| The host owner can inspect their own peer directory | **ONLY WITH `--user`** — see the gotcha below |
-
-**Honest limitation.** All three successful kills landed within 0.5s, which on a
-2GB repo means they hit the *repack* phase. Prune's riskiest window is between
-rewriting the index and deleting the now-obsolete packs, and this spike never
-landed a kill there because prune finished by 0.8s. What is proven: prune is
-crash-safe during repack. What is not yet proven: crash-safety in the
-index-rewrite-to-delete window. Re-run against a repo large enough that prune
-takes 10+ seconds to close that gap.
-
----
-
-## Gotchas found the hard way
-
-**1. The image is configured by environment, not by arguments.**
+## 1. Set aside the space
 
 ```bash
-# WRONG — runc tries to exec "--no-auth" as a binary
-docker run restic/rest-server:0.14.0 --no-auth --path /data
-
-# RIGHT
-docker run -e DISABLE_AUTHENTICATION=1 -e OPTIONS="--append-only" restic/rest-server:0.14.0
+sudo peerbackup-host provision alice 500G
 ```
 
-**2. The image runs as uid 0 and creates repos `0700 root:root` on the host.**
+This creates a 500GB disk image, formats it, and mounts it. The space is really
+reserved, so you can't accidentally promise the same gigabytes to three people.
+It's also not permanent: `release` later gives it all back.
 
-Through a bind mount that means the *host owner cannot read their own peer
-directory*. No `du`, no quota monitoring, no teardown without sudo:
-
-```
-drwx------ 7 root root 160 /srv/peerbackup/nisse
-du: cannot read directory '/srv/peerbackup/nisse': Permission denied
-```
-
-Always pass `--user`:
+Check what you've handed out:
 
 ```bash
---user "$(id -u):$(id -g)"
+$ sudo peerbackup-host list
+PEER                  IMAGE       USABLE      RESERVE         USED  STATE
+alice                  500GB        491GB         73GB        112GB  mounted
 ```
 
-**3. restic appends a Go error-location trace to failures.**
+`USABLE` is less than `IMAGE` because filesystems have overhead. `RESERVE` is
+headroom your friend's cleanup needs to work; they're expected to stay under it.
 
-It is not a panic, but it looks exactly like one:
+## 2. Start the server
 
-```
-failed to remove one or more snapshots
-main.init
-	/restic/cmd/restic/cmd_forget.go:67
-runtime.doInit1
-	/usr/local/go/src/runtime/proc.go:8103
-...
-```
-
-peerbackup must strip lines matching `^(runtime|main)\.` and `^\s+/` before
-showing a user anything, or every ordinary error will read as a crash.
-
-**4. rest-server reads `.htpasswd` ONCE at startup and never reloads it.**
-
-Its own log says so: `Loaded htpasswd file /data/.htpasswd`. A credential created
-while the server is running returns **401 until you restart the container**, which
-is indistinguishable from a wrong password. Both sides then go off debugging TLS
-and typos for an hour.
-
-Never call `create_user` directly. Use:
+Copy the compose file and the service unit into place:
 
 ```bash
-peerbackup-host adduser <peer> [password]
+sudo cp deploy/compose.yml /usr/local/share/peerbackup/
+sudo cp deploy/peerbackup-host /usr/local/bin/
+sudo cp deploy/systemd/peerbackup-rest.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now peerbackup-rest
 ```
 
-which creates the user, restarts the server, and then **verifies the credential
-actually authenticates** before telling you it worked. If it cannot verify, it
-says so rather than reporting success.
+Edit `PB_UID`/`PB_GID` in the service file to match your user, or the container
+will write files you can't read.
 
-**5. `mkfs.ext4` silently undoes `fallocate`.**
-
-This is the subtlest thing in the whole deployment and it defeats the entire
-quota model. `mkfs.ext4` issues discards by default, which on a file-backed image
-punches holes straight through the preallocation:
-
-```
-after fallocate:           allocated = 64M
-after mkfs.ext4 (default): allocated = 4.5M   <- preallocation destroyed
-after mkfs -E nodiscard:   allocated = 64M
-```
-
-A sparse image caps the *inner* filesystem but reserves nothing on the host, so
-three 500G grants on a 1T disk still let the host fill up. Always:
+## 3. Give your friend a login
 
 ```bash
-mkfs.ext4 -q -m 0 -E nodiscard -F image.img
+sudo peerbackup-host adduser alice
 ```
 
-`peerbackup-host provision` does this and then **verifies the final allocated
-size after mkfs**, refusing to create the grant if the image came out sparse.
-Verifying right after `fallocate` is not enough: the check passes and the very
-next command invalidates it. Check the state you are actually shipping.
+It prints a password, restarts the server, and confirms the login actually works
+before telling you it's done. Send the password over something you trust.
 
-**6. Capture exit codes without a pipe.**
+Use this rather than `create_user` directly. The server only reads its password
+file at startup, so a login added any other way returns "unauthorized" until you
+restart, which looks exactly like a wrong password.
 
-`restic ... | tail -5` makes `$?` the exit code of `tail`, and `tail -5` also
-shows only the Go trace, hiding the real error above it. Redirect to a file,
-capture `$?`, then grep the whole thing.
+## 4. Turn on TLS
 
-Observed exit codes:
+Your friend's backups are already encrypted, but their password crosses the wire
+on every connection, so don't skip this.
 
-| Condition | Exit | Signature in output |
-|---|---|---|
-| prune blocked by `--append-only` | `3` | `403 Forbidden` |
-| write past `--max-size` | `1` | `507 Insufficient Storage` |
-
----
-
-## Host setup
-
-### 1. Provision the quota volume
-
-Preallocated, **not** sparse. A sparse image caps the inner filesystem but
-reserves no host blocks, so granting 500GB each to three friends on a 1TB disk
-still lets the host fill up.
+With a domain and Let's Encrypt:
 
 ```bash
-sudo mkdir -p /srv/peerbackup
-sudo fallocate -l 500G /srv/peerbackup/nisse.img      # NOT truncate
-sudo mkfs.ext4 -q /srv/peerbackup/nisse.img
-sudo mkdir -p /srv/peerbackup/mnt/nisse
+sudo mkdir -p /srv/peerbackup/certs
+sudo cp /etc/letsencrypt/live/example.org/{fullchain,privkey}.pem /srv/peerbackup/certs/
 ```
 
-### 2. Mount it on boot, as a hard dependency
+Then uncomment the certs volume in `compose.yml` and set:
 
-Mounting a loop file needs `CAP_SYS_ADMIN`, which the container must not have.
-So the host mounts it and the container receives an already-mounted directory.
-
-`/etc/systemd/system/srv-peerbackup-mnt-nisse.mount`:
-
-```ini
-[Unit]
-Description=peerbackup quota volume for nisse
-
-[Mount]
-What=/srv/peerbackup/nisse.img
-Where=/srv/peerbackup/mnt/nisse
-Type=ext4
-Options=loop,rw
-
-[Install]
-WantedBy=multi-user.target
 ```
+PB_EXTRA_OPTIONS="--tls --tls-cert /certs/fullchain.pem --tls-key /certs/privkey.pem"
+```
+
+Without a domain you can use a self-signed certificate, but your friend will
+need the `.pem` file and `restic --cacert` to use it.
+
+## 5. Open a port
+
+Forward port 8000 to this machine, or point a subdomain at it. Your friend's
+machine only makes outbound connections, so nothing needs opening on their side.
+
+## Check it works
 
 ```bash
-sudo systemctl enable --now srv-peerbackup-mnt-nisse.mount
+sudo peerbackup-host doctor   # prerequisites and permissions
+sudo peerbackup-host guard    # confirms the storage is really mounted
 ```
 
-### 3. Fail closed if the mount is missing
-
-**This is the one that bites silently.** If Docker starts before the mount
-settles, the bind mount resolves to an ordinary directory on the host root
-filesystem with no size limit at all, and the first symptom is a full disk.
+Then have your friend try it, or test locally:
 
 ```bash
-#!/usr/bin/env bash
-# /usr/local/bin/peerbackup-guard — refuse to serve without real mounts
-set -euo pipefail
-for d in /srv/peerbackup/mnt/*; do
-  mountpoint -q "$d" || { echo "FATAL: $d is not a mountpoint, refusing to start" >&2; exit 1; }
-done
+export RESTIC_PASSWORD=test
+restic -r "rest:http://alice:PASSWORD@localhost:8000/alice/" init
 ```
 
-Wire it in as `ExecStartPre=` on the container unit, and make the `.mount` unit
-a `Requires=` plus `After=` dependency. Verify by masking the mount unit and
-rebooting: the container must refuse to start.
-
-### 4. Run the server
+## Giving the space back
 
 ```bash
-docker run -d --name peerbackup-rest \
-  --restart unless-stopped \
-  --user "$(id -u):$(id -g)" \
-  -p 8000:8000 \
-  -v /srv/peerbackup/mnt:/data \
-  -e OPTIONS="--private-repos --append-only --max-size 536870912000" \
-  -v /srv/peerbackup/certs:/certs:ro \
-  restic/rest-server:0.14.0
+sudo peerbackup-host release alice
 ```
 
-`--private-repos` confines each credential to its own subdirectory, so
-`/data/nisse` is reachable only by the `nisse` credential. Per-peer quota comes
-from that subdirectory being its own mount; `--max-size` is a global backstop.
+Unmounts, detaches, deletes, and returns the capacity. It asks you to type the
+name first, because this destroys their backups and you can't undo it.
 
-Create a credential per grantee. **Use `adduser`, not `create_user`** (gotcha 4):
+## Notes
 
-```bash
-peerbackup-host adduser nisse            # generates a password
-peerbackup-host adduser nisse hunter2    # or supply one
-```
+**Reboots.** If Docker starts before the storage finishes mounting, the server
+would write to your root filesystem with no size limit, and you'd find out when
+the disk filled. The service refuses to start in that case instead. Worth
+testing once: mask the mount unit, reboot, and confirm the service fails.
 
-It creates the user, restarts the server so the credential is actually loaded,
-and verifies it authenticates before reporting success.
-
-### 6. Verify the whole thing
+**Pruning.** Old backups don't disappear on their own, and cleaning them up
+means deleting, which the server refuses by default. So a few times a year your
+friend will ask you to open a maintenance window:
 
 ```bash
-peerbackup-host doctor        # host prerequisites and the --user ownership check
-peerbackup-host list          # image size, usable capacity, reserve, used
-peerbackup-host guard         # must pass; this is what ExecStartPre runs
-```
-
-Two test suites ship with the repo and neither needs root:
-
-```bash
-./deploy/test-host-tooling.sh   # 39 assertions: parsing, refusals, fail-closed guard
-./deploy/test-compose-e2e.sh    # 17 assertions: real server, real restic, real isolation
-```
-
-### 5. Teardown, when someone stops hosting
-
-Order matters. `rm` on a mounted image is not a teardown.
-
-```bash
-sudo systemctl disable --now srv-peerbackup-mnt-nisse.mount
-sudo umount /srv/peerbackup/mnt/nisse    # if still mounted
-sudo losetup -D                          # detach
-sudo rm /srv/peerbackup/nisse.img        # only now
-```
-
----
-
-## Maintenance windows (prune)
-
-`--append-only` is a **process flag, not a per-user permission**. There is no
-per-grantee maintenance credential; the spike confirms prune fails with `403`
-and exit `3` while the flag is set.
-
-So pruning requires the host to briefly drop the guard for everyone:
-
-```bash
-docker stop peerbackup-rest
-docker run -d --name peerbackup-rest-maint \
+sudo systemctl stop peerbackup-rest
+sudo docker run -d --name peerbackup-maint \
   --user "$(id -u):$(id -g)" -p 8000:8000 \
   -v /srv/peerbackup/mnt:/data \
-  -e OPTIONS="--private-repos" \
-  restic/rest-server:0.14.0
-# ... grantee runs their prune ...
-docker rm -f peerbackup-rest-maint
-docker start peerbackup-rest
+  -e OPTIONS="--private-repos" restic/rest-server:0.14.0
+# they run their cleanup, then:
+sudo docker rm -f peerbackup-maint
+sudo systemctl start peerbackup-rest
 ```
 
-Coordinate it in the group chat. Exposure is bounded to the length of one prune,
-a few times a year, against a threat the design already declines to defend
-against (design rev 5, P4).
+Everyone you host for is unprotected during that window, so keep it short.
 
----
+## Troubleshooting
 
-## Client side, for reference
+**Your friend gets "unauthorized" with the right password.** The server reads
+logins at startup only. `sudo systemctl restart peerbackup-rest`, or use
+`peerbackup-host adduser`, which handles it.
+
+**You can't read your own backup directory.** The container is running as root.
+Set `PB_UID`/`PB_GID` in the service file to your user and restart.
+
+**`provision` refuses with "sparse grant".** The disk you're storing images on
+can't really reserve space, so the limit wouldn't hold. This happens on
+overlayfs, tmpfs and some network mounts. Put the images on a normal ext4, xfs
+or btrfs filesystem.
+
+**Their backups fail with "insufficient storage".** They've filled their
+allowance. Either they clean up, or you give them more with `release` then
+`provision`.
+
+**restic prints something that looks like a crash.** It appends a Go stack trace
+to ordinary errors. The real message is the line *above* the trace, so don't
+pipe it through `tail`.
+
+## Building the images by hand
+
+If you'd rather not use `peerbackup-host`:
 
 ```bash
-export RESTIC_PASSWORD_FILE=~/.config/peerbackup/friendA.pass
-export RESTIC_CACERT=~/.config/peerbackup/friendA-ca.pem
-R="rest:https://user:pass@peerbackup.example.org:8000/nisse/"
-
-restic -r "$R" init
-restic -r "$R" backup /srv/data
-restic -r "$R" snapshots
-restic -r "$R" check --read-data-subset=1%
-restic -r "$R" restore latest --target /tmp/restore --include /srv/data/canary
+sudo fallocate -l 500G /srv/peerbackup/images/alice.img
+sudo mkfs.ext4 -q -m 0 -E nodiscard -F /srv/peerbackup/images/alice.img
+sudo mkdir -p /srv/peerbackup/mnt/alice
+sudo mount -o loop /srv/peerbackup/images/alice.img /srv/peerbackup/mnt/alice
 ```
 
-These are the exact commands the recovery bundle must print, because after a
-disaster there is no peerbackup binary, only restic and a piece of paper.
+`-E nodiscard` matters. Without it `mkfs` hands the space straight back and your
+500GB image only reserves about 4MB, so the limit is fiction.
