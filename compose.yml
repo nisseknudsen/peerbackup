@@ -5,7 +5,7 @@
 #
 # By default the size limit is applied by rest-server and shared across all
 # peers. Pointing PB_DATA at provisioned per-peer volumes gives each peer its
-# own filesystem-enforced limit instead; see docs/runbook.md.
+# own filesystem-enforced limit instead; see the README.
 
 services:
   rest-server:

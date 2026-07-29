@@ -59,7 +59,7 @@ code=$(curl -s -o /dev/null -w '%{http_code}' -u carol:carolpw "$BASE/carol/conf
 if [ "$code" = "401" ]; then
   ok "confirmed: a credential added without a restart returns 401 (the trap is real)"
 else
-  bad "expected 401 for a credential added post-startup, got $code — behaviour changed, update the runbook"
+  bad "expected 401 for a credential added post-startup, got $code — behaviour changed, update the README"
 fi
 
 # adduser exists precisely so nobody hits that. It creates, restarts, verifies.
@@ -73,13 +73,14 @@ code=$(curl -s -o /dev/null -w '%{http_code}' -u alice:alicepw "$BASE/alice/conf
 code=$(curl -s -o /dev/null -w '%{http_code}' -u alice:wrongpw "$BASE/alice/config")
 [ "$code" = "401" ] && ok "wrong password rejected (401)" || bad "wrong password got $code"
 
-# adduser must refuse to report success if the credential does not work.
-out=$(PB_PORT=9999 PB_CONTAINER=peerbackup-rest "$HERE/peerbackup-host" adduser dave davepw 2>&1)
-if echo "$out" | grep -qi 'could not verify\|401'; then
-  ok "adduser reports a problem when it cannot verify the credential"
+# adduser must FAIL, not warn, when it cannot confirm the credential works.
+# Warning here is what once let quickstart print a URL nothing could use.
+if out=$(PB_PORT=9999 PB_CONTAINER=peerbackup-rest "$HERE/peerbackup-host" adduser dave davepw 2>&1); then
+  bad "adduser exited 0 without confirming the credential works: $out"
 else
-  bad "adduser claimed success without verifying: $out"
+  ok "adduser fails when it cannot confirm the credential works"
 fi
+echo "$out" | grep -qi 'could not confirm' && ok "and says so" || bad "unclear message: $out"
 
 hdr "--private-repos isolation"
 code=$(curl -s -o /dev/null -w '%{http_code}' -u alice:alicepw "$BASE/bob/config")

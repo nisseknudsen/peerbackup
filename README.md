@@ -69,7 +69,7 @@ docker run --rm \
 ```
 
 Source directories must be mounted at the same paths they have on the host. See
-[Docker](#docker) below for why.
+[Docker](#docker-sending-backups) below for why.
 
 ## Status
 
@@ -198,7 +198,115 @@ Persistent=true
 WantedBy=timers.target
 ```
 
-## Docker
+## Hosting
+
+`quickstart` is enough to get going. The rest of this section covers what you
+need for anything long-lived.
+
+### TLS
+
+Backups are encrypted before upload, but the login password is sent with every
+request. Use TLS on anything reachable from the internet.
+
+```sh
+mkdir -p ~/.local/share/peerbackup-certs
+cp /etc/letsencrypt/live/example.org/fullchain.pem ~/.local/share/peerbackup-certs/
+cp /etc/letsencrypt/live/example.org/privkey.pem   ~/.local/share/peerbackup-certs/
+```
+
+Uncomment the certs volume in `compose.yml`, then:
+
+```sh
+PB_EXTRA_OPTIONS="--tls --tls-cert /certs/fullchain.pem --tls-key /certs/privkey.pem" \
+  docker compose up -d
+```
+
+Peers then use `rest:https://...`. With a self-signed certificate they also need
+a copy of it and must pass `--cacert` when connecting.
+
+### A size limit per peer
+
+`quickstart` gives the whole server one limit shared by everyone on it, so one
+peer can consume all of it. To give each peer their own, enforced by the
+filesystem:
+
+```sh
+sudo peerbackup-host provision alice 500G
+sudo peerbackup-host adduser alice
+sudo peerbackup-host list
+```
+
+This creates a fixed-size disk image per peer and mounts it separately, so
+filling it produces an error on their side and cannot affect anyone else. It
+needs root, because mounting does.
+
+```
+$ sudo peerbackup-host list
+PEER                  IMAGE       USABLE      RESERVE         USED  STATE
+alice                  500GB        491GB         73GB        112GB  mounted
+```
+
+`USABLE` is lower than `IMAGE` because of filesystem overhead. `RESERVE` is
+headroom the peer's own cleanup needs.
+
+To give the space back:
+
+```sh
+sudo peerbackup-host release alice
+```
+
+This destroys their backups and cannot be undone, so it asks you to type the
+peer name first.
+
+### Running it as a service
+
+```sh
+sudo install -m 0755 deploy/peerbackup-host /usr/local/bin/
+sudo mkdir -p /usr/local/share/peerbackup
+sudo cp compose.yml /usr/local/share/peerbackup/
+sudo cp deploy/systemd/peerbackup-rest.service /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now peerbackup-rest
+```
+
+Set `PB_UID` and `PB_GID` in the service file to your own user.
+
+If you are using per-peer images, the service refuses to start when storage is
+not mounted. Without that check a boot where Docker wins the race would write to
+your root filesystem with no size limit, and the first symptom would be a full
+disk. Worth confirming once by masking a mount unit and rebooting; the service
+should fail.
+
+### Maintenance windows
+
+Deletion is refused by default, so a peer's cleanup of old backups fails until
+you open a window:
+
+```sh
+docker compose down
+docker run --rm -d --name peerbackup-maint \
+  --user "$(id -u):$(id -g)" -p 51515:8000 \
+  -v ~/.local/share/peerbackup-data:/data \
+  -e OPTIONS="--private-repos" restic/rest-server:0.14.0
+# peer runs their cleanup, then:
+docker rm -f peerbackup-maint
+docker compose up -d
+```
+
+Protection is off for every peer during the window, so keep it short.
+
+### Settings
+
+`compose.yml` reads these from the environment:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `PB_DATA` | `~/.local/share/peerbackup-data` | Where backups are stored |
+| `PB_PORT` | `51515` | Published port |
+| `PB_UID` / `PB_GID` | `1000` | Owner of the stored files |
+| `PB_MAX_SIZE` | `536870912000` | Total bytes, all peers |
+| `PB_EXTRA_OPTIONS` | empty | Extra rest-server flags, e.g. TLS |
+
+## Docker (sending backups)
 
 ### Mount source directories at their real paths
 
@@ -247,42 +355,36 @@ docker run --rm \
 Restored files appear under their original paths, so this produces
 `/tmp/restored/srv/data/...`.
 
-### Host settings
+## Troubleshooting
 
-`compose.yml` reads these from the environment:
+**A peer gets `401 Unauthorized` with the right password.**
+The server reads logins only at startup. Restart it, or use
+`peerbackup-host adduser`, which handles that.
 
-| Variable | Default | Meaning |
-|---|---|---|
-| `PB_DATA` | `~/.local/share/peerbackup-data` | Where backups are stored |
-| `PB_PORT` | `51515` | Published port |
-| `PB_UID` / `PB_GID` | `1000` | Owner of the stored files |
-| `PB_MAX_SIZE` | `536870912000` | Total bytes, all peers |
-| `PB_EXTRA_OPTIONS` | empty | Extra rest-server flags, e.g. TLS |
+**`quickstart` says a container is running but nothing answers on the port.**
+Left over from an earlier setup on a different port or storage directory.
+`docker rm -f peerbackup-rest`, then run it again.
 
-### Maintenance windows
+**You cannot read your own stored backups without `sudo`.**
+The container is running as root. Set `PB_UID`/`PB_GID` to your user and restart.
 
-Deletion is refused by default, so a peer's cleanup of old backups fails until
-you open a window:
+**`provision` refuses with "sparse grant".**
+The filesystem holding the images does not reserve space on allocation, so the
+limit would not hold. Affects overlayfs, tmpfs and some network filesystems. Use
+ext4, xfs or btrfs on local storage.
 
-```sh
-docker compose down
-docker run --rm -d --name peerbackup-maint \
-  --user "$(id -u):$(id -g)" -p 51515:8000 \
-  -v ~/.local/share/peerbackup-data:/data \
-  -e OPTIONS="--private-repos" restic/rest-server:0.14.0
-# peer runs their cleanup, then:
-docker rm -f peerbackup-maint
-docker compose up -d
-```
+**A peer reports `507 Insufficient Storage`.**
+They have filled their allowance. Either they remove old backups, or you give
+them more.
 
-Protection is off for every peer during the window, so keep it short.
+**A backup refuses with "missing or unreadable".**
+A directory in `sources` is gone, unreadable, or in Docker was not mounted.
+peerbackup refuses rather than backing up less than you asked for, because
+restic on its own would save a snapshot anyway and report success.
 
-## Going further
-
-`quickstart` gives every peer on the server one shared size limit. For a limit
-per peer, enforced by the filesystem so one peer cannot consume another's share,
-see [docs/runbook.md](docs/runbook.md). It also covers TLS, systemd units and
-maintenance windows.
+**restic output ends with what looks like a crash.**
+restic appends its own error-location trace to ordinary failures. The real
+message is the line above it.
 
 ## How it works
 

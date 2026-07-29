@@ -19,7 +19,7 @@
 
 [Unit]
 Description=peerbackup rest-server for peer grants
-Documentation=file:///usr/local/share/peerbackup/runbook.md
+Documentation=https://github.com/nisseknudsen/peerbackup
 After=docker.service network-online.target local-fs.target
 Requires=docker.service
 Wants=network-online.target
@@ -37,7 +37,7 @@ WorkingDirectory=/usr/local/share/peerbackup
 Environment=PB_DATA=/srv/peerbackup/mnt
 Environment=PB_PORT=8000
 # Must match the owner of the mounted grant directories, or the container
-# writes files the host owner cannot read. See docs/runbook.md.
+# writes files the host owner cannot read. See the README.
 Environment=PB_UID=1000
 Environment=PB_GID=1000
 
