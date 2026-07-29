@@ -216,6 +216,36 @@ EOF
   run "systemctl daemon-reload"
   run "systemctl enable --now '$unit'"
 
+  # A freshly formatted filesystem is owned by root, and mkfs.ext4 always
+  # creates lost+found as root:0700 whatever the parent looks like. The server
+  # runs as an ordinary user, so without this it cannot write to the grant at
+  # all, and both `adduser` and the startup mount check fail with permission
+  # denied. -R matters: lost+found alone is enough to break it.
+  # PB_UID wins so it can match the service file. Otherwise the person who ran
+  # sudo, since they are the one who will want to inspect the data later.
+  local own_uid="${PB_UID:-${SUDO_UID:-$(id -u)}}"
+  local own_gid="${PB_GID:-${SUDO_GID:-$(id -g)}}"
+
+  if [ "$DRY_RUN" = "1" ]; then
+    printf '  would run: chown %s:%s %s\n' "$own_uid" "$own_gid" "$MNT"
+    printf '  would run: chown -R %s:%s %s\n' "$own_uid" "$own_gid" "$dir"
+  else
+    # The parent holds rest-server's .htpasswd. Left as root, every `adduser`
+    # fails with permission denied, which is the first thing anyone hits.
+    chown "$own_uid:$own_gid" "$MNT" \
+      || die "could not give $MNT to $own_uid:$own_gid; creating logins will fail"
+
+    if ! mountpoint -q "$dir"; then
+      die "$dir is not mounted after enabling $unit, so it cannot be prepared.
+       Check: systemctl status $unit"
+    fi
+    # -R matters. mkfs.ext4 always creates lost+found as root:0700 whatever the
+    # parent looks like, and that alone fails the server's startup mount check.
+    chown -R "$own_uid:$own_gid" "$dir" \
+      || die "could not give $dir to $own_uid:$own_gid; the server cannot write to it"
+    info "grant and $MNT owned by $own_uid:$own_gid"
+  fi
+
   info ""
   info "grant created for '$peer'. Numbers that matter, all three of them:"
   cmd_list "$peer"

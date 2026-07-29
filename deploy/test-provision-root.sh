@@ -59,9 +59,13 @@ hdr() { printf '\n\033[1m=== %s ===\033[0m\n' "$*"; }
 # preallocates. Without it we land on whatever /tmp is, which in a container is
 # overlayfs and cannot back a real quota.
 WORK=$(mktemp -d "${PB_TEST_ROOT:-/tmp}/pb-root-test-XXXXXX")
+# mktemp gives 0700; the server user has to be able to traverse to its grant.
+chmod 755 "$WORK"
 export PEERBACKUP_ROOT="$WORK/srv"
 export SYSTEMD_UNIT_DIR="$WORK/units"
 export HOST_MARGIN_GB=0
+# Who the server would run as. provision must hand the grant to this user.
+export PB_UID=1000 PB_GID=1000
 mkdir -p "$SYSTEMD_UNIT_DIR"
 
 # There is no systemd in a container, and CI runners should not have units
@@ -71,6 +75,16 @@ STUB="$WORK/stub"; mkdir -p "$STUB"
 cat > "$STUB/systemctl" <<'EOS'
 #!/bin/sh
 echo "systemctl $*" >> "$SYSTEMCTL_LOG"
+# Emulate `enable --now <x>.mount` by performing the mount the unit describes.
+# Without this, everything provision does after enabling the unit goes untested.
+if [ "$1" = "enable" ] && [ "$2" = "--now" ] && [ -n "$3" ]; then
+  unit="$SYSTEMD_UNIT_DIR/$3"
+  [ -f "$unit" ] || exit 0
+  what=$(sed -n 's/^What=//p' "$unit"); where=$(sed -n 's/^Where=//p' "$unit")
+  [ -n "$what" ] && [ -n "$where" ] || exit 0
+  mkdir -p "$where"
+  mountpoint -q "$where" || mount -o loop,rw,noatime "$what" "$where" || exit 1
+fi
 exit 0
 EOS
 chmod +x "$STUB/systemctl"
@@ -140,14 +154,18 @@ grep -q 'enable --now' "$SYSTEMCTL_LOG" && ok "provision enables the mount unit"
 
 hdr "guard: refuses before mount, passes after"
 DIR="$PEERBACKUP_ROOT/mnt/testpeer"
+# provision leaves it mounted, which is correct. Unmount to exercise the
+# refusal, then mount it back.
+umount "$DIR" 2>/dev/null || true
 if $HOST guard >/dev/null 2>&1; then
   bad "guard PASSED while the grant was unmounted — fail-open"
 else
   ok "guard refuses while the grant is unmounted"
 fi
 
-# Mount exactly as the unit would.
-mount -o loop,rw,noatime "$IMG" "$DIR" 2>/dev/null || { bad "could not mount the image"; }
+# The stub already mounted it via the unit; this is a fallback.
+mountpoint -q "$DIR" || mount -o loop,rw,noatime "$IMG" "$DIR" 2>/dev/null \
+  || bad "could not mount the image"
 if mountpoint -q "$DIR"; then
   ok "image mounts as a real filesystem"
   if $HOST guard >/dev/null 2>&1; then
@@ -157,6 +175,39 @@ if mountpoint -q "$DIR"; then
   fi
 else
   bad "mountpoint check failed after mount"
+fi
+
+hdr "the grant is usable by the server, not just by root"
+# mkfs.ext4 creates lost+found as root:0700 whatever the parent looks like, and
+# a fresh filesystem is root-owned. The server runs unprivileged, so without a
+# recursive chown it cannot write to the grant at all: adduser and the startup
+# mount check both fail with permission denied.
+OWNER=$(stat -c '%u' "$DIR")
+[ "$OWNER" = "$PB_UID" ] && ok "grant belongs to the server user ($PB_UID)" \
+  || bad "grant is owned by uid $OWNER, not the server user $PB_UID"
+
+MNT_OWNER=$(stat -c '%u' "$PEERBACKUP_ROOT/mnt")
+[ "$MNT_OWNER" = "$PB_UID" ] \
+  && ok "the directory holding .htpasswd belongs to the server user" \
+  || bad "$PEERBACKUP_ROOT/mnt is owned by uid $MNT_OWNER; adduser will fail"
+
+if [ -d "$DIR/lost+found" ]; then
+  LF=$(stat -c '%u' "$DIR/lost+found")
+  [ "$LF" = "$PB_UID" ] && ok "lost+found was chowned too (-R was used)" \
+    || bad "lost+found is owned by uid $LF; the startup mount check will fail"
+fi
+
+# The assertion that matters: can that user actually write?
+if command -v setpriv >/dev/null 2>&1; then
+  PROBE_ERR=$(setpriv --reuid="$PB_UID" --regid="$PB_GID" --clear-groups \
+              touch "$DIR/probe" 2>&1)
+  if [ -e "$DIR/probe" ]; then
+    ok "the server user can write to the grant"
+    rm -f "$DIR/probe"
+  else
+    bad "the server user cannot write to the grant: $PROBE_ERR"
+    ls -ld "$DIR" | sed 's/^/        /'
+  fi
 fi
 
 hdr "the quota is real, not advisory"

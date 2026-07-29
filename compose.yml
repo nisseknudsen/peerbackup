@@ -41,9 +41,13 @@ services:
       # - "${PB_CERTS:-./certs}:/certs:ro"
 
     healthcheck:
-      # rest-server answers 404 on /, which is a running server declining to
-      # list the root. Any HTTP response means it is up.
-      test: ["CMD-SHELL", "wget -q -O /dev/null -T 3 http://127.0.0.1:8000/ || [ $? -eq 8 ]"]
+      # Any HTTP status line means the server answered, which is all "is it up"
+      # should mean. Do not check for a specific code: with --private-repos, /
+      # answers 401 forever, and busybox wget (this image is Alpine) exits 1 for
+      # an HTTP error exactly as it does for nothing listening, so a code check
+      # marks a working server permanently unhealthy. Orchestrators that route
+      # on container health then drop the route without logging why.
+      test: ["CMD-SHELL", "wget -q -S -O /dev/null -T 3 http://127.0.0.1:8000/ 2>&1 | grep -q 'HTTP/'"]
       interval: 30s
       timeout: 5s
       retries: 3
