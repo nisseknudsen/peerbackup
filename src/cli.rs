@@ -542,6 +542,17 @@ pub fn status_cmd() -> Res {
         println!("{}: {}", r.name, r.problem.as_ref().unwrap());
     }
 
+    // An unchecked peer usually just needs `verify`. But if its last attempt
+    // failed, say so: "unchecked" alone reads as "nothing happened yet" when
+    // the truth may be that every backup is being rejected.
+    for r in rows.iter().filter(|r| r.state == PeerState::Unknown) {
+        if let Some(reason) = last_failure(&records, &r.name) {
+            println!();
+            println!("{}: last attempt did not succeed", r.name);
+            println!("  {reason}");
+        }
+    }
+
     let unchecked: Vec<&str> = rows
         .iter()
         .filter(|r| r.state == PeerState::Unknown)
@@ -559,6 +570,14 @@ pub fn status_cmd() -> Res {
         return Err("one or more peers reported a problem".into());
     }
     Ok(())
+}
+
+/// Why a peer's most recent attempt did not succeed, if it did not.
+fn last_failure(records: &[crate::state::Record], peer: &str) -> Option<String> {
+    let last = records.iter().filter(|r| r.peer == peer).next_back()?;
+    (last.verdict != Verdict::Good)
+        .then(|| last.detail.clone())
+        .flatten()
 }
 
 // -------------------------------------------------------------------- restore

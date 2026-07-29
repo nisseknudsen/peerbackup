@@ -223,7 +223,15 @@ pub fn status(cfg: &Config, records: &[Record], now_ts: u64) -> Vec<PeerStatus> 
         .iter()
         .map(|peer| {
             let mine: Vec<&Record> = records.iter().filter(|r| r.peer == peer.name).collect();
-            let last = |k: Kind| mine.iter().filter(|r| r.kind == k).map(|r| r.at).max();
+            // Only successful checks count towards freshness. Counting attempts
+            // means a peer that is full, unreachable or misconfigured keeps
+            // reporting "backed up just now" while receiving nothing.
+            let last = |k: Kind| {
+                mine.iter()
+                    .filter(|r| r.kind == k && r.verdict == Verdict::Good)
+                    .map(|r| r.at)
+                    .max()
+            };
 
             // Anything that came back wrong and has not since been superseded by
             // a good check of the same kind.
@@ -420,5 +428,49 @@ mod tests {
         assert_eq!(ago(Some(NOW - 600), NOW), "10m ago");
         assert_eq!(ago(Some(NOW - 7200), NOW), "2h ago");
         assert_eq!(ago(Some(NOW - 86400 * 3), NOW), "3d ago");
+    }
+}
+
+#[cfg(test)]
+mod scenario_tests {
+    use super::*;
+    use crate::config::Peer;
+
+    #[test]
+    fn a_peer_that_is_full_must_not_look_ok() {
+        // A peer with no room fails every backup. Those failures are recorded
+        // as Unknown, because a failed upload says nothing about the data
+        // already stored. But they must not make the peer look freshly backed
+        // up: that is a green light for a peer receiving nothing.
+        let mut cfg = Config::default();
+        cfg.peers.push(Peer {
+            name: "full".into(),
+            url: "rest:http://x/".into(),
+            ca_cert: None,
+        });
+        let now_ts = 1_800_000_000u64;
+        let r = |kind, verdict, at| Record {
+            at,
+            peer: "full".into(),
+            kind,
+            verdict,
+            detail: None,
+            coverage_pct: Some(1),
+            snapshot: None,
+        };
+        let recs = vec![
+            // Everything was fine a month ago.
+            r(Kind::Backup, Verdict::Good, now_ts - 86400 * 30),
+            r(Kind::Subset, Verdict::Good, now_ts - 86400 * 2),
+            r(Kind::Canary, Verdict::Good, now_ts - 86400 * 2),
+            // Since then every backup has failed for lack of space.
+            r(Kind::Backup, Verdict::Unknown, now_ts - 3600),
+        ];
+        let st = &status(&cfg, &recs, now_ts)[0];
+        assert_ne!(
+            st.state,
+            PeerState::Good,
+            "a peer whose backups all fail must not report ok"
+        );
     }
 }
