@@ -224,6 +224,33 @@ PB_EXTRA_OPTIONS="--tls --tls-cert /certs/fullchain.pem --tls-key /certs/privkey
 Peers then use `rest:https://...`. With a self-signed certificate they also need
 a copy of it and must pass `--cacert` when connecting.
 
+**Already running a reverse proxy** (Traefik, Caddy, nginx...) with its own
+certificate for other services on this host? Skip the above entirely — leave
+`PB_EXTRA_OPTIONS` unset, point the proxy at the container's plain HTTP port
+(`8000` inside the container), and let it terminate TLS the way it does
+everything else. Don't publish `8000`/`51515` to the internet in this case;
+only the proxy's `80`/`443` need to be reachable. The invite URL loses the
+port: `rest:https://alice:PASSWORD@your-domain.example/alice/`.
+
+If the proxy's routing depends on the container's own Docker `HEALTHCHECK`
+(Traefik's docker provider does — silently: an unhealthy container's route
+just never appears, nothing gets logged anywhere obvious), a healthcheck that
+expects one specific status code from `/` is fragile: with `--private-repos`
+(used throughout this guide), `/` always answers `401`, not `200`/`404`. A
+check for one exact code will flap the container unhealthy the moment auth is
+enabled. Minimal images make it worse — rest-server's own image is
+Alpine/busybox, and busybox `wget`'s exit code doesn't distinguish "server
+answered with an HTTP error" from "nothing listening" (both are `1`; GNU
+wget's `8` doesn't apply here). Check for a literal response instead:
+
+```yaml
+healthcheck:
+  test: ["CMD-SHELL", "wget -q -S -O /dev/null -T 3 http://127.0.0.1:8000/ 2>&1 | grep -q 'HTTP/'"]
+```
+
+Any HTTP status line means the server answered, which is all "is it up"
+should mean here.
+
 ### A size limit per peer
 
 `quickstart` gives the whole server one limit shared by everyone on it, so one
@@ -257,6 +284,22 @@ sudo peerbackup-host release alice
 
 This destroys their backups and cannot be undone, so it asks you to type the
 peer name first.
+
+**The grant `provision` just created is owned by `root`** — including its
+auto-created `lost+found`, which `mkfs.ext4` always makes `root:0700`
+regardless of who owns the parent directory. The server is meant to run as
+`PB_UID`/`PB_GID` (see [Settings](#settings)) so you can inspect and remove
+your own stored data without `sudo` — but nothing chowns the grant to match,
+so `adduser` (and the server's own startup quota scan) fails on it with
+`permission denied` until you do this yourself, once per peer, before
+`adduser`:
+
+```sh
+sudo chown -R "$PB_UID:$PB_GID" /srv/peerbackup/mnt/alice
+```
+
+Missing the `-R` still breaks — `lost+found` alone is enough to fail the
+startup quota scan, even after the top-level directory is chowned correctly.
 
 ### Running it as a service
 
