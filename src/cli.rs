@@ -574,7 +574,7 @@ pub fn status_cmd() -> Res {
 
 /// Why a peer's most recent attempt did not succeed, if it did not.
 fn last_failure(records: &[crate::state::Record], peer: &str) -> Option<String> {
-    let last = records.iter().filter(|r| r.peer == peer).next_back()?;
+    let last = records.iter().rfind(|r| r.peer == peer)?;
     (last.verdict != Verdict::Good)
         .then(|| last.detail.clone())
         .flatten()
