@@ -323,6 +323,10 @@ struct SnapshotJson {
     time: String,
     #[serde(default)]
     paths: Vec<PathBuf>,
+    /// restic omits the key entirely for an untagged snapshot rather than
+    /// emitting an empty list.
+    #[serde(default)]
+    tags: Vec<String>,
 }
 
 /// `backup --json` is line-delimited; the summary line carries `snapshot_id`.
@@ -345,6 +349,7 @@ fn parse_snapshots(stdout: &str) -> serde_json::Result<Vec<SnapshotMeta>> {
             id: SnapshotId(s.short_id),
             time: s.time,
             paths: s.paths,
+            tags: s.tags,
         })
         .collect())
 }
@@ -375,6 +380,30 @@ mod tests {
         );
         assert_eq!(snaps[0].id.0, "54d97394");
         assert_eq!(snaps[0].paths, vec![PathBuf::from("/tmp/jsontest/src")]);
+    }
+
+    /// Verbatim from `restic 0.19.1 snapshots --json`, trimmed to the fields
+    /// this layer reads. Captured from a real repository holding one backup and
+    /// one `peer add` check, because `restore` now decides which snapshot holds
+    /// your data by reading `tags`. If restic ever renamed that key, every
+    /// snapshot would parse as untagged and `restore` would refuse all of them.
+    const REAL_TAGGED_SNAPSHOTS_JSON: &str = r#"[{"time": "2026-07-31T22:14:14.246121119-07:00", "paths": ["/tmp/src"], "tags": ["peerbackup"], "short_id": "4d14d8df"}, {"time": "2026-07-31T22:14:14.94813273-07:00", "paths": ["/tmp/src"], "tags": ["peerbackup-check"], "short_id": "bb1a23ec"}]"#;
+
+    #[test]
+    fn parses_the_tags_restic_actually_emits() {
+        let snaps = parse_snapshots(REAL_TAGGED_SNAPSHOTS_JSON).unwrap();
+        // Newest first, so the check snapshot leads.
+        assert_eq!(snaps[0].tags, vec!["peerbackup-check".to_string()]);
+        assert_eq!(snaps[1].tags, vec!["peerbackup".to_string()]);
+    }
+
+    #[test]
+    fn an_untagged_snapshot_parses_as_having_no_tags() {
+        // restic omits the key entirely rather than emitting []. Without the
+        // serde default this would fail to parse and list_snapshots would
+        // report the whole repository as unreadable.
+        let snaps = parse_snapshots(REAL_SNAPSHOTS_JSON).unwrap();
+        assert!(snaps[0].tags.is_empty());
     }
 
     #[test]

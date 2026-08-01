@@ -320,8 +320,11 @@ cmd_list() {
   [ "$found" = "0" ] && info "no grants"
   info ""
   info "USABLE is capacity after filesystem overhead, which is less than IMAGE."
-  info "RESERVE (${RESERVE_PCT}%) is headroom prune needs to repack. It is enforced by"
-  info "the CLIENT, not here: rest-server's --max-size is per instance, not per peer."
+  info "RESERVE (${RESERVE_PCT}%) is how much headroom prune needs to repack."
+  info "Nothing enforces it today. It is shown so you can leave room by hand:"
+  info "if USED climbs past USABLE minus RESERVE, prune may be unable to run."
+  info "rest-server's --max-size is per instance, not per peer, so it cannot"
+  info "enforce it either."
   return 0
 }
 

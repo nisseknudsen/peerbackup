@@ -184,7 +184,9 @@ There is no built-in scheduler.
 # /etc/systemd/system/peerbackup.service
 [Service]
 Type=oneshot
-ExecStart=/usr/local/bin/peerbackup backup
+# The leading `-` matters. `backup` exits non-zero if any peer failed, and
+# without it systemd would stop here and never verify the peers that worked.
+ExecStart=-/usr/local/bin/peerbackup backup
 ExecStart=/usr/local/bin/peerbackup verify
 ```
 
@@ -260,8 +262,10 @@ PEER                  IMAGE       USABLE      RESERVE         USED  STATE
 alice                  500GB        491GB         73GB        112GB  mounted
 ```
 
-`USABLE` is lower than `IMAGE` because of filesystem overhead. `RESERVE` is
-headroom the peer's own cleanup needs.
+`USABLE` is lower than `IMAGE` because of filesystem overhead. `RESERVE` is how
+much headroom `prune` needs to repack. Nothing enforces it: it is shown so you
+can leave room by hand. If `USED` climbs past `USABLE` minus `RESERVE`, cleanup
+may not be able to run.
 
 To give the space back:
 
