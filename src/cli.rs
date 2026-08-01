@@ -3,16 +3,16 @@
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-use crate::config::{Config, Peer, random_token, write_private};
+use crate::config::{Config, Peer, PeerName, random_token, write_private};
 use crate::engine::outcome::VerifyOutcome;
 use crate::engine::restic::ResticEngine;
-use crate::engine::{BackupEngine, SnapshotId, SnapshotMeta, SnapshotOpts};
+use crate::engine::{BackupEngine, Cause, SnapshotId, SnapshotMeta, SnapshotOpts};
 use crate::state::{
-    Canary, Evidence, Kind, PeerState, Record, Verdict, ago, canary_dir, now, sha256_bytes,
-    state_dir, status,
+    Canary, Evidence, Kind, PeerState, PeerStatus, Record, Verdict, ago, canary_dir, now,
+    sha256_bytes, state_dir, status,
 };
 
-type Res = Result<(), String>;
+use crate::Res;
 
 /// Real backups. The recovery instructions select on this.
 pub const BACKUP_TAG: &str = "peerbackup";
@@ -23,19 +23,56 @@ fn err<E: std::fmt::Display>(context: &str) -> impl Fn(E) -> String + '_ {
     move |e| format!("{context}: {e}")
 }
 
+/// A private scratch directory that cleans itself up.
+///
+/// `create_dir` rather than `create_dir_all`, and a random suffix rather than
+/// the pid: `/tmp` is world-writable, and a predictable name lets another user
+/// pre-create the directory so a restore lands somewhere unexpected. Failing
+/// loudly when it already exists is the point.
+struct Scratch(PathBuf);
+
+impl Scratch {
+    fn new(tag: &str) -> Result<Self, String> {
+        let suffix = random_token(16).map_err(err("could not generate a temp name"))?;
+        let dir = std::env::temp_dir().join(format!("peerbackup-{tag}-{suffix}"));
+        std::fs::create_dir(&dir)
+            .map_err(|e| format!("could not create {}: {e}", dir.display()))?;
+        Ok(Self(dir))
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        // A guard rather than a call at the end: the early returns below used to
+        // leak the directory on every failure path.
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 fn engine_for(peer: &Peer) -> ResticEngine {
     let mut e = ResticEngine::new(peer.url.clone(), Config::secret_path(&peer.name));
     e.ca_cert = peer.ca_cert.clone();
     if let Some(bin) = std::env::var_os("PEERBACKUP_RESTIC") {
         e.binary = PathBuf::from(bin);
     }
-    if let Some(secs) = env_secs("PEERBACKUP_PROBE_TIMEOUT") {
-        e.probe_timeout = secs;
-    }
-    if let Some(secs) = env_secs("PEERBACKUP_VERIFY_TIMEOUT") {
-        e.verify_timeout = secs;
-    }
+    // All four, not two. `restore_timeout` and `list_timeout` existed as fields
+    // with no way to set them, so the pair that were honoured looked arbitrary.
+    // These are escape hatches for a slow link, documented in the README.
+    set_from_env("PEERBACKUP_PROBE_TIMEOUT", &mut e.probe_timeout);
+    set_from_env("PEERBACKUP_VERIFY_TIMEOUT", &mut e.verify_timeout);
+    set_from_env("PEERBACKUP_RESTORE_TIMEOUT", &mut e.restore_timeout);
+    set_from_env("PEERBACKUP_LIST_TIMEOUT", &mut e.list_timeout);
     e
+}
+
+fn set_from_env(key: &str, field: &mut std::time::Duration) {
+    if let Some(secs) = env_secs(key) {
+        *field = secs;
+    }
 }
 
 fn env_secs(key: &str) -> Option<std::time::Duration> {
@@ -46,18 +83,69 @@ fn env_secs(key: &str) -> Option<std::time::Duration> {
         .map(std::time::Duration::from_secs)
 }
 
-fn record(peer: &str, kind: Kind, verdict: Verdict, detail: Option<String>, cov: Option<u8>) {
-    let r = Record {
-        at: now(),
-        peer: peer.to_string(),
-        kind,
-        verdict,
-        detail,
-        coverage_pct: cov,
-        snapshot: None,
-    };
-    if let Err(e) = Evidence::append(&r) {
-        eprintln!("warning: could not record evidence: {e}");
+/// Where a command reads and writes state.
+///
+/// Paths are carried rather than looked up from the environment at each use, so
+/// the commands below can be driven against a temporary directory in a test
+/// without mutating the process environment. `backup` and `verify` had no tests
+/// at all while they reached for `state_dir()` and `ResticEngine` directly.
+pub struct Runtime {
+    pub state: PathBuf,
+}
+
+impl Runtime {
+    pub fn from_env() -> Self {
+        Self {
+            state: crate::state::state_dir(),
+        }
+    }
+
+    fn evidence(&self) -> PathBuf {
+        self.state.join("evidence.jsonl")
+    }
+    fn canary_dir(&self) -> PathBuf {
+        self.state.join("canary")
+    }
+    fn canary_manifest(&self) -> PathBuf {
+        self.state.join("canary.json")
+    }
+
+    /// Record what happened to a peer.
+    ///
+    /// A `Bad` verdict is observed corruption, and losing it means the next
+    /// `status` calls a damaged peer healthy. That is the one verdict worth
+    /// failing the command over, so it propagates; the rest warn, because
+    /// failing a backup that actually succeeded would be its own lie.
+    fn record(
+        &self,
+        peer: &PeerName,
+        kind: Kind,
+        verdict: Verdict,
+        detail: Option<String>,
+        cov: Option<u8>,
+    ) -> Res {
+        let r = Record {
+            at: now(),
+            peer: peer.clone(),
+            kind,
+            verdict,
+            detail,
+            coverage_pct: cov,
+            snapshot: None,
+        };
+        match Evidence::append_to(&self.evidence(), &r) {
+            Ok(()) => Ok(()),
+            Err(e) if verdict == Verdict::Bad => Err(format!(
+                "{peer} reported damage and it could not be recorded to {}: {e}\n  \
+                 The next `status` would call this peer healthy. Fix the state \
+                 directory and re-run `peerbackup verify`.",
+                self.evidence().display()
+            )),
+            Err(e) => {
+                eprintln!("warning: could not record evidence: {e}");
+                Ok(())
+            }
+        }
     }
 }
 
@@ -110,7 +198,7 @@ pub fn connect(url: &str, sources: &[PathBuf], name: Option<&str>) -> Res {
     cfg.save().map_err(err("could not save config"))?;
 
     let name = match name {
-        Some(n) => n.to_string(),
+        Some(n) => n.to_owned(),
         None => peer_name_from_url(url).ok_or(
             "could not work out a name for this peer from the URL; pass --name, e.g. --name alice",
         )?,
@@ -161,20 +249,23 @@ fn peer_name_from_url(url: &str) -> Option<String> {
 /// certificate or the friend's disk space are wrong, that surfaces in seconds
 /// rather than several hours into a first real backup.
 pub fn peer_add(name: &str, url: &str, ca_cert: Option<PathBuf>) -> Res {
+    // Validate before the name reaches a path. Everything downstream takes a
+    // PeerName, so this is the only place the raw argument exists.
+    let name = PeerName::new(name)?;
     let mut cfg = Config::load().map_err(err("could not read config"))?;
-    if cfg.peer(name).is_some() {
+    if cfg.peer(&name).is_some() {
         return Err(format!("peer '{name}' already exists"));
     }
 
-    let secret = Config::secret_path(name);
+    let secret = Config::secret_path(&name);
     if !secret.exists() {
         let pw = random_token(32).map_err(err("could not generate a password"))?;
         write_private(&secret, pw.as_bytes()).map_err(err("could not write the password"))?;
     }
 
     let peer = Peer {
-        name: name.to_string(),
-        url: url.to_string(),
+        name: name.clone(),
+        url: url.to_owned(),
         ca_cert,
     };
     let engine = engine_for(&peer);
@@ -183,18 +274,14 @@ pub fn peer_add(name: &str, url: &str, ca_cert: Option<PathBuf>) -> Res {
     println!("Setting up repository...");
     match engine.init_repo() {
         Ok(()) => println!("  repository created"),
-        Err(e)
-            if e.message.contains("already initialized")
-                || e.message.contains("already exists") =>
-        {
+        Err(e) if e.cause == Cause::AlreadyInitialized => {
             println!("  repository already exists, checking the password");
             // A repository that exists but will not open is what you hit after
             // losing your config: peerbackup generates a fresh password and
             // restic answers "wrong password or no key found", which does not
             // tell you what to do about it.
             if let Some(cause) = engine.probe() {
-                let c = cause.to_string();
-                if c.contains("wrong password") || c.contains("no key found") {
+                if cause == Cause::WrongPassword {
                     return Err(format!(
                         "A backup repository already exists at this address, but the password \
                          peerbackup generated does not open it.\n\n\
@@ -231,13 +318,11 @@ pub fn peer_add(name: &str, url: &str, ca_cert: Option<PathBuf>) -> Res {
     let file = canary
         .first()
         .ok_or("the canary is empty; run `peerbackup init`")?;
-    let tmp = std::env::temp_dir().join(format!("peerbackup-check-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&tmp);
+    let tmp = Scratch::new("check")?;
     let got = engine
-        .restore_path(&snap.id, &file.path, &tmp)
+        .restore_path(&snap.id, &file.path, tmp.path())
         .map_err(|e| format!("download failed: {e}"))?;
     let ok = got.sha256 == file.sha256;
-    let _ = std::fs::remove_dir_all(&tmp);
 
     if !ok {
         return Err("the file that came back does not match the one sent".into());
@@ -251,7 +336,7 @@ pub fn peer_add(name: &str, url: &str, ca_cert: Option<PathBuf>) -> Res {
     // there, because none of it was sent. Recording a Backup here made `status`
     // report a brand new peer as "backed up just now", which is the most
     // reassuring possible lie for this program to tell.
-    record(name, Kind::Canary, Verdict::Good, None, None);
+    Runtime::from_env().record(&name, Kind::Canary, Verdict::Good, None, None)?;
 
     println!();
     println!("Peer '{name}' added and working.");
@@ -272,6 +357,7 @@ pub fn peer_list() -> Res {
 }
 
 pub fn peer_remove(name: &str) -> Res {
+    let name = PeerName::new(name)?;
     let mut cfg = Config::load().map_err(err("could not read config"))?;
     let before = cfg.peers.len();
     cfg.peers.retain(|p| p.name != name);
@@ -284,27 +370,79 @@ pub fn peer_remove(name: &str) -> Res {
     println!("Your data is still on their machine. Ask them to run:");
     println!("  sudo peerbackup host release <your-name>");
     println!("Then re-export your recovery file: peerbackup recovery export");
+
+    // The password is deliberately kept: it is the only thing that decrypts
+    // what is still sitting on their disk, and deleting it here would make that
+    // data unrecoverable the moment someone changed their mind. But it is a
+    // plaintext credential that the recovery file no longer covers, so say so
+    // rather than leaving it to be found later.
+    let secret = Config::secret_path(&name);
+    if secret.exists() {
+        println!();
+        println!("The password for '{name}' is still at");
+        println!("  {}", secret.display());
+        println!("It is kept because it is the only thing that decrypts what they");
+        println!("still hold. Delete it once they have released the space.");
+    }
     Ok(())
 }
 
 /// Hide the password in a repository URL before printing it.
+///
+/// The separator is the *last* `@` in the authority segment, not the first.
+/// Using the first leaked any password containing an `@`: given
+/// `rest:https://me:p@ssw0rd@host/`, the first `@` sits inside the password, so
+/// everything from there on was treated as the host and printed verbatim,
+/// producing `me:***@ssw0rd@host/`. `peer list` is the command people paste
+/// into bug reports, which is the exact thing the config and secret split
+/// exists to make safe.
+///
+/// Bounded to the authority segment so an `@` later in the path cannot be
+/// mistaken for the credential separator.
+///
+/// The slicing is safe despite the lint: every index below comes from `find`
+/// or `rfind`, which only ever return character boundaries.
+#[allow(clippy::string_slice)]
 fn redact(url: &str) -> String {
-    match (url.find("://"), url.find('@')) {
-        (Some(s), Some(at)) if at > s => {
-            let scheme = &url[..s + 3];
-            let rest = &url[at..];
-            let user = url[s + 3..at].split(':').next().unwrap_or("");
-            format!("{scheme}{user}:***{rest}")
-        }
-        _ => url.to_string(),
+    let Some(scheme_end) = url.find("://") else {
+        return url.to_owned();
+    };
+    let authority_start = scheme_end + 3;
+    let authority_end = url[authority_start..]
+        .find('/')
+        .map_or(url.len(), |i| authority_start + i);
+
+    let authority = &url[authority_start..authority_end];
+    let Some(at) = authority.rfind('@') else {
+        return url.to_owned();
+    };
+    let credentials = &authority[..at];
+    let user = credentials.split(':').next().unwrap_or("");
+    if credentials.len() == user.len() {
+        // A userinfo with no colon carries no password to hide.
+        return url.to_owned();
     }
+    format!(
+        "{}{user}:***{}",
+        &url[..authority_start],
+        &url[authority_start + at..]
+    )
 }
 
 // --------------------------------------------------------------------- backup
 
 pub fn backup(only: Option<&str>) -> Res {
     let cfg = Config::load().map_err(err("could not read config"))?;
-    let peers = select(&cfg, only)?;
+    backup_in(&Runtime::from_env(), &cfg, only, engine_for)
+}
+
+fn backup_in<E: BackupEngine>(
+    rt: &Runtime,
+    cfg: &Config,
+    only: Option<&str>,
+    make: impl Fn(&Peer) -> E,
+) -> Res {
+    let peers = select(cfg, only)?;
     if cfg.settings.sources.is_empty() {
         return Err(format!(
             "no directories to back up. Add them to `sources` in {}",
@@ -312,9 +450,15 @@ pub fn backup(only: Option<&str>) -> Res {
         ));
     }
 
-    check_sources(&cfg.settings.sources)?;
+    // The canary is part of every backup, so it is checked like every other
+    // source. It used to be appended after `check_sources` ran, so deleting the
+    // canary directory left backups reporting success while quietly shipping
+    // nothing to verify against, and `status` stuck on unchecked forever.
+    Canary::load_or_create_at(&rt.canary_dir(), &rt.canary_manifest())
+        .map_err(err("could not read the test files"))?;
+    let sources = cfg.backup_sources(&rt.canary_dir());
+    check_sources(&sources)?;
 
-    let sources = cfg.backup_sources(&canary_dir());
     let opts = SnapshotOpts {
         upload_limit_kib: (cfg.settings.upload_limit_kib > 0)
             .then_some(cfg.settings.upload_limit_kib),
@@ -327,37 +471,37 @@ pub fn backup(only: Option<&str>) -> Res {
     for peer in &peers {
         print!("{}: backing up... ", peer.name);
         io::stdout().flush().ok();
-        match engine_for(peer).snapshot(&sources, &opts) {
+        match make(peer).snapshot(&sources, &opts) {
             Ok(snap) if snap.incomplete => {
-                // restic exits 0 and saves a snapshot even when it could not
-                // read a source, printing one warning line. Treating that as
-                // success would mean reporting a backup that is missing data.
+                // restic can finish having failed to read some of what it was
+                // asked for. Treating that as success would report a backup
+                // that is missing data.
                 println!("INCOMPLETE ({})", snap.id);
                 println!("  restic could not read everything it was asked to back up.");
                 println!("  Check the paths in `sources` and their permissions.");
-                record(
+                rt.record(
                     &peer.name,
                     Kind::Backup,
                     Verdict::Unknown,
                     Some("restic could not read all sources".into()),
                     None,
-                );
+                )?;
                 failed += 1;
             }
             Ok(snap) => {
                 println!("done ({})", snap.id);
-                record(&peer.name, Kind::Backup, Verdict::Good, None, None);
+                rt.record(&peer.name, Kind::Backup, Verdict::Good, None, None)?;
             }
             Err(e) => {
                 println!("FAILED");
                 println!("  {e}");
-                record(
+                rt.record(
                     &peer.name,
                     Kind::Backup,
                     Verdict::Unknown,
                     Some(e.to_string()),
                     None,
-                );
+                )?;
                 failed += 1;
             }
         }
@@ -399,26 +543,36 @@ fn check_sources(sources: &[PathBuf]) -> Res {
 
 pub fn verify(only: Option<&str>) -> Res {
     let cfg = Config::load().map_err(err("could not read config"))?;
-    let peers = select(&cfg, only)?;
-    let canary = Canary::load().map_err(err("could not read the canary"))?;
+    verify_in(&Runtime::from_env(), &cfg, only, engine_for)
+}
+
+fn verify_in<E: BackupEngine>(
+    rt: &Runtime,
+    cfg: &Config,
+    only: Option<&str>,
+    make: impl Fn(&Peer) -> E,
+) -> Res {
+    let peers = select(cfg, only)?;
+    let canary =
+        Canary::load_at(&rt.canary_manifest()).map_err(err("could not read the canary"))?;
     let pct = cfg.settings.verify_subset_pct;
     let mut bad = 0;
 
     for peer in &peers {
-        let engine = engine_for(peer);
+        let engine = make(peer);
         println!("{}:", peer.name);
 
         // Ask a cheap question first. Checking a peer that is not answering
         // otherwise burns the whole verification timeout on retries.
         if let Some(cause) = engine.probe() {
             println!("  not reachable: {cause}");
-            record(
+            rt.record(
                 &peer.name,
                 Kind::Subset,
                 Verdict::Unknown,
                 Some(cause.to_string()),
                 None,
-            );
+            )?;
             continue;
         }
 
@@ -427,36 +581,36 @@ pub fn verify(only: Option<&str>) -> Res {
         match engine.verify_subset(pct) {
             VerifyOutcome::Good { coverage_pct } => {
                 println!("ok");
-                record(
+                rt.record(
                     &peer.name,
                     Kind::Subset,
                     Verdict::Good,
                     None,
                     Some(coverage_pct),
-                );
+                )?;
             }
             VerifyOutcome::Bad(c) => {
                 println!("FAILED");
                 println!("    {c}");
-                record(
+                rt.record(
                     &peer.name,
                     Kind::Subset,
                     Verdict::Bad,
                     Some(c.to_string()),
                     None,
-                );
+                )?;
                 bad += 1;
             }
             VerifyOutcome::Indeterminate(c) => {
                 println!("could not check");
                 println!("    {c}");
-                record(
+                rt.record(
                     &peer.name,
                     Kind::Subset,
                     Verdict::Unknown,
                     Some(c.to_string()),
                     None,
-                );
+                )?;
             }
         }
 
@@ -465,23 +619,23 @@ pub fn verify(only: Option<&str>) -> Res {
         match restore_canary(&engine, &canary) {
             Ok(true) => {
                 println!("matches");
-                record(&peer.name, Kind::Canary, Verdict::Good, None, None);
+                rt.record(&peer.name, Kind::Canary, Verdict::Good, None, None)?;
             }
             Ok(false) => {
                 println!("DOES NOT MATCH");
-                record(
+                rt.record(
                     &peer.name,
                     Kind::Canary,
                     Verdict::Bad,
                     Some("restored test file did not match what was sent".into()),
                     None,
-                );
+                )?;
                 bad += 1;
             }
             Err(e) => {
                 println!("could not restore");
                 println!("    {e}");
-                record(&peer.name, Kind::Canary, Verdict::Unknown, Some(e), None);
+                rt.record(&peer.name, Kind::Canary, Verdict::Unknown, Some(e), None)?;
             }
         }
     }
@@ -494,7 +648,7 @@ pub fn verify(only: Option<&str>) -> Res {
     Ok(())
 }
 
-fn restore_canary(engine: &ResticEngine, canary: &Canary) -> Result<bool, String> {
+fn restore_canary(engine: &impl BackupEngine, canary: &Canary) -> Result<bool, String> {
     let file = canary.first().ok_or("the canary is empty")?;
     let latest = engine
         .list_snapshots()
@@ -502,25 +656,29 @@ fn restore_canary(engine: &ResticEngine, canary: &Canary) -> Result<bool, String
         .into_iter()
         .next()
         .ok_or("no snapshots on this peer yet")?;
-    let tmp = std::env::temp_dir().join(format!("peerbackup-verify-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&tmp);
+    let tmp = Scratch::new("verify")?;
     let got = engine
-        .restore_path(&latest.id, &file.path, &tmp)
+        .restore_path(&latest.id, &file.path, tmp.path())
         .map_err(|e| e.to_string())?;
-    let _ = std::fs::remove_dir_all(&tmp);
     Ok(got.sha256 == file.sha256)
 }
 
 // --------------------------------------------------------------------- status
 
 pub fn status_cmd() -> Res {
+    let rt = Runtime::from_env();
     let cfg = Config::load().map_err(err("could not read config"))?;
     if cfg.peers.is_empty() {
         println!("No peers yet. Add one with `peerbackup peer add <name> <url>`.");
         return Ok(());
     }
-    let records = Evidence::read_all();
     let t = now();
+    // Only as far back as the widest window `status` actually consults. The
+    // evidence log is append-only and never rotated, so reading all of it meant
+    // re-parsing every record ever written on the command people run most.
+    // Doubled so a boundary record is never the reason a peer looks unchecked.
+    let window = cfg.settings.canary_days.max(cfg.settings.subset_days) * 86400 * 2;
+    let records = Evidence::read_since(&rt.evidence(), t.saturating_sub(window));
     let rows = status(&cfg, &records, t);
 
     println!(
@@ -561,40 +719,53 @@ pub fn status_cmd() -> Res {
     // stale are both `unchecked`, but the thing to do about them is different.
     // Telling someone to run `verify` against a peer holding none of their data
     // sends them to check something that was never there.
-    let (never, stale): (Vec<&str>, Vec<&str>) = rows
+    let (never, stale): (Vec<&PeerStatus>, Vec<&PeerStatus>) = rows
         .iter()
         .filter(|r| r.state == PeerState::Unknown)
-        .map(|r| r.name.as_str())
-        .partition(|n| {
-            rows.iter()
-                .find(|r| r.name == *n)
-                .is_some_and(|r| r.last_backup.is_none())
-        });
+        .partition(|r| r.last_backup.is_none());
 
     if !never.is_empty() {
         println!();
         println!(
             "No backup has reached: {}. Run `peerbackup backup`.",
-            never.join(", ")
+            join_names(&never)
         );
     }
     if !stale.is_empty() {
         println!();
         println!(
             "Not checked recently: {}. Run `peerbackup verify`.",
-            stale.join(", ")
+            join_names(&stale)
         );
     }
 
+    // Exit codes, in the order that matters. `Bad` is observed damage. But a
+    // peer stuck on `unknown` past its own windows -- unreachable for weeks,
+    // out of space, rejecting credentials -- used to exit 0, which meant this
+    // program was silent from cron in exactly the situation it exists for. The
+    // three-state model is right; collapsing it to two at the exit code was
+    // not, and it collapsed in the reassuring direction.
     if rows.iter().any(|r| r.state == PeerState::Bad) {
         return Err("one or more peers reported a problem".into());
+    }
+    if !rows.is_empty() && rows.iter().all(|r| r.state == PeerState::Unknown) {
+        return Err(
+            "no peer has been confirmed good. Run `peerbackup backup` and `peerbackup verify`"
+                .into(),
+        );
+    }
+    if !stale.is_empty() {
+        return Err(format!(
+            "{} peer(s) have not been checked within their windows",
+            stale.len()
+        ));
     }
     Ok(())
 }
 
 /// Why a peer's most recent attempt did not succeed, if it did not.
-fn last_failure(records: &[crate::state::Record], peer: &str) -> Option<String> {
-    let last = records.iter().rfind(|r| r.peer == peer)?;
+fn last_failure(records: &[crate::state::Record], peer: &PeerName) -> Option<String> {
+    let last = records.iter().rfind(|r| peer == r.peer.as_str())?;
     (last.verdict != Verdict::Good)
         .then(|| last.detail.clone())
         .flatten()
@@ -616,7 +787,7 @@ fn last_failure(records: &[crate::state::Record], peer: &str) -> Option<String> 
 /// Selection is by tag, not by matching snapshot paths against `sources`.
 /// Paths stop matching the moment someone reorganises their folders, and a
 /// restore that refuses because you renamed a directory is its own failure.
-fn newest_real_backup(snaps: &[SnapshotMeta], peer_name: &str) -> Result<SnapshotId, String> {
+fn newest_real_backup(snaps: &[SnapshotMeta], peer_name: &PeerName) -> Result<SnapshotId, String> {
     if let Some(s) = snaps
         .iter()
         .find(|s| s.tags.iter().any(|t| t == BACKUP_TAG))
@@ -639,17 +810,18 @@ fn newest_real_backup(snaps: &[SnapshotMeta], peer_name: &str) -> Result<Snapsho
 }
 
 pub fn restore(peer_name: &str, target: &Path, snapshot: Option<&str>) -> Res {
+    let peer_name = PeerName::new(peer_name)?;
     let cfg = Config::load().map_err(err("could not read config"))?;
     let peer = cfg
-        .peer(peer_name)
+        .peer(&peer_name)
         .ok_or_else(|| format!("no peer called '{peer_name}'"))?;
     let engine = engine_for(peer);
 
     let id = match snapshot {
-        Some(s) => SnapshotId(s.to_string()),
+        Some(s) => SnapshotId(s.to_owned()),
         None => {
             let snaps = engine.list_snapshots().map_err(|e| e.to_string())?;
-            newest_real_backup(&snaps, peer_name)?
+            newest_real_backup(&snaps, &peer_name)?
         }
     };
 
@@ -662,9 +834,10 @@ pub fn restore(peer_name: &str, target: &Path, snapshot: Option<&str>) -> Res {
 }
 
 pub fn snapshots(peer_name: &str) -> Res {
+    let peer_name = PeerName::new(peer_name)?;
     let cfg = Config::load().map_err(err("could not read config"))?;
     let peer = cfg
-        .peer(peer_name)
+        .peer(&peer_name)
         .ok_or_else(|| format!("no peer called '{peer_name}'"))?;
     for s in engine_for(peer)
         .list_snapshots()
@@ -737,7 +910,7 @@ pub fn recovery_export(out: Option<PathBuf>) -> Res {
 fn fingerprint(cfg: &Config) -> String {
     let mut material = String::new();
     for p in &cfg.peers {
-        material.push_str(&p.name);
+        material.push_str(p.name.as_str());
         material.push_str(&p.url);
         if let Ok(pw) = std::fs::read_to_string(Config::secret_path(&p.name)) {
             material.push_str(pw.trim());
@@ -764,14 +937,23 @@ pub fn recovery_check() -> Res {
     Ok(())
 }
 
+fn join_names(rows: &[&PeerStatus]) -> String {
+    rows.iter()
+        .map(|r| r.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 // -------------------------------------------------------------------- helpers
 
 fn select<'a>(cfg: &'a Config, only: Option<&str>) -> Result<Vec<&'a Peer>, String> {
     match only {
-        Some(name) => cfg
-            .peer(name)
-            .map(|p| vec![p])
-            .ok_or_else(|| format!("no peer called '{name}'")),
+        Some(name) => {
+            let name = PeerName::new(name)?;
+            cfg.peer(&name)
+                .map(|p| vec![p])
+                .ok_or_else(|| format!("no peer called '{name}'"))
+        }
         None if cfg.peers.is_empty() => {
             Err("no peers yet. Add one with `peerbackup peer add <name> <url>`".into())
         }
@@ -834,11 +1016,243 @@ mod tests {
 
     #[test]
     fn redacting_leaves_urls_without_credentials_alone() {
-        let plain = "rest:https://alice.example.org:8000/me/";
-        assert_eq!(redact(plain), plain);
+        for plain in [
+            "rest:https://alice.example.org:8000/me/",
+            "rest:https://alice.example.org/path/with@sign/",
+            "rest:https://user@alice.example.org/me/",
+        ] {
+            assert_eq!(redact(plain), plain);
+        }
+    }
+
+    #[test]
+    fn redacting_hides_the_whole_password_even_when_it_contains_an_at_sign() {
+        // The version this replaced used the FIRST '@' in the URL. With a
+        // password containing one, everything after it was treated as the host
+        // and printed as-is, so `peer list` published most of the password to
+        // whatever bug report it was pasted into.
+        for (url, want) in [
+            (
+                "rest:https://me:hunter2@alice.example.org:8000/me/",
+                "rest:https://me:***@alice.example.org:8000/me/",
+            ),
+            (
+                "rest:https://me:p@ssw0rd@alice.example.org:8000/me/",
+                "rest:https://me:***@alice.example.org:8000/me/",
+            ),
+            (
+                "rest:https://me:@@@@@alice.example.org/me/",
+                "rest:https://me:***@alice.example.org/me/",
+            ),
+        ] {
+            let got = redact(url);
+            assert_eq!(got, want, "redacting {url}");
+            assert!(
+                !got.contains("ssw0rd") && !got.contains("hunter2"),
+                "password survived redaction: {got}"
+            );
+        }
+    }
+
+    // ------------------------------------------------- backup and verify
+
+    // These are the reason the engine seam exists. Both commands used to reach
+    // for `Config::load`, `state_dir()` and `ResticEngine` directly, so neither
+    // had a single test -- including the branch that decides whether a partial
+    // backup counts as success, which is the distinction the whole product
+    // rests on.
+
+    use crate::engine::EngineError;
+    use crate::engine::fake::FakeEngine;
+    use crate::engine::outcome::Corruption;
+
+    struct Harness {
+        _dir: PathBuf,
+        rt: Runtime,
+        cfg: Config,
+    }
+
+    fn harness(tag: &str) -> Harness {
+        let dir = std::env::temp_dir().join(format!("pb-cmd-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let sources = dir.join("data");
+        std::fs::create_dir_all(&sources).unwrap();
+        std::fs::write(sources.join("f.txt"), b"hello").unwrap();
+
+        let mut cfg = Config::default();
+        cfg.settings.sources = vec![sources];
+        cfg.peers.push(Peer {
+            name: pn("alice"),
+            url: "rest:http://example.invalid/alice/".into(),
+            ca_cert: None,
+        });
+        Harness {
+            rt: Runtime { state: dir.clone() },
+            cfg,
+            _dir: dir,
+        }
+    }
+
+    impl Drop for Harness {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self._dir);
+        }
+    }
+
+    fn records(h: &Harness) -> Vec<Record> {
+        Evidence::read_since(&h.rt.evidence(), 0)
+    }
+
+    #[test]
+    fn a_complete_backup_is_recorded_as_good() {
+        let h = harness("ok");
+        std::fs::create_dir_all(h.rt.canary_dir()).unwrap();
+        backup_in(&h.rt, &h.cfg, None, |_| {
+            FakeEngine::always(VerifyOutcome::Good { coverage_pct: 1 })
+        })
+        .unwrap();
+        let r = records(&h);
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].kind, Kind::Backup);
+        assert_eq!(r[0].verdict, Verdict::Good);
+    }
+
+    #[test]
+    fn an_incomplete_backup_is_a_failure_not_a_success() {
+        // restic can finish having failed to read some of what it was asked
+        // for. Recording that as Good would report a backup missing data, and
+        // `status` would show the peer as fine.
+        let h = harness("incomplete");
+        std::fs::create_dir_all(h.rt.canary_dir()).unwrap();
+        let err =
+            backup_in(&h.rt, &h.cfg, None, |_| FakeEngine::incomplete_snapshot()).unwrap_err();
+        assert!(err.contains("1 of 1"), "must report a failure: {err}");
+
+        let r = records(&h);
+        assert_eq!(r.len(), 1);
+        assert_ne!(
+            r[0].verdict,
+            Verdict::Good,
+            "an incomplete backup is not good"
+        );
+        assert_eq!(r[0].verdict, Verdict::Unknown);
+    }
+
+    #[test]
+    fn a_failed_backup_records_unknown_never_bad() {
+        // A refused upload says nothing about the data already stored there.
+        // Recording Bad would raise a corruption alarm for a full disk.
+        let h = harness("failed");
+        std::fs::create_dir_all(h.rt.canary_dir()).unwrap();
+        let e = EngineError {
+            message: "server out of space".into(),
+            exit_code: Some(1),
+            cause: Cause::OutOfSpace,
+        };
+        assert!(
+            backup_in(&h.rt, &h.cfg, None, |_| FakeEngine::failing_snapshot(
+                e.clone()
+            ))
+            .is_err()
+        );
+        let r = records(&h);
+        assert_eq!(r[0].verdict, Verdict::Unknown);
+        assert!(r[0].detail.as_ref().unwrap().contains("out of space"));
+    }
+
+    #[test]
+    fn backup_refuses_when_a_source_is_missing_rather_than_shipping_less() {
+        let mut h = harness("missing");
+        std::fs::create_dir_all(h.rt.canary_dir()).unwrap();
+        h.cfg.settings.sources.push(PathBuf::from("/nope/not/here"));
+        let err = backup_in(&h.rt, &h.cfg, None, |_| {
+            FakeEngine::always(VerifyOutcome::Good { coverage_pct: 1 })
+        })
+        .unwrap_err();
+        assert!(err.contains("/nope/not/here"), "must name the path: {err}");
+        assert!(records(&h).is_empty(), "nothing may be recorded");
+    }
+
+    #[test]
+    fn verify_probes_before_checking_so_a_dead_peer_costs_seconds() {
+        // Without the probe, an unreachable peer burns the whole verification
+        // timeout while restic retries.
+        let h = harness("probe");
+        Canary::create_at(&h.rt.canary_dir(), &h.rt.canary_manifest()).unwrap();
+        verify_in(&h.rt, &h.cfg, None, |_| {
+            FakeEngine::unreachable("connection refused")
+        })
+        .unwrap();
+
+        let r = records(&h);
+        assert_eq!(r.len(), 1, "a probe failure ends the peer's turn");
+        assert_eq!(r[0].verdict, Verdict::Unknown, "unreachable is not damage");
+    }
+
+    #[test]
+    fn verify_records_bad_only_for_data_it_read_and_found_wrong() {
+        let h = harness("bad");
+        Canary::create_at(&h.rt.canary_dir(), &h.rt.canary_manifest()).unwrap();
+        let err = verify_in(&h.rt, &h.cfg, None, |_| {
+            FakeEngine::always(VerifyOutcome::Bad(Corruption::PackHashMismatch {
+                pack: "abc123".into(),
+            }))
+        })
+        .unwrap_err();
+        assert!(err.contains("failed"), "{err}");
+
+        let subset = records(&h)
+            .into_iter()
+            .find(|r| r.kind == Kind::Subset)
+            .unwrap();
+        assert_eq!(subset.verdict, Verdict::Bad);
+        assert!(subset.detail.unwrap().contains("abc123"));
+    }
+
+    #[test]
+    fn verify_treats_an_unreadable_check_as_unknown_not_damage() {
+        // The distinction the whole product rests on: could-not-check must
+        // never age into "your backup is corrupt".
+        let h = harness("indet");
+        Canary::create_at(&h.rt.canary_dir(), &h.rt.canary_manifest()).unwrap();
+        verify_in(&h.rt, &h.cfg, None, |_| {
+            FakeEngine::always(VerifyOutcome::Indeterminate(Cause::TimedOut {
+                after_secs: 3600,
+            }))
+        })
+        .unwrap();
+        let subset = records(&h)
+            .into_iter()
+            .find(|r| r.kind == Kind::Subset)
+            .unwrap();
+        assert_eq!(subset.verdict, Verdict::Unknown);
+    }
+
+    #[test]
+    fn a_canary_that_comes_back_wrong_is_bad() {
+        let h = harness("canary");
+        Canary::create_at(&h.rt.canary_dir(), &h.rt.canary_manifest()).unwrap();
+        let err = verify_in(&h.rt, &h.cfg, None, |_| {
+            // Digest that cannot match what was sent.
+            FakeEngine {
+                restored_digest: Some("f".repeat(64)),
+                ..FakeEngine::always(VerifyOutcome::Good { coverage_pct: 1 })
+            }
+        })
+        .unwrap_err();
+        assert!(err.contains("failed"), "{err}");
+        let canary = records(&h)
+            .into_iter()
+            .find(|r| r.kind == Kind::Canary)
+            .unwrap();
+        assert_eq!(canary.verdict, Verdict::Bad);
     }
 
     // ---------------------------------------------------------- restore choice
+
+    fn pn(s: &str) -> PeerName {
+        PeerName::new(s).unwrap()
+    }
 
     fn snap(id: &str, tags: &[&str]) -> SnapshotMeta {
         SnapshotMeta {
@@ -854,7 +1268,7 @@ mod tests {
         // The bug this replaced fell back to `snaps.first()`, restored a canary
         // directory and printed "Done." to someone who had just lost a disk.
         let snaps = [snap("aaaa1111", &[CHECK_TAG])];
-        let err = newest_real_backup(&snaps, "alice").unwrap_err();
+        let err = newest_real_backup(&snaps, &pn("alice")).unwrap_err();
         assert!(
             err.contains("no backup of your data"),
             "must say the data is not there, got: {err}"
@@ -867,7 +1281,7 @@ mod tests {
 
     #[test]
     fn restore_refuses_when_the_peer_holds_nothing() {
-        let err = newest_real_backup(&[], "alice").unwrap_err();
+        let err = newest_real_backup(&[], &pn("alice")).unwrap_err();
         assert!(err.contains("no backups at all"), "got: {err}");
     }
 
@@ -880,7 +1294,7 @@ mod tests {
             snap("aaaa1111", &[CHECK_TAG]),
         ];
         assert_eq!(
-            newest_real_backup(&snaps, "alice").unwrap(),
+            newest_real_backup(&snaps, &pn("alice")).unwrap(),
             SnapshotId("bbbb2222".into())
         );
     }
@@ -890,6 +1304,6 @@ mod tests {
         // Anything restic already held before peerbackup touched the repository
         // is not ours and we cannot say what is in it.
         let snaps = [snap("dddd4444", &[])];
-        assert!(newest_real_backup(&snaps, "alice").is_err());
+        assert!(newest_real_backup(&snaps, &pn("alice")).is_err());
     }
 }

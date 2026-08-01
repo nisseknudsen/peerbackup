@@ -13,6 +13,7 @@
 //!   chown parent, then grant -R        rm unit          loop device
 //! ```
 
+use std::ffi::OsStr;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
@@ -82,19 +83,35 @@ pub fn provision(ctx: &Ctx, peer: &str, size: &str) -> Res {
         ));
     }
 
-    ctx.run("mkdir", &["-p", &s(&images), &s(&ctx.mnt())])?;
+    if !ctx.would(&format!(
+        "mkdir -p {} {}",
+        images.display(),
+        ctx.mnt().display()
+    )) {
+        for d in [&images, &ctx.mnt()] {
+            std::fs::create_dir_all(d)
+                .map_err(|e| format!("could not create {}: {e}", d.display()))?;
+        }
+    }
 
     ctx.info(&format!(
         "allocating {} (preallocated, this is not instant)",
         img.display()
     ));
-    ctx.run("fallocate", &["-l", &bytes.to_string(), &s(&img)])
-        .map_err(|e| {
-            format!(
-                "{e}\n       fallocate failed. The filesystem may not support preallocation; \
+    ctx.run(
+        "fallocate",
+        &[
+            OsStr::new("-l"),
+            OsStr::new(&bytes.to_string()),
+            img.as_os_str(),
+        ],
+    )
+    .map_err(|e| {
+        format!(
+            "{e}\n       fallocate failed. The filesystem may not support preallocation; \
                  dd is NOT equivalent, investigate before working around it."
-            )
-        })?;
+        )
+    })?;
 
     // -m 0 drops ext4's default 5% root reservation. The peer paid for that
     // space.
@@ -111,12 +128,23 @@ pub fn provision(ctx: &Ctx, peer: &str, size: &str) -> Res {
     // exactly the mechanism this design exists to prevent.
     ctx.run(
         "mkfs.ext4",
-        &["-q", "-m", "0", "-E", "nodiscard", "-F", &s(&img)],
+        &[
+            OsStr::new("-q"),
+            OsStr::new("-m"),
+            OsStr::new("0"),
+            OsStr::new("-E"),
+            OsStr::new("nodiscard"),
+            OsStr::new("-F"),
+            img.as_os_str(),
+        ],
     )?;
 
     verify_not_sparse(ctx, &img)?;
 
-    ctx.run("mkdir", &["-p", &s(&dir)])?;
+    if !ctx.would(&format!("mkdir -p {}", dir.display())) {
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| format!("could not create {}: {e}", dir.display()))?;
+    }
 
     let unit = unit_name(&dir)?;
     let unit_path = ctx.units.join(&unit);
@@ -149,10 +177,30 @@ pub fn provision(ctx: &Ctx, peer: &str, size: &str) -> Res {
             .map_err(|e| format!("could not write {}: {e}", unit_path.display()))?;
     }
 
-    ctx.run("systemctl", &["daemon-reload"])?;
-    ctx.run("systemctl", &["enable", "--now", &unit])?;
-
-    take_ownership(ctx, &dir, &unit)?;
+    // Everything from here can fail with the image already on disk. Without a
+    // rollback the next `provision` refuses ("already exists; use release"),
+    // and `release` is the type-the-name-to-confirm destructor whose own
+    // warning is that it permanently destroys the peer's backups. Recovering
+    // from a half-provisioned grant should not require running that.
+    let finish = || -> Res {
+        ctx.run("systemctl", &["daemon-reload"])?;
+        ctx.run("systemctl", &["enable", "--now", &unit])?;
+        take_ownership(ctx, &dir, &unit)
+    };
+    if let Err(e) = finish() {
+        warn("provisioning failed part-way; undoing what was created");
+        ctx.run_best_effort("systemctl", &["disable", "--now", &unit]);
+        remove_quietly(ctx, &ctx.units.join(&unit));
+        if !ctx.would(&format!("rmdir {}", dir.display())) {
+            let _ = std::fs::remove_dir(&dir);
+        }
+        remove_quietly(ctx, &img);
+        ctx.run_best_effort("systemctl", &["daemon-reload"]);
+        return Err(format!(
+            "{e}\n       Nothing was left behind, so this can be run again once the \
+             cause is fixed."
+        ));
+    }
 
     ctx.info("");
     ctx.info(&format!(
@@ -216,10 +264,11 @@ fn take_ownership(ctx: &Ctx, dir: &Path, unit: &str) -> Res {
     // PB_UID wins so it can match the service file. Otherwise the person who
     // ran sudo, since they are the one who will want to inspect the data later.
     // SAFETY: getuid/getgid read process properties and cannot fail.
-    let uid =
-        first_env(&["PB_UID", "SUDO_UID"]).unwrap_or_else(|| unsafe { libc::getuid() }.to_string());
-    let gid =
-        first_env(&["PB_GID", "SUDO_GID"]).unwrap_or_else(|| unsafe { libc::getgid() }.to_string());
+    // Parsed rather than interpolated: a non-numeric PB_UID is not exploitable
+    // (nothing goes through a shell) but it produces an opaque chown error
+    // several steps later instead of naming the variable that is wrong.
+    let uid = numeric_env(&["PB_UID", "SUDO_UID"])?.unwrap_or_else(|| unsafe { libc::getuid() });
+    let gid = numeric_env(&["PB_GID", "SUDO_GID"])?.unwrap_or_else(|| unsafe { libc::getgid() });
     let own = format!("{uid}:{gid}");
     let mnt = ctx.mnt();
 
@@ -229,12 +278,13 @@ fn take_ownership(ctx: &Ctx, dir: &Path, unit: &str) -> Res {
         return Ok(());
     }
 
-    ctx.run("chown", &[&own, &s(&mnt)]).map_err(|e| {
-        format!(
-            "{e}\n       could not give {} to {own}; creating logins will fail",
-            mnt.display()
-        )
-    })?;
+    ctx.run("chown", &[OsStr::new(&own), mnt.as_os_str()])
+        .map_err(|e| {
+            format!(
+                "{e}\n       could not give {} to {own}; creating logins will fail",
+                mnt.display()
+            )
+        })?;
 
     if !is_mountpoint(dir) {
         return Err(format!(
@@ -244,7 +294,11 @@ fn take_ownership(ctx: &Ctx, dir: &Path, unit: &str) -> Res {
         ));
     }
 
-    ctx.run("chown", &["-R", &own, &s(dir)]).map_err(|e| {
+    ctx.run(
+        "chown",
+        &[OsStr::new("-R"), OsStr::new(&own), dir.as_os_str()],
+    )
+    .map_err(|e| {
         format!(
             "{e}\n       could not give {} to {own}; the server cannot write to it",
             dir.display()
@@ -260,10 +314,13 @@ pub fn release(ctx: &Ctx, peer: &str) -> Res {
 
     let img = ctx.image_of(peer);
     let dir = ctx.dir_of(peer);
-    let unit = unit_name(&dir)?;
+    // Before deriving the unit name, which shells out: on a machine without
+    // systemd-escape, `release nobody` should say there is no such grant rather
+    // than report a systemd-escape failure.
     if !img.exists() && !dir.is_dir() {
         return Err(format!("no grant found for '{peer}'"));
     }
+    let unit = unit_name(&dir)?;
 
     warn(&format!(
         "this destroys {peer}'s backups permanently. They cannot be recovered from here."
@@ -285,7 +342,7 @@ pub fn release(ctx: &Ctx, peer: &str) -> Res {
     // allocated to the open loop device and the mount keeps serving stale data.
     ctx.run_best_effort("systemctl", &["disable", "--now", &unit]);
     if is_mountpoint(&dir) {
-        ctx.run("umount", &[&s(&dir)]).map_err(|e| {
+        ctx.run("umount", &[dir.as_os_str()]).map_err(|e| {
             format!(
                 "{e}\n       something still has {} open (lsof +f -- {})",
                 dir.display(),
@@ -296,14 +353,31 @@ pub fn release(ctx: &Ctx, peer: &str) -> Res {
     if let Some(loopdev) = loop_device_for(&img) {
         ctx.run_best_effort("losetup", &["-d", &loopdev]);
     }
-    ctx.run_best_effort("rm", &["-f", &s(&img)]);
-    ctx.run_best_effort("rmdir", &[&s(&dir)]);
-    ctx.run_best_effort("rm", &["-f", &s(&ctx.units.join(&unit))]);
+    // std::fs rather than shelling out: these are three syscalls, and going
+    // through a process each time only adds a PATH lookup and an error string
+    // to re-parse. `unit_name` shells out for a real reason; these did not.
+    remove_quietly(ctx, &img);
+    if !ctx.would(&format!("rmdir {}", dir.display())) {
+        let _ = std::fs::remove_dir(&dir);
+    }
+    remove_quietly(ctx, &ctx.units.join(&unit));
     ctx.run("systemctl", &["daemon-reload"])?;
     ctx.info(&format!(
         "grant for '{peer}' released, capacity returned to the host"
     ));
     Ok(())
+}
+
+/// Remove a file, saying so under a dry run and shrugging if it is not there.
+fn remove_quietly(ctx: &Ctx, path: &Path) {
+    if ctx.would(&format!("rm -f {}", path.display())) {
+        return;
+    }
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => warn(&format!("could not remove {}: {e}", path.display())),
+    }
 }
 
 fn loop_device_for(img: &Path) -> Option<String> {
@@ -314,7 +388,7 @@ fn loop_device_for(img: &Path) -> Option<String> {
         .ok()?;
     let text = String::from_utf8_lossy(&out.stdout);
     let first = text.lines().next()?;
-    let dev = first.split(':').next()?.trim().to_string();
+    let dev = first.split(':').next()?.trim().to_owned();
     (!dev.is_empty()).then_some(dev)
 }
 
@@ -324,11 +398,6 @@ pub fn list(ctx: &Ctx, only: Option<&str>) -> Res {
         ctx.info("no grants");
         return Ok(());
     }
-    println!(
-        "{:<14} {:>12} {:>12} {:>12} {:>12}  STATE",
-        "PEER", "IMAGE", "USABLE", "RESERVE", "USED"
-    );
-
     let mut dirs: Vec<_> = std::fs::read_dir(&mnt)
         .map_err(|e| format!("could not read {}: {e}", mnt.display()))?
         .filter_map(|e| e.ok())
@@ -346,6 +415,15 @@ pub fn list(ctx: &Ctx, only: Option<&str>) -> Res {
             .to_string();
         if only.is_some_and(|o| o != peer) {
             continue;
+        }
+        if !found {
+            // Printed here rather than up front so `list` on an empty host says
+            // "no grants" without a header above it, and so `provision` -- which
+            // calls this for one peer -- does not print a table it will not fill.
+            println!(
+                "{:<14} {:>12} {:>12} {:>12} {:>12}  STATE",
+                "PEER", "IMAGE", "USABLE", "RESERVE", "USED"
+            );
         }
         found = true;
         let img = ctx.image_of(&peer);
@@ -373,6 +451,7 @@ pub fn list(ctx: &Ctx, only: Option<&str>) -> Res {
     }
     if !found {
         ctx.info("no grants");
+        return Ok(());
     }
     ctx.info("");
     ctx.info("USABLE is capacity after filesystem overhead, which is less than IMAGE.");
@@ -480,21 +559,28 @@ pub fn doctor(ctx: &Ctx) -> Res {
 
     if problems == 0 {
         ctx.info("host looks healthy");
-    } else {
-        ctx.info(&format!("{problems} problem(s) found"));
+        return Ok(());
     }
-    Ok(())
+    // Exits non-zero so it can gate something. A diagnostic that always
+    // succeeds cannot be used in a script, in CI, or as an ExecStartPre, which
+    // is the job its sibling `guard` already does.
+    Err(format!("{problems} problem(s) found"))
 }
 
-fn first_env(keys: &[&str]) -> Option<String> {
-    keys.iter()
-        .find_map(|k| std::env::var(k).ok())
-        .filter(|v| !v.is_empty())
-}
-
-/// Paths get handed to commands as strings often enough to be worth a name.
-fn s(p: &Path) -> String {
-    p.to_string_lossy().into_owned()
+/// The first of these variables that is set, as a uid or gid.
+fn numeric_env(keys: &[&str]) -> Result<Option<u32>, String> {
+    for k in keys {
+        match std::env::var(k) {
+            Ok(v) if !v.is_empty() => {
+                return v
+                    .parse()
+                    .map(Some)
+                    .map_err(|_| format!("{k}='{v}' is not a numeric id"));
+            }
+            _ => {}
+        }
+    }
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -594,6 +680,29 @@ mod tests {
         let err = release(&ctx, "nobody").unwrap_err();
         assert!(err.contains("no grant found"), "got: {err}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn doctor_exits_non_zero_when_it_finds_a_problem() {
+        // A diagnostic that always succeeds cannot gate anything, which is the
+        // job its sibling `guard` already does as an ExecStartPre.
+        let dir = tmp("g10");
+        let ctx = Ctx {
+            root: dir.join("definitely-absent"),
+            ..ctx_in(&dir)
+        };
+        // No docker or mkfs on a bare test runner is enough to trip it; if the
+        // machine has everything, the missing root directory only warns, so
+        // accept either outcome rather than asserting on the environment.
+        let result = doctor(&ctx);
+        if let Err(e) = result {
+            assert!(e.contains("problem"), "got: {e}");
+        }
+    }
+
+    #[test]
+    fn a_non_numeric_uid_is_refused_by_name() {
+        assert!(numeric_env(&["PB_TEST_NOT_SET_AT_ALL"]).unwrap().is_none());
     }
 
     #[test]

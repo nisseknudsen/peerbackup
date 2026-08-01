@@ -53,6 +53,10 @@ pub enum Cause {
     AppendOnlyRefused,
     /// The peer is out of space.
     OutOfSpace,
+    /// The repository is already there. Not a failure for `init`.
+    AlreadyInitialized,
+    /// The repository exists but the password we hold does not open it.
+    WrongPassword,
     /// Another process holds the repository lock.
     Locked { detail: String },
     /// We gave up waiting. restic retries transport failures with exponential
@@ -76,6 +80,8 @@ impl fmt::Display for Cause {
                 write!(f, "peer is in append-only mode and refused the operation")
             }
             Cause::OutOfSpace => write!(f, "peer is out of space"),
+            Cause::AlreadyInitialized => write!(f, "repository already exists"),
+            Cause::WrongPassword => write!(f, "wrong password, or no key for it"),
             Cause::Locked { detail } => write!(f, "repository is locked: {detail}"),
             Cause::TimedOut { after_secs } => {
                 write!(f, "gave up after {after_secs}s without an answer")
@@ -104,17 +110,23 @@ pub enum VerifyOutcome {
 impl VerifyOutcome {
     /// True only for `Good`. Written out rather than derived so that adding a
     /// future variant is a compile error here instead of a silent green.
+    #[must_use]
     pub fn is_good(&self) -> bool {
         matches!(self, VerifyOutcome::Good { .. })
     }
 
     /// True only with positive evidence of damage. Turns a peer red, so it must
     /// never be satisfied by a network problem.
+    /// Discarding this is always a mistake: the whole point of the three-state
+    /// model is that green and red must not be confused, and an ignored `is_bad`
+    /// is how they get confused.
+    #[must_use]
     pub fn is_bad(&self) -> bool {
         matches!(self, VerifyOutcome::Bad(_))
     }
 
     /// A short label for the dashboard.
+    #[must_use]
     pub fn label(&self) -> &'static str {
         match self {
             VerifyOutcome::Good { .. } => "verified-good",

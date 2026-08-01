@@ -9,14 +9,14 @@
 //! a crash mid-write should cost one line rather than the whole record.
 
 use std::fs;
-use std::io::{BufRead, BufReader, Read, Write};
-use std::path::PathBuf;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::config::{Config, home};
+use crate::config::{Config, PeerName, home};
 
 pub fn state_dir() -> PathBuf {
     std::env::var_os("PEERBACKUP_STATE_DIR")
@@ -26,10 +26,6 @@ pub fn state_dir() -> PathBuf {
 
 pub fn canary_dir() -> PathBuf {
     state_dir().join("canary")
-}
-
-pub fn evidence_path() -> PathBuf {
-    state_dir().join("evidence.jsonl")
 }
 
 pub fn now() -> u64 {
@@ -59,8 +55,13 @@ impl Canary {
 
     /// Create the canary files and record their digests.
     pub fn create() -> std::io::Result<Self> {
-        let dir = canary_dir();
-        fs::create_dir_all(&dir)?;
+        Self::create_at(&canary_dir(), &Self::manifest_path())
+    }
+
+    /// The same, against explicit paths, so a test can build one in a temporary
+    /// directory without pointing the whole process at it.
+    pub fn create_at(dir: &Path, manifest: &Path) -> std::io::Result<Self> {
+        fs::create_dir_all(dir)?;
         let mut files = Vec::new();
         for i in 0..3 {
             let path = dir.join(format!("canary-{i}.bin"));
@@ -73,20 +74,20 @@ impl Canary {
             });
         }
         let c = Canary { files };
-        c.save()?;
+        c.save_at(manifest)?;
         Ok(c)
     }
 
-    pub fn load() -> std::io::Result<Self> {
-        let p = Self::manifest_path();
-        let text = fs::read_to_string(&p)
+    pub fn load_at(p: &Path) -> std::io::Result<Self> {
+        let text = fs::read_to_string(p)
             .map_err(|e| std::io::Error::new(e.kind(), format!("{}: {e}", p.display())))?;
         serde_json::from_str(&text).map_err(std::io::Error::other)
     }
 
-    pub fn save(&self) -> std::io::Result<()> {
-        let p = Self::manifest_path();
-        fs::create_dir_all(p.parent().unwrap())?;
+    pub fn save_at(&self, p: &Path) -> std::io::Result<()> {
+        if let Some(parent) = p.parent() {
+            fs::create_dir_all(parent)?;
+        }
         fs::write(
             p,
             serde_json::to_vec_pretty(self).map_err(std::io::Error::other)?,
@@ -94,9 +95,13 @@ impl Canary {
     }
 
     pub fn load_or_create() -> std::io::Result<Self> {
-        match Self::load() {
+        Self::load_or_create_at(&canary_dir(), &Self::manifest_path())
+    }
+
+    pub fn load_or_create_at(dir: &Path, manifest: &Path) -> std::io::Result<Self> {
+        match Self::load_at(manifest) {
             Ok(c) => Ok(c),
-            Err(_) => Self::create(),
+            Err(_) => Self::create_at(dir, manifest),
         }
     }
 
@@ -136,7 +141,7 @@ pub enum Verdict {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Record {
     pub at: u64,
-    pub peer: String,
+    pub peer: PeerName,
     pub kind: Kind,
     pub verdict: Verdict,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -150,27 +155,53 @@ pub struct Record {
 pub struct Evidence;
 
 impl Evidence {
-    pub fn append(r: &Record) -> std::io::Result<()> {
-        let p = evidence_path();
-        fs::create_dir_all(p.parent().unwrap())?;
-        let mut f = fs::OpenOptions::new().create(true).append(true).open(p)?;
+    /// The same, against an explicit path.
+    ///
+    /// These exist so the tests do not have to point the whole process at a
+    /// temporary directory with `std::env::set_var`, which is `unsafe` in
+    /// edition 2024 for a real reason: other tests in the same binary read the
+    /// environment concurrently, so a test that sets a variable is a data race
+    /// against every one of them, and it passed only by luck of scheduling.
+    pub fn append_to(path: &Path, r: &Record) -> std::io::Result<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let mut f = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
         let mut line = serde_json::to_string(r).map_err(std::io::Error::other)?;
         line.push('\n');
         f.write_all(line.as_bytes())
     }
 
-    /// Read every record. Unparsable lines are skipped rather than fatal: a
-    /// crash mid-append can leave a partial last line, and losing all history
-    /// because of one truncated record would be a poor trade.
-    pub fn read_all() -> Vec<Record> {
-        let Ok(f) = fs::File::open(evidence_path()) else {
+    /// Records newer than `oldest`, newest last. Pass `0` for everything.
+    ///
+    ///
+    /// `status` needs at most `canary_days` of history, but read the whole file
+    /// and parsed every line of it. Hourly backups and daily verifies to three
+    /// peers is tens of thousands of lines a year, growing forever, re-parsed
+    /// on every invocation of the command people run most.
+    ///
+    /// Reads from the end and stops early. The file is append-only and written
+    /// in time order, so the first record older than the cutoff means the rest
+    /// are too.
+    pub fn read_since(path: &Path, oldest: u64) -> Vec<Record> {
+        let Ok(text) = fs::read_to_string(path) else {
             return Vec::new();
         };
-        BufReader::new(f)
-            .lines()
-            .map_while(Result::ok)
-            .filter_map(|l| serde_json::from_str(&l).ok())
-            .collect()
+        let mut out: Vec<Record> = Vec::new();
+        for line in text.lines().rev() {
+            let Ok(r) = serde_json::from_str::<Record>(line) else {
+                continue; // A truncated tail, or a record from a future version.
+            };
+            if r.at < oldest {
+                break;
+            }
+            out.push(r);
+        }
+        out.reverse();
+        out
     }
 }
 
@@ -187,7 +218,8 @@ pub enum PeerState {
 }
 
 impl PeerState {
-    pub fn label(&self) -> &'static str {
+    #[must_use]
+    pub fn label(self) -> &'static str {
         match self {
             PeerState::Good => "ok",
             PeerState::Bad => "FAILED",
@@ -198,7 +230,7 @@ impl PeerState {
 
 #[derive(Debug, Clone)]
 pub struct PeerStatus {
-    pub name: String,
+    pub name: PeerName,
     pub state: PeerState,
     pub last_backup: Option<u64>,
     pub last_subset: Option<u64>,
@@ -243,7 +275,7 @@ pub fn status(cfg: &Config, records: &[Record], now_ts: u64) -> Vec<PeerStatus> 
                 (!newer_good).then(|| {
                     r.detail
                         .clone()
-                        .unwrap_or_else(|| "a check failed".to_string())
+                        .unwrap_or_else(|| "a check failed".to_owned())
                 })
             });
 
@@ -306,7 +338,7 @@ mod tests {
     fn cfg_with_peer() -> Config {
         let mut c = Config::default();
         c.peers.push(Peer {
-            name: "alice".into(),
+            name: PeerName::new("alice").unwrap(),
             url: "rest:http://x/".into(),
             ca_cert: None,
         });
@@ -316,7 +348,7 @@ mod tests {
     fn rec(kind: Kind, verdict: Verdict, at: u64) -> Record {
         Record {
             at,
-            peer: "alice".into(),
+            peer: PeerName::new("alice").unwrap(),
             kind,
             verdict,
             detail: None,
@@ -406,19 +438,54 @@ mod tests {
     #[test]
     fn evidence_survives_a_truncated_last_line() {
         // A crash mid-append should cost the last record, not the history.
+        //
+        // This used to point the whole process at a temp directory with
+        // `std::env::set_var`, which races every other test in this binary that
+        // reads the environment, and never put it back. The path is an argument
+        // now, so the test touches nothing outside its own directory.
         let dir = std::env::temp_dir().join(format!("pb-ev-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
-        unsafe { std::env::set_var("PEERBACKUP_STATE_DIR", &dir) };
+        let path = dir.join("evidence.jsonl");
 
-        Evidence::append(&rec(Kind::Backup, Verdict::Good, 1)).unwrap();
-        Evidence::append(&rec(Kind::Backup, Verdict::Good, 2)).unwrap();
-        let mut raw = fs::read_to_string(evidence_path()).unwrap();
+        Evidence::append_to(&path, &rec(Kind::Backup, Verdict::Good, 1)).unwrap();
+        Evidence::append_to(&path, &rec(Kind::Backup, Verdict::Good, 2)).unwrap();
+        let mut raw = fs::read_to_string(&path).unwrap();
         raw.push_str("{\"at\": 3, \"peer\": \"alic");
-        fs::write(evidence_path(), raw).unwrap();
+        fs::write(&path, raw).unwrap();
 
-        assert_eq!(Evidence::read_all().len(), 2);
+        assert_eq!(Evidence::read_since(&path, 0).len(), 2);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reading_a_window_stops_at_the_cutoff() {
+        // status only consults a bounded window, but used to parse every record
+        // ever written. This walks backwards and stops, so the cost is the
+        // window rather than the history.
+        let dir = std::env::temp_dir().join(format!("pb-win-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("evidence.jsonl");
+
+        for at in [100u64, 200, 300, 400] {
+            Evidence::append_to(&path, &rec(Kind::Backup, Verdict::Good, at)).unwrap();
+        }
+        let recent = Evidence::read_since(&path, 250);
+        assert_eq!(recent.len(), 2, "only records at or after the cutoff");
+        assert_eq!(recent.first().unwrap().at, 300, "oldest first, as written");
+        assert_eq!(recent.last().unwrap().at, 400);
+        assert_eq!(
+            Evidence::read_since(&path, 0).len(),
+            4,
+            "0 means everything"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_missing_evidence_file_reads_as_no_history_not_an_error() {
+        assert!(Evidence::read_since(Path::new("/nope/evidence.jsonl"), 0).is_empty());
     }
 
     #[test]
@@ -444,14 +511,14 @@ mod scenario_tests {
         // up: that is a green light for a peer receiving nothing.
         let mut cfg = Config::default();
         cfg.peers.push(Peer {
-            name: "full".into(),
+            name: PeerName::new("full").unwrap(),
             url: "rest:http://x/".into(),
             ca_cert: None,
         });
         let now_ts = 1_800_000_000u64;
         let r = |kind, verdict, at| Record {
             at,
-            peer: "full".into(),
+            peer: PeerName::new("full").unwrap(),
             kind,
             verdict,
             detail: None,

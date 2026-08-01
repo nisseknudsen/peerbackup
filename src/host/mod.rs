@@ -36,7 +36,7 @@ pub mod size;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-pub type Res = Result<(), String>;
+pub use crate::Res;
 
 /// 51515 is in the dynamic port range, so it is unlikely to collide with
 /// something already running. 8000 collides constantly.
@@ -62,12 +62,6 @@ pub struct Ctx {
     pub dry_run: bool,
     pub quiet: bool,
     pub force: bool,
-}
-
-impl Default for Ctx {
-    fn default() -> Self {
-        Self::from_env()
-    }
 }
 
 impl Ctx {
@@ -107,6 +101,15 @@ impl Ctx {
         self.mnt().join(peer)
     }
 
+    /// Describe an action that a dry run would take instead of taking it.
+    /// Returns true when the caller should skip the real work.
+    pub fn would(&self, what: &str) -> bool {
+        if self.dry_run {
+            println!("  would run: {what}");
+        }
+        self.dry_run
+    }
+
     pub fn info(&self, msg: &str) {
         println!("{msg}");
     }
@@ -120,14 +123,24 @@ impl Ctx {
     ///
     /// The printed form matches what the shell printed, because the tests read
     /// it and because seeing the exact command is the point of a dry run.
-    pub fn run(&self, program: &str, args: &[&str]) -> Res {
-        let line = format!("{program} {}", args.join(" "));
+    pub fn run<S: AsRef<std::ffi::OsStr>>(&self, program: &str, args: &[S]) -> Res {
+        // Arguments are OsStr, not str. Paths used to be flattened through
+        // `to_string_lossy` on the way here, so a root directory containing a
+        // non-UTF-8 byte became a *different* path with U+FFFD in it -- and
+        // that mangled path was then handed to `chown -R` and `rm -f`.
+        let line = format!(
+            "{program} {}",
+            args.iter()
+                .map(|a| a.as_ref().to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
         if self.dry_run {
             println!("  would run: {line}");
             return Ok(());
         }
         let out = Command::new(program)
-            .args(args)
+            .args(args.iter().map(std::convert::AsRef::as_ref))
             .output()
             .map_err(|e| format!("could not run `{line}`: {e}"))?;
         if out.status.success() {
@@ -150,7 +163,7 @@ impl Ctx {
 
     /// Same, but a non-zero exit only warns. For teardown steps that are
     /// expected to fail when the thing is already gone.
-    pub fn run_best_effort(&self, program: &str, args: &[&str]) {
+    pub fn run_best_effort<S: AsRef<std::ffi::OsStr>>(&self, program: &str, args: &[S]) {
         if let Err(e) = self.run(program, args) {
             warn(&e);
         }
@@ -220,11 +233,12 @@ pub fn statfs(path: &Path) -> Result<(u64, u64), String> {
 
     let c = CString::new(path.as_os_str().as_bytes())
         .map_err(|_| format!("path {} contains a NUL byte", path.display()))?;
-    // SAFETY: `c` is a valid NUL-terminated path for the duration of the call
-    // and `buf` is owned here. statvfs writes only into buf and signals failure
-    // through its return value.
-    let mut buf: libc::statvfs = unsafe { std::mem::zeroed() };
-    let rc = unsafe { libc::statvfs(c.as_ptr(), &mut buf) };
+    let mut buf = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    // SAFETY: `c` is a valid NUL-terminated path for the duration of the call,
+    // and `buf` is owned here and correctly sized. statvfs writes the whole
+    // struct on success and signals failure through its return value, so `buf`
+    // is only read below after a zero return.
+    let rc = unsafe { libc::statvfs(c.as_ptr(), buf.as_mut_ptr()) };
     if rc != 0 {
         return Err(format!(
             "could not read free space on {}: {}",
@@ -232,14 +246,19 @@ pub fn statfs(path: &Path) -> Result<(u64, u64), String> {
             std::io::Error::last_os_error()
         ));
     }
+    // SAFETY: statvfs returned 0, so the struct is initialised.
+    let buf = unsafe { buf.assume_init() };
     // f_frsize is the fragment size, which is what f_blocks and f_bavail are
     // counted in. f_bsize is the preferred I/O size and is the wrong multiplier.
+    // These are `c_ulong`, which is u64 on every target this builds for. No cast:
+    // on a 32-bit target the arithmetic below would stop compiling, which is a
+    // better way to find out than a silent truncation.
     let unit = if buf.f_frsize > 0 {
         buf.f_frsize
     } else {
         buf.f_bsize
-    } as u64;
-    Ok((buf.f_blocks as u64 * unit, buf.f_bavail as u64 * unit))
+    };
+    Ok((buf.f_blocks * unit, buf.f_bavail * unit))
 }
 
 /// The systemd mount unit name for a grant directory.
@@ -259,7 +278,7 @@ pub fn unit_name(dir: &Path) -> Result<String, String> {
                 dir.display()
             )
         })?;
-    let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let name = String::from_utf8_lossy(&out.stdout).trim().to_owned();
     if !out.status.success() || name.is_empty() {
         return Err(format!(
             "systemd-escape produced an empty unit name for {}",

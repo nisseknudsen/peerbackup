@@ -7,7 +7,7 @@
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 
-use super::outcome::VerifyOutcome;
+use super::outcome::{Cause, VerifyOutcome};
 use super::{
     BackupEngine, EngineError, RestoredFile, Snapshot, SnapshotId, SnapshotMeta, SnapshotOpts,
 };
@@ -18,6 +18,17 @@ pub struct FakeEngine {
     pub verify_queue: RefCell<Vec<VerifyOutcome>>,
     pub verify_default: VerifyOutcome,
     pub snapshot_result: RefCell<Option<Result<Snapshot, EngineError>>>,
+    /// What `probe` answers. `None` means reachable.
+    pub probe_result: Option<Cause>,
+    /// Forces the digest `restore_path` reports back.
+    ///
+    /// `None` is the healthy peer: it hashes the file it was asked for and
+    /// returns the truth, so a canary check passes exactly when it should.
+    /// `Some` is a peer that returns the wrong bytes.
+    pub restored_digest: Option<String>,
+    /// What `list_snapshots` answers. A canary restore needs one to pick.
+    pub snapshots: Vec<SnapshotMeta>,
+    /// Every operation asked of this engine, in order.
     pub calls: RefCell<Vec<String>>,
 }
 
@@ -27,6 +38,14 @@ impl FakeEngine {
             verify_queue: RefCell::new(Vec::new()),
             verify_default: outcome,
             snapshot_result: RefCell::new(None),
+            probe_result: None,
+            restored_digest: None,
+            snapshots: vec![SnapshotMeta {
+                id: SnapshotId("fake0001".into()),
+                time: "2026-07-01T10:00:00Z".into(),
+                paths: vec![PathBuf::from("/srv/data")],
+                tags: vec!["peerbackup".into()],
+            }],
             calls: RefCell::new(Vec::new()),
         }
     }
@@ -38,12 +57,43 @@ impl FakeEngine {
             verify_queue: RefCell::new(outcomes),
             verify_default: default,
             snapshot_result: RefCell::new(None),
+            probe_result: None,
+            restored_digest: None,
+            snapshots: vec![SnapshotMeta {
+                id: SnapshotId("fake0001".into()),
+                time: "2026-07-01T10:00:00Z".into(),
+                paths: vec![PathBuf::from("/srv/data")],
+                tags: vec!["peerbackup".into()],
+            }],
             calls: RefCell::new(Vec::new()),
         }
     }
 
-    pub fn call_log(&self) -> Vec<String> {
-        self.calls.borrow().clone()
+    /// A peer that does not answer at all.
+    pub fn unreachable(detail: &str) -> Self {
+        Self {
+            probe_result: Some(Cause::Unreachable {
+                detail: detail.into(),
+            }),
+            ..Self::always(VerifyOutcome::Good { coverage_pct: 1 })
+        }
+    }
+
+    pub fn failing_snapshot(e: EngineError) -> Self {
+        Self {
+            snapshot_result: RefCell::new(Some(Err(e))),
+            ..Self::always(VerifyOutcome::Good { coverage_pct: 1 })
+        }
+    }
+
+    pub fn incomplete_snapshot() -> Self {
+        Self {
+            snapshot_result: RefCell::new(Some(Ok(Snapshot {
+                id: SnapshotId("fake0001".into()),
+                incomplete: true,
+            }))),
+            ..Self::always(VerifyOutcome::Good { coverage_pct: 1 })
+        }
     }
 }
 
@@ -72,9 +122,12 @@ impl BackupEngine for FakeEngine {
         self.calls
             .borrow_mut()
             .push(format!("restore_path({snapshot}, {})", path.display()));
+        let sha256 = self.restored_digest.clone().unwrap_or_else(|| {
+            std::fs::read(path).map_or_else(|_| "0".repeat(64), |b| crate::state::sha256_bytes(&b))
+        });
         Ok(RestoredFile {
             path: target.join(path.file_name().unwrap_or_default()),
-            sha256: "0".repeat(64),
+            sha256,
             bytes: 0,
         })
     }
@@ -98,41 +151,40 @@ impl BackupEngine for FakeEngine {
 
     fn list_snapshots(&self) -> Result<Vec<SnapshotMeta>, EngineError> {
         self.calls.borrow_mut().push("list_snapshots()".into());
-        Ok(Vec::new())
+        Ok(self.snapshots.clone())
+    }
+
+    fn probe(&self) -> Option<Cause> {
+        self.calls.borrow_mut().push("probe()".into());
+        self.probe_result.clone()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::outcome::Cause;
+
+    // The scripting mechanism itself is not worth a test -- asserting that a
+    // queue written three lines earlier pops in order tests `Vec`. What is
+    // worth testing is that this stands in for a real engine faithfully enough
+    // for the command tests in `cli` to mean something, so these check the two
+    // behaviours those tests rely on.
 
     #[test]
-    fn scripted_outcomes_are_returned_in_order() {
+    fn a_queued_outcome_is_returned_before_the_default() {
         let e = FakeEngine::scripted(
-            vec![
-                VerifyOutcome::Good { coverage_pct: 5 },
-                VerifyOutcome::Indeterminate(Cause::Unreachable { detail: "x".into() }),
-            ],
+            vec![VerifyOutcome::Bad(
+                super::super::outcome::Corruption::CheckFailed { detail: "x".into() },
+            )],
             VerifyOutcome::Good { coverage_pct: 1 },
         );
-        assert!(e.verify_subset(5).is_good());
-        assert_eq!(e.verify_subset(5).label(), "unknown");
-        // Queue exhausted: falls back to the default.
-        assert!(e.verify_subset(5).is_good());
-        assert_eq!(e.call_log().len(), 3);
+        assert!(e.verify_subset(1).is_bad(), "queued outcome must win");
+        assert!(e.verify_subset(1).is_good(), "then the default");
     }
 
     #[test]
-    fn upload_limit_reaches_the_engine() {
-        // The bandwidth ceiling has to survive the seam or the governor above it
-        // is decorative.
-        let e = FakeEngine::always(VerifyOutcome::Good { coverage_pct: 1 });
-        let opts = SnapshotOpts {
-            upload_limit_kib: Some(5000),
-            ..Default::default()
-        };
-        e.snapshot(&[PathBuf::from("/srv/data")], &opts).unwrap();
-        assert!(e.call_log()[0].contains("5000"));
+    fn an_unreachable_engine_reports_it_from_probe() {
+        let e = FakeEngine::unreachable("connection refused");
+        assert!(e.probe().is_some());
     }
 }
