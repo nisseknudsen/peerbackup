@@ -26,7 +26,6 @@ jobs:
         run: |
           docker run --rm -v "$PWD:/mnt" koalaman/shellcheck:stable \
             -S warning -f gcc \
-            deploy/peerbackup-host \
             deploy/test-host-tooling.sh \
             deploy/test-compose-e2e.sh \
             deploy/test-provision-root.sh \
@@ -102,6 +101,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build
       - run: ./deploy/test-host-tooling.sh
 
   compose-e2e:
@@ -109,6 +111,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build
 
       - name: install restic (pinned, checksum verified)
         run: |
@@ -131,11 +136,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build
 
       # Runs as root on the runner rather than in a nested privileged container:
       # the runner's /tmp is real ext4, which is required because the test asserts
       # that fallocate genuinely reserves blocks. On overlayfs it does not, and
-      # peerbackup-host is expected to refuse rather than create a fake quota.
+      # provisioning is expected to refuse rather than create a fake quota.
       - name: provisioning lifecycle
         run: sudo -E ./deploy/test-provision-root.sh
         env:

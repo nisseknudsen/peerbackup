@@ -12,6 +12,10 @@
 set -uo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
+REPO="$(cd "$HERE/.." && pwd)"
+PB_BIN="${PB_BIN:-$REPO/target/debug/peerbackup}"
+# Unquoted at call sites: a command plus its subcommand.
+PB_HOST="$PB_BIN host"
 RESTIC="${RESTIC_BIN:-restic}"
 export PB_ROOT="${PB_ROOT:-/tmp/pb-e2e}"
 export PB_DATA="$PB_ROOT/mnt"
@@ -63,8 +67,8 @@ else
 fi
 
 # adduser exists precisely so nobody hits that. It creates, restarts, verifies.
-PB_PORT="$PB_PORT" PB_CONTAINER=peerbackup-rest "$HERE/peerbackup-host" adduser alice alicepw >/dev/null 2>&1
-PB_PORT="$PB_PORT" PB_CONTAINER=peerbackup-rest "$HERE/peerbackup-host" adduser bob bobpw >/dev/null 2>&1
+PB_PORT="$PB_PORT" PB_CONTAINER=peerbackup-rest $PB_HOST adduser alice alicepw >/dev/null 2>&1
+PB_PORT="$PB_PORT" PB_CONTAINER=peerbackup-rest $PB_HOST adduser bob bobpw >/dev/null 2>&1
 
 code=$(curl -s -o /dev/null -w '%{http_code}' -u alice:alicepw "$BASE/alice/config")
 [ "$code" = "404" ] && ok "adduser produces a working credential (404 = authed, no repo yet)" \
@@ -75,7 +79,7 @@ code=$(curl -s -o /dev/null -w '%{http_code}' -u alice:wrongpw "$BASE/alice/conf
 
 # adduser must FAIL, not warn, when it cannot confirm the credential works.
 # Warning here is what once let quickstart print a URL nothing could use.
-if out=$(PB_PORT=9999 PB_CONTAINER=peerbackup-rest "$HERE/peerbackup-host" adduser dave davepw 2>&1); then
+if out=$(PB_PORT=9999 PB_CONTAINER=peerbackup-rest $PB_HOST adduser dave davepw 2>&1); then
   bad "adduser exited 0 without confirming the credential works: $out"
 else
   ok "adduser fails when it cannot confirm the credential works"
@@ -128,7 +132,7 @@ else
 fi
 
 hdr "guard still fails closed on this layout"
-if PEERBACKUP_ROOT="$PB_ROOT" "$HERE/peerbackup-host" guard >/dev/null 2>&1; then
+if PEERBACKUP_ROOT="$PB_ROOT" $PB_HOST guard >/dev/null 2>&1; then
   bad "guard PASSED on plain directories — fail-closed is broken"
 else
   ok "guard refuses: these are directories, not mounted quota volumes"

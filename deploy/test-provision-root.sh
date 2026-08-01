@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Root-requiring tests for deploy/peerbackup-host: the real provisioning
-# lifecycle with real loop devices and a real ext4 filesystem.
+# Root-requiring tests for `peerbackup host`: the real provisioning lifecycle
+# with real loop devices and a real ext4 filesystem.
 #
 # This covers the paths test-host-tooling.sh has to skip:
 #   - fallocate actually preallocates (the file consumes real blocks)
@@ -24,7 +24,7 @@ REPO="$(cd "$HERE/.." && pwd)"
 # Re-exec inside a privileged container when asked.
 if [ "${1:-}" = "--in-container" ]; then
   # A container's root filesystem is overlayfs, where fallocate returns success
-  # without reserving blocks. That is a legitimate thing for peerbackup-host to
+  # without reserving blocks. That is a legitimate thing for provisioning to
   # refuse, but it means the lifecycle cannot be tested there. So give the test
   # a real ext4 filesystem on a loop device and run inside that.
   exec docker run --rm --privileged \
@@ -41,12 +41,30 @@ if [ "${1:-}" = "--in-container" ]; then
       # The backing store consumes loop0; grants need more. mount does not always
       # auto-create them via loop-control inside a container.
       for i in $(seq 1 7); do [ -e /dev/loop$i ] || mknod -m 660 /dev/loop$i b 7 $i; done
-      cp -r /repo /work && chmod +x /work/deploy/*.sh /work/deploy/peerbackup-host
-      PB_TEST_ROOT=/pbroot /work/deploy/test-provision-root.sh'
+      cp -r /repo /work && chmod +x /work/deploy/*.sh
+      # The binary is built outside and mounted in. A glibc build from a newer
+      # distribution will not run here, so say so plainly rather than failing
+      # with "No such file or directory", which names the wrong problem.
+      PB_BIN=""
+      for c in /work/target/x86_64-unknown-linux-musl/debug/peerbackup \
+               /work/target/debug/peerbackup; do
+        [ -x "$c" ] && "$c" --version >/dev/null 2>&1 && { PB_BIN="$c"; break; }
+      done
+      if [ -z "$PB_BIN" ]; then
+        echo "error: no peerbackup binary here will run inside debian:bookworm-slim." >&2
+        echo "       A glibc build from a newer distribution cannot. Build a static one:" >&2
+        echo "         rustup target add x86_64-unknown-linux-musl" >&2
+        echo "         cargo build --target x86_64-unknown-linux-musl" >&2
+        exit 1
+      fi
+      echo "using $PB_BIN"
+      PB_BIN="$PB_BIN" PB_TEST_ROOT=/pbroot /work/deploy/test-provision-root.sh'
 fi
 
-HOST="$HERE/peerbackup-host"
-[ -x "$HOST" ] || HOST="bash $HERE/peerbackup-host"
+# Unquoted on purpose at the call sites: this is a command plus a subcommand.
+BIN="${PB_BIN:-$REPO/target/debug/peerbackup}"
+[ -x "$BIN" ] || { echo "error: $BIN not found — run: cargo build" >&2; exit 1; }
+HOST="$BIN host"
 
 PASS=0; FAIL=0
 ok()  { printf '  \033[32mPASS\033[0m  %s\n' "$*"; PASS=$((PASS+1)); }

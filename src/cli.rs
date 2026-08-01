@@ -282,7 +282,7 @@ pub fn peer_remove(name: &str) -> Res {
     println!("Removed '{name}' from your config.");
     println!();
     println!("Your data is still on their machine. Ask them to run:");
-    println!("  sudo peerbackup-host release <your-name>");
+    println!("  sudo peerbackup host release <your-name>");
     println!("Then re-export your recovery file: peerbackup recovery export");
     Ok(())
 }

@@ -19,7 +19,7 @@ Two commands. One person hosts, the other sends.
 ### Host: give a friend some space
 
 ```sh
-./deploy/peerbackup-host quickstart alice
+peerbackup host quickstart alice
 ```
 
 Starts a server in Docker and prints a URL to send them:
@@ -94,8 +94,10 @@ git clone https://github.com/nisseknudsen/peerbackup
 cd peerbackup
 cargo build --release
 sudo install -m 0755 target/release/peerbackup /usr/local/bin/
-sudo install -m 0755 deploy/peerbackup-host /usr/local/bin/   # only if hosting
 ```
+
+One binary covers both roles: `peerbackup` to send backups, `peerbackup host`
+to hold a friend's.
 
 Or build the client image, which bundles restic:
 
@@ -119,11 +121,11 @@ peerbackup peer add|list|remove           # manage peers individually
 Hosting:
 
 ```sh
-peerbackup-host quickstart <peer>         # start a server and add a peer
-peerbackup-host adduser <peer>            # add another peer later
-peerbackup-host list                      # allowances and usage
-peerbackup-host provision <peer> <size>   # per-peer size limit (needs root)
-peerbackup-host release <peer>            # give the space back
+peerbackup host quickstart <peer>    # start a server and add a peer
+peerbackup host adduser <peer>       # add another peer later
+peerbackup host list                 # allowances and usage
+peerbackup host provision <peer> <size>   # per-peer size limit (needs root)
+peerbackup host release <peer>       # give the space back
 ```
 
 `status` reads locally recorded results and does not contact peers, so it
@@ -247,9 +249,9 @@ peer can consume all of it. To give each peer their own, enforced by the
 filesystem:
 
 ```sh
-sudo peerbackup-host provision alice 500G
-sudo peerbackup-host adduser alice
-sudo peerbackup-host list
+sudo peerbackup host provision alice 500G
+sudo peerbackup host adduser alice
+sudo peerbackup host list
 ```
 
 This creates a fixed-size disk image per peer and mounts it separately, so
@@ -257,7 +259,7 @@ filling it produces an error on their side and cannot affect anyone else. It
 needs root, because mounting does.
 
 ```
-$ sudo peerbackup-host list
+$ sudo peerbackup host list
 PEER                  IMAGE       USABLE      RESERVE         USED  STATE
 alice                  500GB        491GB         73GB        112GB  mounted
 ```
@@ -270,7 +272,7 @@ may not be able to run.
 To give the space back:
 
 ```sh
-sudo peerbackup-host release alice
+sudo peerbackup host release alice
 ```
 
 This destroys their backups and cannot be undone, so it asks you to type the
@@ -279,7 +281,7 @@ peer name first.
 ### Running it as a service
 
 ```sh
-sudo install -m 0755 deploy/peerbackup-host /usr/local/bin/
+sudo install -m 0755 target/release/peerbackup /usr/local/bin/
 sudo mkdir -p /usr/local/share/peerbackup
 sudo cp compose.yml /usr/local/share/peerbackup/
 sudo cp deploy/systemd/peerbackup-rest.service /etc/systemd/system/
@@ -377,7 +379,7 @@ Restored files appear under their original paths, so this produces
 
 **A peer gets `401 Unauthorized` with the right password.**
 The server reads logins only at startup. Restart it, or use
-`peerbackup-host adduser`, which handles that.
+`peerbackup host adduser`, which handles that.
 
 **`quickstart` says a container is running but nothing answers on the port.**
 Left over from an earlier setup on a different port or storage directory.

@@ -1,0 +1,484 @@
+//! Running the receiving server, and creating the logins it serves.
+
+use std::net::{Ipv4Addr, SocketAddrV4, TcpStream};
+use std::path::PathBuf;
+use std::process::Command;
+use std::time::Duration;
+
+use super::{Ctx, DEFAULT_CONTAINER, DEFAULT_PORT, REST_SERVER_IMAGE, Res, check_peer, have, warn};
+use crate::config::random_token;
+
+pub struct ServerOpts {
+    pub port: u16,
+    pub data: PathBuf,
+    pub container: String,
+    pub max_size: u64,
+}
+
+impl ServerOpts {
+    /// Read the overrides, refusing any that cannot be understood.
+    ///
+    /// Falling back to a default when an operator has explicitly set something
+    /// is the wrong shape here: PB_MAX_SIZE decides how much a friend can
+    /// store, and silently substituting 500G for a typo means the limit you
+    /// think you set is not the limit you have. Same argument as `parse_size`,
+    /// which this now uses, so `PB_MAX_SIZE=500G` works as well as raw bytes.
+    pub fn from_env() -> Result<Self, String> {
+        let port = match std::env::var("PB_PORT") {
+            Ok(v) => v
+                .parse()
+                .map_err(|_| format!("PB_PORT='{v}' is not a port number"))?,
+            Err(_) => DEFAULT_PORT,
+        };
+        let max_size = match std::env::var("PB_MAX_SIZE") {
+            Ok(v) => super::size::parse_size(&v).map_err(|e| format!("PB_MAX_SIZE: {e}"))?,
+            Err(_) => 536_870_912_000,
+        };
+        Ok(Self {
+            port,
+            data: std::env::var_os("PB_DATA")
+                .map(PathBuf::from)
+                .unwrap_or_else(default_data_dir),
+            container: std::env::var("PB_CONTAINER")
+                .unwrap_or_else(|_| DEFAULT_CONTAINER.to_string()),
+            max_size,
+        })
+    }
+}
+
+/// Somewhere an ordinary user can write. `/srv` needs root, which defeats the
+/// point of a setup that otherwise does not.
+fn default_data_dir() -> PathBuf {
+    std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| crate::config::home().join(".local/share"))
+        .join("peerbackup-data")
+}
+
+/// Start a server and hand back a URL, in one command and without root.
+///
+/// Uses a plain directory rather than a preallocated image, so the size limit
+/// is rest-server's and is shared across all peers. `provision` is the version
+/// with a per-peer limit the kernel enforces.
+pub fn quickstart(ctx: &Ctx, peer: &str, o: &ServerOpts) -> Res {
+    check_peer(peer)?;
+    if !have("docker") {
+        return Err("docker is required".into());
+    }
+    if !docker_ok() {
+        return Err(
+            "cannot talk to docker; is the daemon running and are you in the docker group?".into(),
+        );
+    }
+
+    std::fs::create_dir_all(&o.data).map_err(|e| {
+        format!(
+            "cannot create {} ({e})\n       Pick somewhere you can write: \
+             PB_DATA=/path peerbackup host quickstart {peer}",
+            o.data.display()
+        )
+    })?;
+    if !writable(&o.data) {
+        return Err(format!(
+            "{} exists but is not writable by this user\n       \
+             Either: sudo chown -R $(id -un) '{}'\n       \
+             Or pick another: PB_DATA=/path peerbackup host quickstart {peer}",
+            o.data.display(),
+            o.data.display()
+        ));
+    }
+
+    if container_running(&o.container) {
+        // Being up is not the same as serving on the port we are about to hand
+        // out. A container left over from an earlier setup listens somewhere
+        // else, and skipping this check is how a URL that cannot work gets
+        // printed.
+        if !http_reachable(o.port) {
+            return Err(format!(
+                "a container named '{}' is already running, but nothing answers\n       \
+                 on port {}. It is probably left over from an earlier setup using a\n       \
+                 different port or storage directory.\n\n       \
+                 Look at it:  docker ps --filter name={}\n       \
+                 Remove it:   docker rm -f {}\n       \
+                 Then run this again.",
+                o.container, o.port, o.container, o.container
+            ));
+        }
+        ctx.info(&format!(
+            "server already running on port {}, adding a peer to it",
+            o.port
+        ));
+    } else {
+        let _ = Command::new("docker")
+            .args(["rm", "-f", &o.container])
+            .output();
+        if !port_free(o.port) {
+            return Err(format!(
+                "port {} is already in use on this machine\n       \
+                 Choose another: PB_PORT=51516 peerbackup host quickstart {peer}",
+                o.port
+            ));
+        }
+
+        ctx.info(&format!("starting the server on port {}", o.port));
+        let user = format!("{}:{}", uid(), gid());
+        let ports = format!("{}:8000", o.port);
+        let volume = format!("{}:/data", o.data.display());
+        let options = format!(
+            "OPTIONS=--private-repos --append-only --max-size {}",
+            o.max_size
+        );
+        let out = Command::new("docker")
+            .args([
+                "run",
+                "-d",
+                "--name",
+                &o.container,
+                "--restart",
+                "unless-stopped",
+                "--user",
+                &user,
+                "-p",
+                &ports,
+                "-v",
+                &volume,
+                "-e",
+                &options,
+                REST_SERVER_IMAGE,
+            ])
+            .output()
+            .map_err(|e| format!("could not run docker: {e}"))?;
+        if !out.status.success() {
+            return Err(format!(
+                "docker could not start the server. Full error:\n{}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+
+        // Do not trust `docker run` exiting 0: the container can start and then
+        // die a moment later.
+        let mut up = false;
+        for _ in 0..60 {
+            if container_running(&o.container) && http_reachable(o.port) {
+                up = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        if !up {
+            warn("the server did not come up. Its log:");
+            if let Ok(logs) = Command::new("docker").args(["logs", &o.container]).output() {
+                for line in String::from_utf8_lossy(&logs.stderr)
+                    .lines()
+                    .chain(String::from_utf8_lossy(&logs.stdout).lines())
+                    .rev()
+                    .take(10)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                {
+                    eprintln!("  {line}");
+                }
+            }
+            let _ = Command::new("docker")
+                .args(["rm", "-f", &o.container])
+                .output();
+            return Err(format!("could not start the server on port {}", o.port));
+        }
+    }
+
+    let pw = adduser(ctx, peer, None, o).map_err(|e| {
+        format!("server is running but the login for '{peer}' could not be created\n       {e}")
+    })?;
+    let pw = pw.ok_or_else(|| format!("no password was generated for '{peer}'"))?;
+
+    let host = hostname();
+    ctx.info("");
+    ctx.info(&format!(
+        "Ready. Send this to {peer}, over something you trust:"
+    ));
+    ctx.info("");
+    ctx.info(&format!(
+        "  rest:http://{peer}:{pw}@{host}:{}/{peer}/",
+        o.port
+    ));
+    ctx.info("");
+    ctx.info("They run:  peerbackup connect '<that url>' --source /path/to/back/up");
+    ctx.info("");
+    ctx.info(&format!("Storage:   {}", o.data.display()));
+    ctx.info(&format!(
+        "Port {} must reach this machine. Use TLS if it is exposed to the",
+        o.port
+    ));
+    ctx.info("internet: see the README.");
+    Ok(())
+}
+
+/// Create a login, restart, and verify it before handing it to anyone.
+///
+/// rest-server loads .htpasswd ONCE at startup and never reloads it. Its own
+/// log says so: "Loaded htpasswd file /data/.htpasswd". A credential created
+/// after the server is running returns 401 until the container restarts, which
+/// looks exactly like a wrong password and sends both sides off debugging TLS.
+///
+/// So this exists purely to make the correct sequence unavoidable. Returns the
+/// generated password when it generated one.
+pub fn adduser(
+    ctx: &Ctx,
+    peer: &str,
+    password: Option<&str>,
+    o: &ServerOpts,
+) -> Result<Option<String>, String> {
+    check_peer(peer)?;
+
+    let (pw, generated) = match password {
+        Some(p) => (p.to_string(), false),
+        None => {
+            let p = random_token(24).map_err(|e| format!("could not generate a password: {e}"))?;
+            (p, true)
+        }
+    };
+    if generated {
+        ctx.say(&format!("generated password for '{peer}': {pw}"));
+        ctx.say("send it over a channel you trust. It is not stored anywhere in plaintext.");
+    }
+
+    let out = Command::new("docker")
+        .args(["exec", &o.container, "create_user", peer, &pw])
+        .output()
+        .map_err(|e| format!("could not run docker: {e}"))?;
+    if !out.status.success() {
+        let msg = String::from_utf8_lossy(&out.stderr);
+        warn(msg.trim());
+        return Err(format!(
+            "could not create the login for '{peer}' on container '{}'.\n       \
+             If the message above mentions /data, the server's storage directory is\n       \
+             missing or not writable. Check what it is mounted on:\n         \
+             docker inspect -f '{{{{range .Mounts}}}}{{{{.Source}}}} -> {{{{.Destination}}}}{{{{end}}}}' {}",
+            o.container, o.container
+        ));
+    }
+
+    ctx.say("restarting the server so it picks up the new credential (it only reads");
+    ctx.say("the htpasswd file at startup)");
+    ctx.run("docker", &["restart", &o.container])?;
+
+    if ctx.dry_run {
+        return Ok(generated.then_some(pw));
+    }
+
+    // 404 means authenticated but no repository yet, which is exactly right for
+    // a fresh grant. 200 means they already have one.
+    let mut code = String::new();
+    for _ in 0..40 {
+        code = http_status(o.port, &format!("/{peer}/config"), Some((peer, &pw)));
+        if code == "404" || code == "200" {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    match code.as_str() {
+        "404" | "200" => {
+            ctx.say(&format!(
+                "verified: credential for '{peer}' authenticates (HTTP {code})"
+            ));
+            Ok(generated.then_some(pw))
+        }
+        "401" => Err(format!(
+            "the login for '{peer}' still fails after a restart. The server is\n       \
+             running but does not accept it; check its htpasswd file."
+        )),
+        _ => Err(format!(
+            "could not confirm the login for '{peer}' works (HTTP {}).\n       \
+             Nothing is answering on port {}, so the server is not serving there.\n       \
+             Check it:   docker ps --filter name={}\n       \
+             Remove it:  docker rm -f {}",
+            if code.is_empty() {
+                "no response"
+            } else {
+                &code
+            },
+            o.port,
+            o.container,
+            o.container
+        )),
+    }
+}
+
+pub fn compose(ctx: &Ctx, up: bool) -> Res {
+    // As a binary there is no script directory to hang this off, so the file is
+    // looked up where a person would keep it: beside them, or named outright.
+    let file = std::env::var_os("PB_COMPOSE_FILE")
+        .map(PathBuf::from)
+        .or_else(|| {
+            let here = PathBuf::from("compose.yml");
+            here.exists().then_some(here)
+        })
+        .ok_or(
+            "no compose.yml here. Run this from the directory holding it, or set \
+             PB_COMPOSE_FILE=/path/to/compose.yml",
+        )?;
+    let f = file.to_string_lossy().into_owned();
+    if up {
+        ctx.run("docker", &["compose", "-f", &f, "up", "-d"])
+    } else {
+        ctx.run("docker", &["compose", "-f", &f, "down"])
+    }
+}
+
+// ------------------------------------------------------------------- plumbing
+
+fn uid() -> u32 {
+    // SAFETY: getuid reads a process property and cannot fail.
+    unsafe { libc::getuid() }
+}
+fn gid() -> u32 {
+    // SAFETY: getgid reads a process property and cannot fail.
+    unsafe { libc::getgid() }
+}
+
+fn writable(path: &std::path::Path) -> bool {
+    let probe = path.join(format!(".peerbackup-write-test-{}", std::process::id()));
+    match std::fs::write(&probe, b"") {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&probe);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+fn docker_ok() -> bool {
+    Command::new("docker")
+        .arg("info")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+fn container_running(name: &str) -> bool {
+    Command::new("docker")
+        .args(["ps", "--format", "{{.Names}}"])
+        .output()
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .any(|l| l.trim() == name)
+        })
+        .unwrap_or(false)
+}
+
+/// True when nothing is listening on the port.
+fn port_free(port: u16) -> bool {
+    TcpStream::connect_timeout(
+        &SocketAddrV4::new(Ipv4Addr::LOCALHOST, port).into(),
+        Duration::from_millis(300),
+    )
+    .is_err()
+}
+
+fn http_reachable(port: u16) -> bool {
+    !http_status(port, "/", None).is_empty()
+}
+
+/// The status code as a string, or empty when nothing answered.
+///
+/// curl rather than an HTTP crate: this is two calls on a setup path, and the
+/// alternative is a dependency tree larger than the rest of the program.
+fn http_status(port: u16, path: &str, auth: Option<(&str, &str)>) -> String {
+    let url = format!("http://127.0.0.1:{port}{path}");
+    let mut cmd = Command::new("curl");
+    cmd.args([
+        "-s",
+        "-o",
+        "/dev/null",
+        "-w",
+        "%{http_code}",
+        "--max-time",
+        "5",
+    ]);
+    if let Some((user, pw)) = auth {
+        cmd.args(["-u", &format!("{user}:{pw}")]);
+    }
+    cmd.arg(&url);
+    match cmd.output() {
+        Ok(o) => {
+            let code = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            if code == "000" { String::new() } else { code }
+        }
+        Err(_) => String::new(),
+    }
+}
+
+fn hostname() -> String {
+    for args in [vec!["-f"], vec![]] {
+        if let Ok(o) = Command::new("hostname").args(&args).output() {
+            let h = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            if o.status.success() && !h.is_empty() {
+                return h;
+            }
+        }
+    }
+    "localhost".into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_port_nobody_listens_on_reads_as_free() {
+        // Port 1 requires root to bind and is not in use on a test machine.
+        assert!(port_free(1));
+    }
+
+    #[test]
+    fn a_bound_port_does_not_read_as_free() {
+        let l = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = l.local_addr().unwrap().port();
+        assert!(!port_free(port), "a listening socket must not read as free");
+    }
+
+    #[test]
+    fn a_writable_directory_reads_as_writable_and_leaves_nothing_behind() {
+        let d = std::env::temp_dir().join(format!("pb-w-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        assert!(writable(&d));
+        let leftovers: Vec<_> = std::fs::read_dir(&d)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "write probe must clean up after itself"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_missing_directory_is_not_writable() {
+        assert!(!writable(std::path::Path::new("/nope/not/here")));
+    }
+
+    #[test]
+    fn quickstart_refuses_a_bad_peer_name() {
+        let ctx = Ctx {
+            root: PathBuf::from("/tmp/pb-unused"),
+            units: PathBuf::from("/tmp/pb-unused"),
+            reserve_pct: 15,
+            host_margin_gb: 20,
+            dry_run: true,
+            quiet: true,
+            force: false,
+        };
+        let o = ServerOpts {
+            port: 51515,
+            data: PathBuf::from("/tmp/pb-unused-data"),
+            container: "x".into(),
+            max_size: 1,
+        };
+        assert!(quickstart(&ctx, "a b", &o).is_err());
+        assert!(quickstart(&ctx, "", &o).is_err());
+    }
+}

@@ -1,6 +1,7 @@
 mod cli;
 mod config;
 mod engine;
+mod host;
 mod state;
 
 use std::path::PathBuf;
@@ -76,6 +77,10 @@ enum Command {
     /// Manage the file that lets you recover without this program
     #[command(subcommand)]
     Recovery(RecoveryCmd),
+
+    /// Host backups for a friend: grants, the server, and its logins
+    #[command(subcommand)]
+    Host(HostCmd),
 }
 
 #[derive(Subcommand)]
@@ -111,6 +116,65 @@ enum RecoveryCmd {
     Check,
 }
 
+/// Hosting for a friend: grants, the server, and the logins it serves.
+///
+/// This replaced `deploy/peerbackup-host`, which was 549 lines of bash. The OS
+/// still does the work -- fallocate, mkfs.ext4, systemctl, docker -- but the
+/// person hosting now installs the same one binary as the person backing up.
+#[derive(Subcommand)]
+enum HostCmd {
+    /// Start a server and print an invite, in one command and without root
+    Quickstart {
+        /// Short name for the friend you are hosting for
+        peer: String,
+    },
+    /// Create a size-limited grant the kernel enforces (needs root)
+    Provision {
+        peer: String,
+        /// e.g. 500G, 1T, 512M
+        size: String,
+    },
+    /// Create a login, restart the server, and verify it works
+    Adduser {
+        peer: String,
+        /// Leave empty to generate one
+        password: Option<String>,
+    },
+    /// Destroy a grant and give the capacity back (needs root)
+    Release { peer: String },
+    /// Grants, sizes and usage
+    List {
+        /// Only this peer
+        peer: Option<String>,
+    },
+    /// Refuse to start unless every grant is really mounted
+    Guard,
+    /// Check this machine is set up to host
+    Doctor,
+    /// docker compose up -d
+    Up,
+    /// docker compose down
+    Down,
+}
+
+fn run_host(cmd: HostCmd) -> Result<(), String> {
+    let ctx = host::Ctx::from_env();
+    let opts = host::server::ServerOpts::from_env()?;
+    match cmd {
+        HostCmd::Quickstart { peer } => host::server::quickstart(&ctx, &peer, &opts),
+        HostCmd::Provision { peer, size } => host::grant::provision(&ctx, &peer, &size),
+        HostCmd::Adduser { peer, password } => {
+            host::server::adduser(&ctx, &peer, password.as_deref(), &opts).map(|_| ())
+        }
+        HostCmd::Release { peer } => host::grant::release(&ctx, &peer),
+        HostCmd::List { peer } => host::grant::list(&ctx, peer.as_deref()),
+        HostCmd::Guard => host::grant::guard(&ctx),
+        HostCmd::Doctor => host::grant::doctor(&ctx),
+        HostCmd::Up => host::server::compose(&ctx, true),
+        HostCmd::Down => host::server::compose(&ctx, false),
+    }
+}
+
 fn main() {
     let cli = Cli::parse();
 
@@ -136,6 +200,7 @@ fn main() {
         } => cli::restore(&peer, &target, snapshot.as_deref()),
         Command::Recovery(RecoveryCmd::Export { out }) => cli::recovery_export(out),
         Command::Recovery(RecoveryCmd::Check) => cli::recovery_check(),
+        Command::Host(h) => run_host(h),
     };
 
     if let Err(e) = result {
