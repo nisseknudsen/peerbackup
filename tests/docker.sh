@@ -53,7 +53,11 @@ ok "image built"
 PB_DATA="$WORK/srv" PB_PORT="$PORT" PB_UID="$(id -u)" PB_GID="$(id -g)" \
   docker compose -f "$HOST_COMPOSE" up -d >/dev/null 2>&1
 for _ in $(seq 1 60); do curl -s -o /dev/null "http://127.0.0.1:$PORT/" && break; sleep 0.25; done
-docker ps --filter "name=$SERVER" --format '{{.Status}}' | grep -q Up \
+# Same rule as the backup assertion below, for the same pipefail reason. This
+# one rarely lost the race because `docker ps` exits right after writing, which
+# is exactly what makes it the kind of bug that surfaces months later.
+PS_OUT=$(docker ps --filter "name=$SERVER" --format '{{.Status}}')
+[[ "$PS_OUT" == *Up* ]] \
   && ok "host compose file starts a server" || { bad "host compose failed"; docker compose -f "$HOST_COMPOSE" logs | tail -5; exit 1; }
 
 docker exec "$SERVER" create_user me pw >/dev/null 2>&1
@@ -95,8 +99,25 @@ else
 fi
 
 hdr "with both mounted"
-pb -v "$WORK/data:$WORK/data:ro" -v "$WORK/other:$WORK/other:ro" \
-   "$IMAGE" backup 2>&1 | grep -q "done" && ok "backup completes" || bad "backup failed"
+# Capture, then match with bash rather than a pipe.
+#
+# `cmd | grep -q PATTERN` under `set -o pipefail` is a race. grep -q exits the
+# instant it matches and closes the pipe; the still-writing producer takes
+# SIGPIPE and exits 141; pipefail then reports 141 for a pipeline whose match
+# succeeded. `backup` prints "done (id)" and can print a recovery-file warning
+# after it, so there is always something still to write when grep leaves.
+#
+# This is why this job failed intermittently. Capturing first is not enough on
+# its own either: `echo "$BIG" | grep -q` races the same way once the string
+# exceeds the 64KB pipe buffer. `[[ ]]` has no pipe and no subprocess, so it
+# cannot race at all.
+OUT=$(pb -v "$WORK/data:$WORK/data:ro" -v "$WORK/other:$WORK/other:ro" \
+        "$IMAGE" backup 2>&1)
+if [[ "$OUT" == *done* ]]; then
+  ok "backup completes"
+else
+  bad "backup failed"; echo "$OUT" | sed 's/^/      /'
+fi
 
 hdr "verify and status through the container"
 VOUT=$(pb "$IMAGE" verify 2>&1)
