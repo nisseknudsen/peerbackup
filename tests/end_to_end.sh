@@ -78,6 +78,38 @@ hdr "passwords are not printed"
 "$BIN" peer list 2>/dev/null | grep -q "pw@" && bad "password shown in peer list" \
   || ok "peer list hides the password"
 
+hdr "a peer that has been added but never backed up is not safe to trust"
+# The worst bug this program can have: `peer add` uploads a test file to prove
+# the peer works, and that used to be recorded as a successful backup. `status`
+# then said ok, and `restore` fell back to that test snapshot and printed
+# "Done." after returning a canary directory and none of your data.
+#
+# Both halves are asserted together on purpose. Either one alone can regress
+# while the other still passes, and it is the combination that lies to someone
+# who has just lost a disk.
+OUT=$("$BIN" status 2>&1)
+if echo "$OUT" | grep -qE "alice .*ok"; then
+  bad "status reports ok for a peer holding no data"; echo "$OUT" | sed 's/^/      /'
+else
+  ok "status does not claim a peer is ok before any backup reached it"
+fi
+echo "$OUT" | grep -q "No backup has reached" \
+  && ok "status says a backup is missing, not that a check is overdue" \
+  || { bad "status does not say the peer never received a backup"; echo "$OUT" | sed 's/^/      /'; }
+
+RC=0
+OUT=$("$BIN" restore alice "$WORK/premature" 2>&1) || RC=$?
+if [ "$RC" = "0" ]; then
+  bad "restore succeeded with no backup present"; echo "$OUT" | sed 's/^/      /'
+else
+  ok "restore refuses when the peer holds only the peer-add test snapshot"
+fi
+echo "$OUT" | grep -qi "done" && bad "restore printed success while failing" \
+  || ok "restore does not print success on the refusal path"
+[ -d "$WORK/premature" ] && [ -n "$(ls -A "$WORK/premature" 2>/dev/null)" ] \
+  && bad "restore wrote files despite refusing" \
+  || ok "nothing was written to the restore target"
+
 hdr "backup"
 OUT=$("$BIN" backup 2>&1)
 echo "$OUT" | grep -q "done" && ok "backup completed" || { bad "backup failed"; echo "$OUT" | sed 's/^/      /'; }

@@ -44,6 +44,12 @@ pub struct SnapshotMeta {
     /// does not force a time library on callers that only display it.
     pub time: String,
     pub paths: Vec<PathBuf>,
+    /// What the snapshot was tagged with when it was made. This is how a real
+    /// backup is told apart from the test upload `peer add` makes, and it has to
+    /// be the tag rather than the paths: paths stop matching the moment someone
+    /// edits `sources`, and a restore that refuses because you reorganised your
+    /// folders is its own kind of failure.
+    pub tags: Vec<String>,
 }
 
 /// A file pulled back out, with the digest computed on arrival. The digest is

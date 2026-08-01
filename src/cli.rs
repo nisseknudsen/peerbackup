@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use crate::config::{Config, Peer, random_token, write_private};
 use crate::engine::outcome::VerifyOutcome;
 use crate::engine::restic::ResticEngine;
-use crate::engine::{BackupEngine, SnapshotId, SnapshotOpts};
+use crate::engine::{BackupEngine, SnapshotId, SnapshotMeta, SnapshotOpts};
 use crate::state::{
     Canary, Evidence, Kind, PeerState, Record, Verdict, ago, canary_dir, now, sha256_bytes,
     state_dir, status,
@@ -246,12 +246,16 @@ pub fn peer_add(name: &str, url: &str, ca_cert: Option<PathBuf>) -> Res {
 
     cfg.peers.push(peer);
     cfg.save().map_err(err("could not save config"))?;
-    record(name, Kind::Backup, Verdict::Good, None, None);
+    // Only the canary. This round trip proves the peer is reachable, writable
+    // and readable back byte-for-byte -- it does not prove any of your data is
+    // there, because none of it was sent. Recording a Backup here made `status`
+    // report a brand new peer as "backed up just now", which is the most
+    // reassuring possible lie for this program to tell.
     record(name, Kind::Canary, Verdict::Good, None, None);
 
     println!();
     println!("Peer '{name}' added and working.");
-    println!("Run `peerbackup backup` to send your first real backup.");
+    println!("No data has been sent yet. Run `peerbackup backup` to send your first backup.");
     Ok(())
 }
 
@@ -553,16 +557,32 @@ pub fn status_cmd() -> Res {
         }
     }
 
-    let unchecked: Vec<&str> = rows
+    // A peer that has never received a backup and a peer whose checks have gone
+    // stale are both `unchecked`, but the thing to do about them is different.
+    // Telling someone to run `verify` against a peer holding none of their data
+    // sends them to check something that was never there.
+    let (never, stale): (Vec<&str>, Vec<&str>) = rows
         .iter()
         .filter(|r| r.state == PeerState::Unknown)
         .map(|r| r.name.as_str())
-        .collect();
-    if !unchecked.is_empty() {
+        .partition(|n| {
+            rows.iter()
+                .find(|r| r.name == *n)
+                .is_some_and(|r| r.last_backup.is_none())
+        });
+
+    if !never.is_empty() {
+        println!();
+        println!(
+            "No backup has reached: {}. Run `peerbackup backup`.",
+            never.join(", ")
+        );
+    }
+    if !stale.is_empty() {
         println!();
         println!(
             "Not checked recently: {}. Run `peerbackup verify`.",
-            unchecked.join(", ")
+            stale.join(", ")
         );
     }
 
@@ -582,6 +602,42 @@ fn last_failure(records: &[crate::state::Record], peer: &str) -> Option<String> 
 
 // -------------------------------------------------------------------- restore
 
+/// Pick the snapshot a bare `restore` should use: the newest one tagged as a
+/// real backup, and nothing else.
+///
+/// `peer add` uploads the canary under its own tag to prove the peer works. That
+/// snapshot holds the test file and none of your data, so selecting it would
+/// restore almost nothing and report success. This function previously ended in
+/// `.or_else(|| snaps.first())` — three lines under a comment saying the test
+/// snapshot must never be chosen — which did exactly that whenever no real
+/// backup existed. Refusing is the only correct answer: there is nothing to
+/// restore, and saying so is the entire job.
+///
+/// Selection is by tag, not by matching snapshot paths against `sources`.
+/// Paths stop matching the moment someone reorganises their folders, and a
+/// restore that refuses because you renamed a directory is its own failure.
+fn newest_real_backup(snaps: &[SnapshotMeta], peer_name: &str) -> Result<SnapshotId, String> {
+    if let Some(s) = snaps
+        .iter()
+        .find(|s| s.tags.iter().any(|t| t == BACKUP_TAG))
+    {
+        return Ok(s.id.clone());
+    }
+    if snaps.is_empty() {
+        return Err(format!(
+            "{peer_name} holds no backups at all.\n  Run `peerbackup backup` to send one."
+        ));
+    }
+    Err(format!(
+        "{peer_name} holds no backup of your data.\n  \
+         The {} snapshot(s) there are from `peer add`, which uploads a test file and \
+         nothing else.\n  \
+         Run `peerbackup backup` first, or name one explicitly with --snapshot if you \
+         know what is in it.",
+        snaps.len()
+    ))
+}
+
 pub fn restore(peer_name: &str, target: &Path, snapshot: Option<&str>) -> Res {
     let cfg = Config::load().map_err(err("could not read config"))?;
     let peer = cfg
@@ -593,16 +649,7 @@ pub fn restore(peer_name: &str, target: &Path, snapshot: Option<&str>) -> Res {
         Some(s) => SnapshotId(s.to_string()),
         None => {
             let snaps = engine.list_snapshots().map_err(|e| e.to_string())?;
-            // Skip the round-trip check `peer add` uploads: it contains the test
-            // file and nothing else, so restoring it would look like success and
-            // give you none of your data.
-            snaps
-                .iter()
-                .find(|s| s.paths.iter().any(|p| cfg.settings.sources.contains(p)))
-                .or_else(|| snaps.first())
-                .ok_or("no backups on this peer")?
-                .id
-                .clone()
+            newest_real_backup(&snaps, peer_name)?
         }
     };
 
@@ -789,5 +836,60 @@ mod tests {
     fn redacting_leaves_urls_without_credentials_alone() {
         let plain = "rest:https://alice.example.org:8000/me/";
         assert_eq!(redact(plain), plain);
+    }
+
+    // ---------------------------------------------------------- restore choice
+
+    fn snap(id: &str, tags: &[&str]) -> SnapshotMeta {
+        SnapshotMeta {
+            id: SnapshotId(id.into()),
+            time: "2026-07-30T12:00:00Z".into(),
+            paths: vec![PathBuf::from("/srv/data")],
+            tags: tags.iter().map(|t| t.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn restore_refuses_when_only_the_peer_add_test_snapshot_exists() {
+        // The bug this replaced fell back to `snaps.first()`, restored a canary
+        // directory and printed "Done." to someone who had just lost a disk.
+        let snaps = [snap("aaaa1111", &[CHECK_TAG])];
+        let err = newest_real_backup(&snaps, "alice").unwrap_err();
+        assert!(
+            err.contains("no backup of your data"),
+            "must say the data is not there, got: {err}"
+        );
+        assert!(
+            err.contains("peerbackup backup"),
+            "must say what to do about it, got: {err}"
+        );
+    }
+
+    #[test]
+    fn restore_refuses_when_the_peer_holds_nothing() {
+        let err = newest_real_backup(&[], "alice").unwrap_err();
+        assert!(err.contains("no backups at all"), "got: {err}");
+    }
+
+    #[test]
+    fn restore_picks_the_newest_real_backup_over_the_test_snapshot() {
+        // list_snapshots is newest first.
+        let snaps = [
+            snap("bbbb2222", &[BACKUP_TAG]),
+            snap("cccc3333", &[BACKUP_TAG]),
+            snap("aaaa1111", &[CHECK_TAG]),
+        ];
+        assert_eq!(
+            newest_real_backup(&snaps, "alice").unwrap(),
+            SnapshotId("bbbb2222".into())
+        );
+    }
+
+    #[test]
+    fn an_untagged_snapshot_is_not_treated_as_a_backup() {
+        // Anything restic already held before peerbackup touched the repository
+        // is not ours and we cannot say what is in it.
+        let snaps = [snap("dddd4444", &[])];
+        assert!(newest_real_backup(&snaps, "alice").is_err());
     }
 }
