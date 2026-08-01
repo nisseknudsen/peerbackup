@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Tests for deploy/peerbackup-host.
+# Tests for `peerbackup host`, driven as a black box.
 #
 # Everything here runs WITHOUT root, because the paths that matter most are the
 # refusals: bad size strings, bad peer names, overcommit, and above all the
@@ -10,7 +10,11 @@
 # Run: ./deploy/test-host-tooling.sh
 
 set -uo pipefail
-HOST="$(dirname "$0")/peerbackup-host"
+# The command under test, as an array so callers can prefix environment
+# variables normally. A shell function would leak `DRY_RUN=1 host ...` into the
+# rest of the script, because bash keeps the assignment after a function call.
+BIN="${PB_BIN:-$(dirname "$0")/../target/debug/peerbackup}"
+HOST=("$BIN" host)
 PASS=0; FAIL=0
 ok()  { printf '  \033[32mPASS\033[0m  %s\n' "$*"; PASS=$((PASS+1)); }
 bad() { printf '  \033[31mFAIL\033[0m  %s\n' "$*"; FAIL=$((FAIL+1)); }
@@ -22,30 +26,37 @@ export PEERBACKUP_ROOT="$WORK/srv"
 export SYSTEMD_UNIT_DIR="$WORK/units"
 mkdir -p "$PEERBACKUP_ROOT/mnt" "$SYSTEMD_UNIT_DIR"
 
-hdr "syntax"
-if bash -n "$HOST"; then ok "peerbackup-host parses"; else bad "syntax error"; exit 1; fi
+hdr "the binary is there and answers"
+if [ -x "$BIN" ]; then ok "$BIN is executable"
+else bad "$BIN not found — run: cargo build"; exit 1; fi
+if "${HOST[@]}" --help >/dev/null 2>&1; then ok "host --help works"
+else bad "host --help failed"; exit 1; fi
 if bash -n "$(dirname "$0")/../spike/lifecycle-spike.sh"; then ok "lifecycle-spike parses"; else bad "spike syntax error"; fi
 
 hdr "size parsing — good input"
-for pair in "500G:536870912000" "1T:1099511627776" "512M:536870912" "1024K:1048576" "4096:4096"; do
+# This block used to reimplement to_bytes inside the test and assert against
+# the copy, because the shell version could not be sourced without running its
+# dispatcher. The shipped function was never executed, so a bug in it would
+# have passed. That is the single clearest reason this moved into the binary.
+#
+# The unit tests in src/host/size.rs cover parsing directly. What is left here
+# is the black-box half: prove the size a user types reaches the allocation.
+#
+# Sizes here stay small on purpose: admission control runs during a dry run, so
+# asking for 500G on a CI disk is refused before it ever reaches fallocate.
+# Magnitudes larger than the disk are covered by the overcommit test below,
+# which proves the same parsing from the other side.
+for pair in "2G:2147483648" "512M:536870912" "1024K:1048576" "4096:4096"; do
   in="${pair%%:*}"; want="${pair##*:}"
-  got=$(DRY_RUN=1 bash -c 'source "$0" 2>/dev/null; to_bytes "$1"' "$HOST" "$in" 2>/dev/null | tail -1)
-  # sourcing runs the dispatcher, so fall back to an isolated extraction
-  got=$(bash -c '
-    to_bytes() {
-      local s="${1^^}" n unit
-      n="${s%%[KMGT]*}"; unit="${s#"$n"}"; unit="${unit%B}"
-      case "$unit" in
-        K) echo $(( n * 1024 ));; M) echo $(( n * 1024 * 1024 ));;
-        G) echo $(( n * 1024 * 1024 * 1024 ));; T) echo $(( n * 1024 * 1024 * 1024 * 1024 ));;
-        "") echo "$n";; esac
-    }; to_bytes "$1"' _ "$in")
-  if [ "$got" = "$want" ]; then ok "$in -> $want"; else bad "$in -> got '$got', want '$want'"; fi
+  out=$(DRY_RUN=1 HOST_MARGIN_GB=0 "${HOST[@]}" provision sizecheck "$in" 2>&1)
+  got=$(echo "$out" | sed -n 's/.*would run: fallocate -l \([0-9]*\) .*/\1/p' | head -1)
+  if [ "$got" = "$want" ]; then ok "$in -> fallocate -l $want"
+  else bad "$in -> fallocate got '$got', want '$want'"; echo "$out" | sed 's/^/      /'; fi
 done
 
 hdr "size parsing — bad input must be refused, not guessed"
 for bad_in in "500X" "abc" "" "-5G" "5.5G"; do
-  out=$(DRY_RUN=1 "$HOST" provision testpeer "$bad_in" 2>&1)
+  out=$(DRY_RUN=1 "${HOST[@]}" provision testpeer "$bad_in" 2>&1)
   if echo "$out" | grep -qi 'bad size\|usage:'; then
     ok "refused '$bad_in'"
   else
@@ -55,14 +66,14 @@ done
 
 hdr "peer name validation — the name becomes a path and a systemd unit"
 for bad_peer in "../etc" "a/b" "a b" "a;rm" ""; do
-  out=$(DRY_RUN=1 "$HOST" provision "$bad_peer" 500G 2>&1)
+  out=$(DRY_RUN=1 "${HOST[@]}" provision "$bad_peer" 500G 2>&1)
   if echo "$out" | grep -qi 'peer name\|usage:'; then
     ok "refused peer name '$bad_peer'"
   else
     bad "accepted dangerous peer name '$bad_peer': $out"
   fi
 done
-out=$(DRY_RUN=1 "$HOST" provision "friend-a_1" 500G 2>&1)
+out=$(DRY_RUN=1 "${HOST[@]}" provision "friend-a_1" 500G 2>&1)
 if echo "$out" | grep -qi 'bad size\|peer name'; then
   bad "rejected a legitimate peer name"
 else
@@ -74,7 +85,7 @@ hdr "guard: refuses to start when storage is not mounted"
 # 1. No grant directories at all: must refuse, not shrug.
 # ${var:?} so an unset PEERBACKUP_ROOT aborts instead of rm -rf /mnt.
 rm -rf "${PEERBACKUP_ROOT:?}/mnt"; mkdir -p "$PEERBACKUP_ROOT/mnt"
-if "$HOST" guard >/dev/null 2>&1; then
+if "${HOST[@]}" guard >/dev/null 2>&1; then
   bad "guard PASSED with zero grants — would start a server with nothing mounted"
 else
   ok "guard refuses when there are no grants"
@@ -83,14 +94,14 @@ fi
 # 2. A grant directory that exists but is NOT a mountpoint. This is the exact
 #    boot race the guard exists for: bind mount resolves to the root filesystem.
 mkdir -p "$PEERBACKUP_ROOT/mnt/nisse"
-if "$HOST" guard >/dev/null 2>&1; then
+if "${HOST[@]}" guard >/dev/null 2>&1; then
   bad "guard PASSED on a non-mountpoint — writes would hit the host root fs with no quota"
 else
   ok "guard refuses when a grant directory is not a mountpoint"
 fi
 
 # 3. The refusal must say why, or nobody will know what to fix at 3am.
-out=$("$HOST" guard 2>&1)
+out=$("${HOST[@]}" guard 2>&1)
 if echo "$out" | grep -qi 'not a mountpoint\|NOT MOUNTED'; then
   ok "guard names the offending directory and the reason"
 else
@@ -101,7 +112,7 @@ fi
 #    conditional rather than skipped silently.
 if [ "$(id -u)" -eq 0 ]; then
   mount -t tmpfs -o size=10M tmpfs "$PEERBACKUP_ROOT/mnt/nisse" 2>/dev/null && {
-    if "$HOST" guard >/dev/null 2>&1; then ok "guard passes on a real mountpoint"
+    if "${HOST[@]}" guard >/dev/null 2>&1; then ok "guard passes on a real mountpoint"
     else bad "guard refused a genuinely mounted directory"; fi
     umount "$PEERBACKUP_ROOT/mnt/nisse"
   }
@@ -112,7 +123,7 @@ fi
 hdr "admission control — refuse to overcommit the host"
 # Runs under DRY_RUN on purpose: the check must happen even in a dry run, or the
 # rehearsal proves nothing about the thing you are rehearsing.
-out=$(DRY_RUN=1 HOST_MARGIN_GB=20 "$HOST" provision bigpeer 900T 2>&1)
+out=$(DRY_RUN=1 HOST_MARGIN_GB=20 "${HOST[@]}" provision bigpeer 900T 2>&1)
 if echo "$out" | grep -qi 'refusing to overcommit'; then
   ok "oversized grant refused, and refused during a dry run"
 else
@@ -120,7 +131,7 @@ else
 fi
 
 # A grant that clearly fits must NOT be refused, or the check is just a wall.
-out=$(DRY_RUN=1 HOST_MARGIN_GB=0 "$HOST" provision smallpeer 1M 2>&1)
+out=$(DRY_RUN=1 HOST_MARGIN_GB=0 "${HOST[@]}" provision smallpeer 1M 2>&1)
 if echo "$out" | grep -qi 'refusing to overcommit'; then
   bad "a 1M grant was refused — admission control is too aggressive"
 else
@@ -133,7 +144,7 @@ for want in requested available margin; do
 done
 
 hdr "list — reports all three numbers, and is honest that nothing enforces the reserve"
-out=$("$HOST" list 2>&1)
+out=$("${HOST[@]}" list 2>&1)
 for want in IMAGE USABLE RESERVE USED; do
   echo "$out" | grep -q "$want" && ok "list reports $want" || bad "list missing $want"
 done
@@ -152,7 +163,7 @@ else
 fi
 
 hdr "release — must refuse without confirmation"
-out=$(printf 'wrongname\n' | DRY_RUN=0 "$HOST" release nisse 2>&1)
+out=$(printf 'wrongname\n' | DRY_RUN=0 "${HOST[@]}" release nisse 2>&1)
 if echo "$out" | grep -qi 'aborted\|must run as root\|no grant found'; then
   ok "release refuses on a mistyped confirmation"
 else
@@ -162,26 +173,78 @@ fi
 hdr "quickstart defaults and failure reporting"
 # The first command a new user runs. It must not need root, and it must never
 # print a URL when the server is not actually up.
-grep -q 'DEFAULT_DATA=.*XDG_DATA_HOME' "$HOST" \
-  && ok "default storage is under the user's home, not /srv" \
-  || bad "default storage path needs root"
-grep -q 'DEFAULT_PORT=51515' "$HOST" \
-  && ok "default port is out of the commonly-used range" \
-  || bad "default port is likely to collide"
+#
+# These used to grep the shell source for `DEFAULT_DATA=` and `DEFAULT_PORT=`.
+# Greping an implementation for a constant proves the constant is written down,
+# not that it is used. Ask the program instead: run it somewhere it must fail,
+# and read which path and port it actually reached for.
+#
+# Both probes use their own container name so they can never disturb a real
+# server running on this machine, and both are arranged to fail before anything
+# is created, so the only thing observed is which path or port was reached for.
 
-# An exec carrying only redirections applies them to the whole shell. Having
-# that swallow every later error is how a failed start once printed a URL.
-# Skip comments: the warning about this pattern contains the pattern. The
-# equivalent check for compose.yml made the same mistake first.
-if grep -vE '^\s*#' "$HOST" | grep -qE 'exec [0-9]>&-\s+2>/dev/null'; then
-  bad "an exec redirection is silencing stderr for the rest of the script"
+# Point XDG_DATA_HOME somewhere that cannot be created. The error then names the
+# directory it tried, which is the default under test.
+out=$(PB_CONTAINER=pb-defaults-probe XDG_DATA_HOME=/proc/nowhere \
+      "${HOST[@]}" quickstart tester 2>&1)
+if echo "$out" | grep -q '/proc/nowhere/peerbackup-data'; then
+  ok "default storage follows XDG_DATA_HOME, not /srv"
+elif echo "$out" | grep -qi 'docker is required\|cannot talk to docker'; then
+  printf '  \033[33mSKIP\033[0m  default storage path (needs docker)\n'
 else
-  ok "no exec redirection that would silence later errors"
+  bad "default storage is not under the user's data dir: $out"
 fi
 
+# 51515 is in the dynamic range; 8000 collides constantly. Occupy the default
+# and watch the collision get reported. If something already holds it, that is
+# the same condition, so a failed bind is not a problem.
+if command -v python3 >/dev/null 2>&1; then
+  python3 -c "
+import socket,time
+s=socket.socket(); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
+try:
+    s.bind(('127.0.0.1',51515)); s.listen(1)
+except OSError:
+    pass
+time.sleep(8)
+" >/dev/null 2>&1 &
+  BLOCKER=$!
+  sleep 1
+  out=$(PB_DATA="$WORK/portprobe" PB_CONTAINER=pb-port-probe "${HOST[@]}" quickstart tester 2>&1)
+  kill "$BLOCKER" 2>/dev/null; wait "$BLOCKER" 2>/dev/null
+  docker rm -f pb-port-probe >/dev/null 2>&1 || true
+  if echo "$out" | grep -q 'port 51515 is already in use'; then
+    ok "default port is 51515, out of the commonly-used range"
+  elif echo "$out" | grep -qi 'docker is required\|cannot talk to docker'; then
+    printf '  \033[33mSKIP\033[0m  default port (needs docker)\n'
+  else
+    bad "did not reach for port 51515: $out"
+  fi
+else
+  printf '  \033[33mSKIP\033[0m  default port (needs python3)\n'
+fi
+
+# A size limit the operator set deliberately must never be silently replaced by
+# a default. This used to be passed straight through to the server, which died
+# on it; now it is refused before docker is touched, which is the better place.
+OUT=$(PB_MAX_SIZE=not-a-number "${HOST[@]}" quickstart tester 2>&1)
+echo "$OUT" | grep -qi 'PB_MAX_SIZE' \
+  && ok "an unparseable PB_MAX_SIZE is refused by name" \
+  || bad "PB_MAX_SIZE=not-a-number was not rejected: $OUT"
+echo "$OUT" | grep -q "Ready. Send this" \
+  && bad "printed a peer URL despite a bad size limit" \
+  || ok "no URL printed when the size limit is unusable"
+OUT=$(PB_MAX_SIZE=10G PB_CONTAINER=pb-size-probe "${HOST[@]}" quickstart tester 2>&1)
+echo "$OUT" | grep -qi 'PB_MAX_SIZE' \
+  && bad "rejected a valid size string: $OUT" \
+  || ok "PB_MAX_SIZE accepts a human size like 10G"
+docker rm -f pb-size-probe >/dev/null 2>&1 || true
+
 if command -v docker >/dev/null 2>&1; then
-  OUT=$(PB_DATA="$WORK/dies" PB_PORT=51599 PB_MAX_SIZE=not-a-number \
-        "$HOST" quickstart tester 2>&1)
+  # Make docker itself refuse: a container name with a slash in it is invalid.
+  # The point is the reaction, not the cause -- no URL, and a clear reason.
+  OUT=$(PB_DATA="$WORK/dies" PB_PORT=51599 PB_CONTAINER="bad/name" \
+        "${HOST[@]}" quickstart tester 2>&1)
   if echo "$OUT" | grep -q "Ready. Send this"; then
     bad "printed a peer URL even though the server failed to start"
   else
@@ -200,7 +263,7 @@ if command -v docker >/dev/null 2>&1; then
     -v "$WORK/stale:/data" -e OPTIONS="--private-repos" \
     restic/rest-server:0.14.0 >/dev/null 2>&1
   sleep 2
-  OUT=$(PB_DATA="$WORK/d1" PB_PORT=51598 "$HOST" quickstart tester 2>&1)
+  OUT=$(PB_DATA="$WORK/d1" PB_PORT=51598 "${HOST[@]}" quickstart tester 2>&1)
   if echo "$OUT" | grep -q "Ready. Send this"; then
     bad "printed a URL while a stale container held the name"
   else
@@ -217,7 +280,7 @@ if command -v docker >/dev/null 2>&1; then
     restic/rest-server:0.14.0 >/dev/null 2>&1
   sleep 2
   rm -rf "$WORK/vanish"
-  OUT=$(PB_DATA="$WORK/d2" PB_PORT=51597 "$HOST" quickstart tester 2>&1)
+  OUT=$(PB_DATA="$WORK/d2" PB_PORT=51597 "${HOST[@]}" quickstart tester 2>&1)
   if echo "$OUT" | grep -q "Ready. Send this"; then
     bad "printed a URL when the login could not be created"
   else

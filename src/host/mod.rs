@@ -1,0 +1,339 @@
+//! The host side: what you run when a friend asks you to hold their backups.
+//!
+//! This was 549 lines of bash in `deploy/peerbackup-host` until the size parser
+//! turned out to have no real test, and could not have one: a bash file that is
+//! both a library and an executable cannot be sourced without running its
+//! dispatcher, so the test reimplemented the function and asserted against the
+//! copy. The install story was the other half of the argument -- the friend
+//! doing you the favour cloned a repo while the friend being helped downloaded
+//! one binary, which is backwards.
+//!
+//! What did not change: the OS still does the work. `provision` drives
+//! `fallocate`, `mkfs.ext4` and `systemctl`; `quickstart` drives `docker`. This
+//! removed a language seam, not a dependency.
+//!
+//! The four things that are easy to get wrong, unchanged from the shell:
+//!
+//!   * Images are PREALLOCATED, never sparse. A sparse image caps the inner
+//!     filesystem but reserves no host blocks, so granting 500G to three
+//!     friends on a 1T disk still lets the host fill up.
+//!
+//!   * Mounting needs CAP_SYS_ADMIN, which the internet-facing container must
+//!     not have. The host mounts; the container receives a mounted directory.
+//!
+//!   * `guard` is fail-closed. If Docker starts before the mounts settle, bind
+//!     mounts resolve to ordinary directories on the root filesystem with no
+//!     size limit, and the first symptom is a full disk.
+//!
+//!   * The maintenance reserve is advisory. Nothing enforces it, because
+//!     rest-server's `--max-size` is per instance and one instance serves every
+//!     grantee.
+
+pub mod grant;
+pub mod server;
+pub mod size;
+
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+pub type Res = Result<(), String>;
+
+/// 51515 is in the dynamic port range, so it is unlikely to collide with
+/// something already running. 8000 collides constantly.
+pub const DEFAULT_PORT: u16 = 51515;
+pub const DEFAULT_CONTAINER: &str = "peerbackup-rest";
+pub const REST_SERVER_IMAGE: &str = "restic/rest-server:0.14.0";
+
+/// Where everything lives, plus the switches the tests drive.
+///
+/// Read from the environment once rather than at each use, so a command cannot
+/// see two different values for the same setting partway through.
+pub struct Ctx {
+    pub root: PathBuf,
+    pub units: PathBuf,
+    /// Percent of a grant left as headroom for `prune` to repack. Advisory:
+    /// reported so a human can leave room, enforced by nothing.
+    pub reserve_pct: u64,
+    /// Never let grants consume the last of the host disk, even if each grant
+    /// is individually legal.
+    pub host_margin_gb: u64,
+    /// Print what would happen and touch nothing. The tests rely on this, and
+    /// admission control deliberately still runs.
+    pub dry_run: bool,
+    pub quiet: bool,
+    pub force: bool,
+}
+
+impl Default for Ctx {
+    fn default() -> Self {
+        Self::from_env()
+    }
+}
+
+impl Ctx {
+    pub fn from_env() -> Self {
+        let env_num = |k: &str, d: u64| {
+            std::env::var(k)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(d)
+        };
+        let flag = |k: &str| std::env::var(k).is_ok_and(|v| v == "1");
+        Self {
+            root: std::env::var_os("PEERBACKUP_ROOT")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("/srv/peerbackup")),
+            units: std::env::var_os("SYSTEMD_UNIT_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("/etc/systemd/system")),
+            reserve_pct: env_num("MAINTENANCE_RESERVE_PCT", 15),
+            host_margin_gb: env_num("HOST_MARGIN_GB", 20),
+            dry_run: flag("DRY_RUN"),
+            quiet: flag("QUIET"),
+            force: flag("FORCE"),
+        }
+    }
+
+    pub fn images(&self) -> PathBuf {
+        self.root.join("images")
+    }
+    pub fn mnt(&self) -> PathBuf {
+        self.root.join("mnt")
+    }
+    pub fn image_of(&self, peer: &str) -> PathBuf {
+        self.images().join(format!("{peer}.img"))
+    }
+    pub fn dir_of(&self, peer: &str) -> PathBuf {
+        self.mnt().join(peer)
+    }
+
+    pub fn info(&self, msg: &str) {
+        println!("{msg}");
+    }
+    pub fn say(&self, msg: &str) {
+        if !self.quiet {
+            println!("{msg}");
+        }
+    }
+
+    /// Run a command, or describe it under `DRY_RUN`.
+    ///
+    /// The printed form matches what the shell printed, because the tests read
+    /// it and because seeing the exact command is the point of a dry run.
+    pub fn run(&self, program: &str, args: &[&str]) -> Res {
+        let line = format!("{program} {}", args.join(" "));
+        if self.dry_run {
+            println!("  would run: {line}");
+            return Ok(());
+        }
+        let out = Command::new(program)
+            .args(args)
+            .output()
+            .map_err(|e| format!("could not run `{line}`: {e}"))?;
+        if out.status.success() {
+            return Ok(());
+        }
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        Err(format!(
+            "`{line}` failed{}{}",
+            match out.status.code() {
+                Some(c) => format!(" (exit {c})"),
+                None => String::new(),
+            },
+            if stderr.trim().is_empty() {
+                String::new()
+            } else {
+                format!(": {}", stderr.trim())
+            }
+        ))
+    }
+
+    /// Same, but a non-zero exit only warns. For teardown steps that are
+    /// expected to fail when the thing is already gone.
+    pub fn run_best_effort(&self, program: &str, args: &[&str]) {
+        if let Err(e) = self.run(program, args) {
+            warn(&e);
+        }
+    }
+
+    pub fn need_root(&self) -> Res {
+        if self.dry_run || is_root() {
+            return Ok(());
+        }
+        Err("must run as root (mount, losetup and systemd all need it)".into())
+    }
+}
+
+pub fn warn(msg: &str) {
+    eprintln!("\x1b[33mwarn:\x1b[0m {msg}");
+}
+
+pub fn is_root() -> bool {
+    // SAFETY: geteuid reads a process property. It cannot fail and touches no
+    // memory we own.
+    unsafe { libc::geteuid() == 0 }
+}
+
+/// A peer name becomes a path component and a systemd unit name, so it gets the
+/// narrowest character set that still reads naturally.
+pub fn peer_valid(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+pub fn check_peer(name: &str) -> Res {
+    if peer_valid(name) {
+        Ok(())
+    } else {
+        Err(format!(
+            "peer name '{name}' must be [a-zA-Z0-9_-] only (it becomes a path and a unit name)"
+        ))
+    }
+}
+
+/// Is this path a mount point?
+///
+/// Compares the device id of the directory against its parent, which is what
+/// `mountpoint` does. Native rather than shelled out because it is two stat
+/// calls, and because `guard` depends on the answer: a false "yes" here means
+/// writes land on the host root filesystem with no size limit.
+pub fn is_mountpoint(path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(here) = std::fs::metadata(path) else {
+        return false;
+    };
+    let Some(parent) = path.parent() else {
+        return true; // "/" is always a mount point.
+    };
+    match std::fs::metadata(parent) {
+        Ok(up) => here.dev() != up.dev(),
+        Err(_) => false,
+    }
+}
+
+/// Capacity of the filesystem holding `path`: (total, available) in bytes.
+pub fn statfs(path: &Path) -> Result<(u64, u64), String> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let c = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| format!("path {} contains a NUL byte", path.display()))?;
+    // SAFETY: `c` is a valid NUL-terminated path for the duration of the call
+    // and `buf` is owned here. statvfs writes only into buf and signals failure
+    // through its return value.
+    let mut buf: libc::statvfs = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::statvfs(c.as_ptr(), &mut buf) };
+    if rc != 0 {
+        return Err(format!(
+            "could not read free space on {}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    // f_frsize is the fragment size, which is what f_blocks and f_bavail are
+    // counted in. f_bsize is the preferred I/O size and is the wrong multiplier.
+    let unit = if buf.f_frsize > 0 {
+        buf.f_frsize
+    } else {
+        buf.f_bsize
+    } as u64;
+    Ok((buf.f_blocks as u64 * unit, buf.f_bavail as u64 * unit))
+}
+
+/// The systemd mount unit name for a grant directory.
+///
+/// Shelled out on purpose. The escaping rules are exact, and getting them
+/// subtly wrong writes a unit to a path systemd never reads. The shell version
+/// hit that once: the unit was written, `provision` reported success, and the
+/// grant never mounted.
+pub fn unit_name(dir: &Path) -> Result<String, String> {
+    let out = Command::new("systemd-escape")
+        .args(["--path", "--suffix=mount"])
+        .arg(dir)
+        .output()
+        .map_err(|e| {
+            format!(
+                "systemd-escape not found ({e}); cannot derive the mount unit name for {}",
+                dir.display()
+            )
+        })?;
+    let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if !out.status.success() || name.is_empty() {
+        return Err(format!(
+            "systemd-escape produced an empty unit name for {}",
+            dir.display()
+        ));
+    }
+    Ok(name)
+}
+
+pub fn have(tool: &str) -> bool {
+    // PATH lookup without a shell, so a tool name can never be interpreted.
+    std::env::var_os("PATH")
+        .map(|paths| {
+            std::env::split_paths(&paths).any(|dir| {
+                let c = dir.join(tool);
+                std::fs::metadata(&c).map(|m| m.is_file()).unwrap_or(false)
+            })
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn peer_names_that_would_break_a_path_or_a_unit_are_refused() {
+        for good in ["alice", "bob-2", "a_b", "A1"] {
+            assert!(peer_valid(good), "{good} should be allowed");
+        }
+        for bad in ["", "../etc", "a b", "a/b", "a.b", "a;rm -rf /", "péer"] {
+            assert!(!peer_valid(bad), "{bad:?} must be refused");
+        }
+    }
+
+    #[test]
+    fn a_plain_directory_is_not_a_mountpoint() {
+        // The guard's whole job rests on this returning false for an ordinary
+        // directory, so a container never starts against unmounted storage.
+        let dir = std::env::temp_dir().join(format!("pb-mp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        assert!(!is_mountpoint(&dir.join("sub")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_missing_directory_is_not_a_mountpoint() {
+        // Fail closed: an absent path must never read as mounted.
+        assert!(!is_mountpoint(Path::new("/nope/not/here")));
+    }
+
+    #[test]
+    fn root_is_a_mountpoint() {
+        assert!(is_mountpoint(Path::new("/")));
+    }
+
+    #[test]
+    fn statfs_reports_a_plausible_filesystem() {
+        let (total, avail) = statfs(Path::new("/")).unwrap();
+        assert!(total > 0, "root filesystem should have a size");
+        assert!(avail <= total, "available cannot exceed total");
+    }
+
+    #[test]
+    fn statfs_on_a_missing_path_is_an_error_not_a_zero() {
+        // Returning zero here would make admission control refuse every grant,
+        // or accept one against a filesystem it never read.
+        assert!(statfs(Path::new("/definitely/not/here/at/all")).is_err());
+    }
+
+    #[test]
+    fn have_finds_a_tool_that_exists_and_not_one_that_does_not() {
+        assert!(have("sh"), "sh must be on PATH");
+        assert!(!have("definitely-not-a-real-binary-xyzzy"));
+    }
+}

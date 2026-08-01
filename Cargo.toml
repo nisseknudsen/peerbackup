@@ -11,3 +11,6 @@ toml = "0.8"
 # Every canary comparison depends on this being right.
 sha2 = "0.10"
 clap = { version = "4", features = ["derive"] }
+# Already in the tree via sha2. Used for statvfs and geteuid on the host side,
+# where shelling out to df and parsing its columns is the fragile alternative.
+libc = "0.2"

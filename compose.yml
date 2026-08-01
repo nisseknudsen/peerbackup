@@ -1,7 +1,7 @@
 # Hosting backups for peers.
 #
 # `docker compose up -d` is enough for a basic setup, or use
-# `peerbackup-host quickstart <peer>` which does this plus creating a login.
+# `peerbackup host quickstart <peer>` which does this plus creating a login.
 #
 # By default the size limit is applied by rest-server and shared across all
 # peers. Pointing PB_DATA at provisioned per-peer volumes gives each peer its

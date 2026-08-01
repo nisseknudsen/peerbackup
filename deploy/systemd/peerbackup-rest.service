@@ -8,7 +8,7 @@
 #
 # Install:
 #   sudo cp deploy/systemd/peerbackup-rest.service /etc/systemd/system/
-#   sudo cp deploy/peerbackup-host /usr/local/bin/
+#   sudo install -m 0755 target/release/peerbackup /usr/local/bin/
 #   sudo systemctl daemon-reload && sudo systemctl enable --now peerbackup-rest
 #
 # Verify the guard actually works (do this once, it is the whole point):
@@ -42,7 +42,7 @@ Environment=PB_UID=1000
 Environment=PB_GID=1000
 
 # FAIL CLOSED. If any grant directory is not a real mountpoint, refuse to start.
-ExecStartPre=/usr/local/bin/peerbackup-host guard
+ExecStartPre=/usr/local/bin/peerbackup host guard
 
 ExecStart=/usr/bin/docker compose -f /usr/local/share/peerbackup/compose.yml up -d
 ExecStop=/usr/bin/docker compose -f /usr/local/share/peerbackup/compose.yml down
