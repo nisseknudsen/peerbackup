@@ -132,15 +132,23 @@ for want in requested available margin; do
   echo "$out" | grep -qi "$want" && ok "provision shows '$want'" || bad "provision hides '$want'"
 done
 
-hdr "list — reports all three numbers, and says who enforces the reserve"
+hdr "list — reports all three numbers, and is honest that nothing enforces the reserve"
 out=$("$HOST" list 2>&1)
 for want in IMAGE USABLE RESERVE USED; do
   echo "$out" | grep -q "$want" && ok "list reports $want" || bad "list missing $want"
 done
-if echo "$out" | grep -qi 'enforced by'; then
-  ok "list states that the reserve is client-enforced, not server-enforced"
+# This used to assert that the reserve was "enforced by the CLIENT". No client
+# reserve model was ever built, so the test was asserting a false claim and
+# locking it in. The reserve is advisory; the output has to say so.
+if echo "$out" | grep -qi 'nothing enforces it'; then
+  ok "list states plainly that the reserve is not enforced"
 else
-  bad "list does not say who enforces the maintenance reserve"
+  bad "list must not imply the maintenance reserve is enforced by anything"
+fi
+if echo "$out" | grep -qi 'enforced by the CLIENT'; then
+  bad "list still claims client enforcement, which does not exist"
+else
+  ok "list makes no false enforcement claim"
 fi
 
 hdr "release — must refuse without confirmation"
