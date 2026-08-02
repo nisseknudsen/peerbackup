@@ -65,14 +65,6 @@ impl ResticEngine {
     /// happening is not something anyone will sit through, and the answer is
     /// known within seconds anyway.
     ///
-    /// Returns `None` when the peer responded.
-    pub fn probe(&self) -> Option<Cause> {
-        match self.run(&["cat", "config"], Some(self.probe_timeout)) {
-            Ok(_) => None,
-            Err(e) => Some(e.cause),
-        }
-    }
-
     fn command(&self, args: &[&str]) -> Command {
         let mut c = Command::new(&self.binary);
         c.arg("-r").arg(&self.repo_url);
@@ -146,9 +138,27 @@ impl BackupEngine for ResticEngine {
         args.extend(sources.iter().map(|s| s.display().to_string()));
 
         let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        let out = self.run(&refs, None)?;
 
-        let combined = combined_output(&out);
+        // Exit 3 is restic saying "I finished, but I could not read some of
+        // what you asked for". There is a real snapshot behind it, and it is
+        // missing data, which is precisely the case worth telling the user
+        // about. `run` rejects every non-zero exit, so this is unwrapped here
+        // rather than treated as a failure with raw restic text attached.
+        let out = match self.run(&refs, None) {
+            Ok(out) => out,
+            Err(e) if e.exit_code == Some(EXIT_INCOMPLETE) => {
+                return match parse_snapshot_id(&e.message) {
+                    Some(id) => Ok(Snapshot {
+                        id,
+                        incomplete: true,
+                    }),
+                    // Exit 3 with no snapshot id means nothing was stored.
+                    None => Err(e),
+                };
+            }
+            Err(e) => return Err(e),
+        };
+
         let id = parse_snapshot_id(&String::from_utf8_lossy(&out.stdout)).ok_or_else(|| {
             EngineError {
                 message: "backup reported success but emitted no snapshot_id".into(),
@@ -160,8 +170,7 @@ impl BackupEngine for ResticEngine {
         })?;
         Ok(Snapshot {
             id,
-            incomplete: combined.contains("could not be read")
-                || combined.contains("error_count") && !combined.contains("\"error_count\":0"),
+            incomplete: is_incomplete(&combined_output(&out)),
         })
     }
 
@@ -245,6 +254,19 @@ impl BackupEngine for ResticEngine {
         }
     }
 
+    /// Returns `None` when the peer responded.
+    ///
+    /// Without this, verifying an unreachable peer waits out the full
+    /// verification timeout, because restic keeps retrying. An hour of nothing
+    /// happening is not something anyone will sit through, and the answer is
+    /// known within seconds anyway.
+    fn probe(&self) -> Option<Cause> {
+        match self.run(&["cat", "config"], Some(self.probe_timeout)) {
+            Ok(_) => None,
+            Err(e) => Some(e.cause),
+        }
+    }
+
     fn list_snapshots(&self) -> Result<Vec<SnapshotMeta>, EngineError> {
         let out = self.run(&["snapshots", "--json"], Some(self.list_timeout))?;
         parse_snapshots(&String::from_utf8_lossy(&out.stdout)).map_err(|e| EngineError {
@@ -294,10 +316,17 @@ fn run_bounded(mut cmd: Command, timeout: Option<Duration>) -> std::io::Result<O
         thread::sleep(Duration::from_millis(50));
     };
 
+    // Join on both paths. On the timeout path these used to be dropped and the
+    // threads detached; they do exit once the pipes close after the kill, but
+    // leaving them unjoined asserts a cleanup that was not performed. The kill
+    // and wait above have already happened, so neither can block.
+    let stdout = t_out.join().unwrap_or_default();
+    let stderr = t_err.join().unwrap_or_default();
+
     Ok(status.map(|status| Output {
         status,
-        stdout: t_out.join().unwrap_or_default(),
-        stderr: t_err.join().unwrap_or_default(),
+        stdout,
+        stderr,
     }))
 }
 
@@ -329,6 +358,40 @@ struct SnapshotJson {
     tags: Vec<String>,
 }
 
+/// restic's exit code for "completed, but could not read everything".
+///
+/// Since 0.17 this is how a partial backup is reported: there is a snapshot,
+/// and it is missing data. Treating it as an ordinary failure loses the
+/// snapshot id and shows raw restic output instead of saying what happened.
+pub const EXIT_INCOMPLETE: i32 = 3;
+
+/// Did this backup fail to read some of its sources?
+///
+/// Indices come from `find` and a literal length, so they land on character
+/// boundaries; the lint cannot see that.
+#[allow(clippy::string_slice)]
+///
+/// Belt and braces alongside the exit code: older restic reported some partial
+/// reads on exit 0, and the summary carries an explicit count either way.
+fn is_incomplete(combined: &str) -> bool {
+    if combined.contains("could not be read") {
+        return true;
+    }
+    // `"error_count":0` is the healthy case; any other value is not.
+    match combined.find("\"error_count\":") {
+        Some(i) => {
+            let rest = &combined[i + "\"error_count\":".len()..];
+            let digits: String = rest
+                .trim_start()
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect();
+            digits.parse::<u64>().is_ok_and(|n| n > 0)
+        }
+        None => false,
+    }
+}
+
 /// `backup --json` is line-delimited; the summary line carries `snapshot_id`.
 fn parse_snapshot_id(stdout: &str) -> Option<SnapshotId> {
     stdout.lines().rev().find_map(|l| {
@@ -341,17 +404,26 @@ fn parse_snapshot_id(stdout: &str) -> Option<SnapshotId> {
 
 /// Newest first. Hand-rolled extraction used to live here and silently returned
 /// an empty list, because restic nests a `summary` object inside each snapshot.
+///
+/// Sorted on the timestamp rather than reversing restic's output. `restore` and
+/// the canary check both take the first element and call it the newest, so if
+/// restic's ordering ever changed a bare `restore` would hand back the *oldest*
+/// backup and print "Done." RFC3339 with a fixed offset sorts correctly as
+/// text, and the offset is restic's own so it is consistent within a
+/// repository; ties keep restic's order, which is stable.
 fn parse_snapshots(stdout: &str) -> serde_json::Result<Vec<SnapshotMeta>> {
-    let mut v: Vec<SnapshotJson> = serde_json::from_str(stdout)?;
-    v.reverse();
-    Ok(v.into_iter()
+    let v: Vec<SnapshotJson> = serde_json::from_str(stdout)?;
+    let mut out: Vec<SnapshotMeta> = v
+        .into_iter()
         .map(|s| SnapshotMeta {
             id: SnapshotId(s.short_id),
             time: s.time,
             paths: s.paths,
             tags: s.tags,
         })
-        .collect())
+        .collect();
+    out.sort_by(|a, b| b.time.cmp(&a.time));
+    Ok(out)
 }
 
 fn sha256_file(path: &Path) -> std::io::Result<String> {
@@ -393,8 +465,8 @@ mod tests {
     fn parses_the_tags_restic_actually_emits() {
         let snaps = parse_snapshots(REAL_TAGGED_SNAPSHOTS_JSON).unwrap();
         // Newest first, so the check snapshot leads.
-        assert_eq!(snaps[0].tags, vec!["peerbackup-check".to_string()]);
-        assert_eq!(snaps[1].tags, vec!["peerbackup".to_string()]);
+        assert_eq!(snaps[0].tags, vec!["peerbackup-check".to_owned()]);
+        assert_eq!(snaps[1].tags, vec!["peerbackup".to_owned()]);
     }
 
     #[test]
@@ -408,13 +480,30 @@ mod tests {
 
     #[test]
     fn lists_snapshots_newest_first() {
+        // Deliberately unsorted input. The version this replaced just reversed
+        // restic's output, so a test feeding ascending input and asserting a
+        // reversal could not fail for any reason that mattered -- it pinned the
+        // implementation, not the property callers depend on.
         let json = r#"[
-          {"time":"2026-07-01T10:00:00Z","short_id":"aaaa1111","paths":["/srv/data"]},
-          {"time":"2026-07-02T10:00:00Z","short_id":"bbbb2222","paths":["/srv/data","/etc"]}
+          {"time":"2026-07-02T10:00:00Z","short_id":"bbbb2222","paths":["/srv/data"]},
+          {"time":"2026-06-01T10:00:00Z","short_id":"cccc3333","paths":["/srv/data"]},
+          {"time":"2026-07-30T10:00:00Z","short_id":"dddd4444","paths":["/srv/data"]},
+          {"time":"2026-07-01T10:00:00Z","short_id":"aaaa1111","paths":["/srv/data"]}
         ]"#;
         let snaps = parse_snapshots(json).unwrap();
-        assert_eq!(snaps[0].id.0, "bbbb2222");
-        assert_eq!(snaps[1].id.0, "aaaa1111");
+        let ids: Vec<&str> = snaps.iter().map(|s| s.id.0.as_str()).collect();
+        assert_eq!(ids, ["dddd4444", "bbbb2222", "aaaa1111", "cccc3333"]);
+    }
+
+    #[test]
+    fn ordering_holds_for_the_offsets_restic_actually_emits() {
+        // restic writes local time with an offset, not Z.
+        let json = r#"[
+          {"time":"2026-07-27T14:52:17.825129263-07:00","short_id":"older"},
+          {"time":"2026-07-27T15:52:17.825129263-07:00","short_id":"newer"}
+        ]"#;
+        let snaps = parse_snapshots(json).unwrap();
+        assert_eq!(snaps[0].id.0, "newer");
     }
 
     #[test]
@@ -422,6 +511,49 @@ mod tests {
         // The bug this replaced returned an empty vec on input it could not
         // understand, which reads as "this peer holds nothing".
         assert!(parse_snapshots("not json at all").is_err());
+    }
+
+    /// Verbatim from `restic 0.19.1 backup --json` over a directory containing
+    /// an unreadable subdirectory. Trimmed to the two lines that matter.
+    ///
+    /// Note what is NOT here: `error_count`. The heuristic this replaced looked
+    /// for that field, and restic 0.19.1 does not emit it, so that half was
+    /// dead. The other half looked for "could not be read", which only ever
+    /// appears alongside exit code 3 -- and `run` rejects every non-zero exit,
+    /// so the whole incomplete check was unreachable and the user got raw
+    /// restic text instead of the message written for this case.
+    const REAL_INCOMPLETE_BACKUP: &str = concat!(
+        r#"{"message_type":"error","error":{"message":"openfile for readdirnames failed: open /srv/data/sub: permission denied"},"during":"scan","item":"/srv/data/sub"}"#,
+        "\n",
+        r#"{"message_type":"summary","files_new":1,"data_added":3030,"total_bytes_processed":3,"snapshot_id":"80aec4e00642cb0da6162c2d7bb17c6744bfa11caa0d393f7ebe7bdaf8e9bf58"}"#,
+        "\n",
+        r#"{"message_type":"exit_error","code":3,"message":"Warning: at least one source file could not be read"}"#,
+    );
+
+    #[test]
+    fn a_partial_backup_still_yields_its_snapshot_id() {
+        // Exit 3 carries a real snapshot. Losing it would mean reporting a
+        // failure for a backup that did store data, just not all of it.
+        let id = parse_snapshot_id(REAL_INCOMPLETE_BACKUP).expect("summary carries the id");
+        assert_eq!(
+            id.0,
+            "80aec4e00642cb0da6162c2d7bb17c6744bfa11caa0d393f7ebe7bdaf8e9bf58"
+        );
+    }
+
+    #[test]
+    fn a_partial_backup_reads_as_incomplete() {
+        assert!(is_incomplete(REAL_INCOMPLETE_BACKUP));
+    }
+
+    #[test]
+    fn a_clean_backup_does_not_read_as_incomplete() {
+        let clean = r#"{"message_type":"summary","files_new":1,"data_added":1481,"snapshot_id":"54d973943c4e9698"}"#;
+        assert!(!is_incomplete(clean));
+        // And the field-based form, for restic builds that do emit it.
+        assert!(!is_incomplete(r#"{"error_count":0,"files_new":1}"#));
+        assert!(is_incomplete(r#"{"error_count":2,"files_new":1}"#));
+        assert!(is_incomplete(r#"{"error_count": 7 }"#));
     }
 
     #[test]

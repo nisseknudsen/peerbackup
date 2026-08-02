@@ -25,6 +25,15 @@ pub fn parse_size(input: &str) -> Result<u64, String> {
     };
 
     // Split at the first unit letter, mirroring the shell's ${s%%[KMGT]*}.
+    // Accept a bare `B` so the two directions are inverses: `human` renders a
+    // sub-kilobyte value as `999B`, and feeding that back in used to be an
+    // error because only K/M/G/T were treated as units.
+    let s = match s.strip_suffix('B') {
+        // A bare `B` is the byte suffix. `KB`/`MB`/`GB`/`TB` keep their unit
+        // letter, which the split below handles.
+        Some(head) if !head.is_empty() && !head.ends_with(['K', 'M', 'G', 'T']) => head.to_owned(),
+        _ => s,
+    };
     let split = s.find(['K', 'M', 'G', 'T']).unwrap_or(s.len());
     let (digits, unit) = s.split_at(split);
     let unit = unit.strip_suffix('B').unwrap_or(unit);
@@ -74,7 +83,7 @@ pub fn human(bytes: u64) -> String {
         // reader should see as 1.0GB.
         if v >= 1024 && idx + 1 < UNITS.len() {
             let promoted = v / 1024;
-            return format!("{}.{}{}", promoted, 0, UNITS[idx + 1]);
+            return format!("{promoted}.0{}", UNITS[idx + 1]);
         }
         format!("{}{}", v, UNITS[idx])
     } else {
@@ -101,6 +110,9 @@ mod tests {
             ("4096", 4096),
             ("0", 0),
             (" 500G ", 536_870_912_000),
+            // What `human` prints for a sub-kilobyte value must read back.
+            ("999B", 999),
+            ("0B", 0),
         ] {
             assert_eq!(parse_size(input).unwrap(), want, "parsing {input}");
         }
@@ -181,6 +193,7 @@ mod tests {
         // magnitudes keep a decimal because that is what numfmt did: `1T` reads
         // back as `1.0TB`, not `1TB`.
         for (typed, shown) in [
+            ("999B", "999B"),
             ("500G", "500GB"),
             ("100G", "100GB"),
             ("512M", "512MB"),

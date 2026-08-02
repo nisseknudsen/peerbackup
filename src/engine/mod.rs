@@ -25,8 +25,16 @@ pub struct SnapshotId(pub String);
 impl SnapshotId {
     /// restic reports the full 64-character id after a backup but shows the
     /// first 8 everywhere else. Match what people see in `snapshots`.
+    ///
+    /// Truncates on a character boundary rather than a byte one. Ids are hex in
+    /// practice, but the field is public and byte-slicing a `String` panics if
+    /// anyone ever puts something else in it.
+    #[must_use]
     pub fn short(&self) -> &str {
-        &self.0[..self.0.len().min(8)]
+        self.0
+            .char_indices()
+            .nth(8)
+            .map_or(self.0.as_str(), |(i, _)| self.0.split_at(i).0)
     }
 }
 
@@ -134,6 +142,15 @@ pub trait BackupEngine {
 
     /// List snapshots, newest first.
     fn list_snapshots(&self) -> Result<Vec<SnapshotMeta>, EngineError>;
+
+    /// Cheap reachability check. `None` means the peer answered.
+    ///
+    /// On the trait rather than inherent to the restic engine because callers
+    /// depend on it for ordering: verifying an unreachable peer without probing
+    /// first waits out the whole verification timeout while restic retries.
+    /// Anything standing in for an engine has to be able to say "not reachable"
+    /// or that ordering cannot be tested.
+    fn probe(&self) -> Option<Cause>;
 }
 
 #[cfg(test)]

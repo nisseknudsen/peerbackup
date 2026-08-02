@@ -2,6 +2,13 @@
 name = "peerbackup"
 version = "0.1.0"
 edition = "2024"
+# Pinned for the same reason restic is pinned with a checksum in CI: a backup
+# tool that only builds on whatever the author happened to have installed is a
+# backup tool your friend cannot build.
+rust-version = "1.88"
+license = "MIT"
+description = "Encrypted incremental backups between servers owned by people who know each other"
+repository = "https://github.com/nisseknudsen/peerbackup"
 
 [dependencies]
 # restic's --json output nests objects; hand-rolled extraction got it wrong.
@@ -14,3 +21,28 @@ clap = { version = "4", features = ["derive"] }
 # Already in the tree via sha2. Used for statvfs and geteuid on the host side,
 # where shelling out to df and parsing its columns is the fragile alternative.
 libc = "0.2"
+
+# Declared here rather than passed on the CI command line, so a local
+# `cargo clippy` enforces exactly what CI does. A lint you only meet in CI is a
+# lint you meet after you have already pushed.
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+# Not the whole pedantic set: it carries style opinions worth ignoring. These
+# are the ones that catch the shape of defect this codebase has actually hit.
+inefficient_to_string = "warn"
+redundant_clone = "warn"
+str_to_string = "warn"
+# Byte-slicing a String panics on a non-ASCII boundary, which is how
+# SnapshotId::short could have panicked on an id that was not hex.
+string_slice = "warn"
+
+[profile.release]
+# A backup tool is not a hot loop, and a smaller static binary is easier to hand
+# to a friend than a marginally faster one.
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true

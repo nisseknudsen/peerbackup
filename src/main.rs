@@ -8,6 +8,9 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
+/// Every command returns a message a human can act on, or nothing.
+pub type Res = Result<(), String>;
+
 #[derive(Parser)]
 #[command(
     name = "peerbackup",
@@ -157,15 +160,24 @@ enum HostCmd {
     Down,
 }
 
-fn run_host(cmd: HostCmd) -> Result<(), String> {
+fn run_host(cmd: HostCmd) -> Res {
     let ctx = host::Ctx::from_env();
-    let opts = host::server::ServerOpts::from_env()?;
+    // Server settings are read only by the two commands that talk to the
+    // server. Reading them up front meant a typo in PB_PORT failed `host guard`
+    // -- which runs as ExecStartPre -- for a reason that had nothing to do with
+    // whether the grants were mounted.
     match cmd {
-        HostCmd::Quickstart { peer } => host::server::quickstart(&ctx, &peer, &opts),
-        HostCmd::Provision { peer, size } => host::grant::provision(&ctx, &peer, &size),
-        HostCmd::Adduser { peer, password } => {
-            host::server::adduser(&ctx, &peer, password.as_deref(), &opts).map(|_| ())
+        HostCmd::Quickstart { peer } => {
+            host::server::quickstart(&ctx, &peer, &host::server::ServerOpts::from_env()?)
         }
+        HostCmd::Provision { peer, size } => host::grant::provision(&ctx, &peer, &size),
+        HostCmd::Adduser { peer, password } => host::server::adduser(
+            &ctx,
+            &peer,
+            password.as_deref(),
+            &host::server::ServerOpts::from_env()?,
+        )
+        .map(|_| ()),
         HostCmd::Release { peer } => host::grant::release(&ctx, &peer),
         HostCmd::List { peer } => host::grant::list(&ctx, peer.as_deref()),
         HostCmd::Guard => host::grant::guard(&ctx),

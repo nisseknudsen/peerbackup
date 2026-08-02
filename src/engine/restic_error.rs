@@ -84,6 +84,21 @@ pub fn classify(code: i32, output: &str) -> Classified {
     }
 
     // ---- no verdict: transport, auth, capacity, locking ----
+    // Repository-state answers first. `peer add` used to match these two on the
+    // message text at the call site, which is knowledge about restic's prose
+    // leaking out of this module -- the whole reason `Cause` is carried on the
+    // error in the first place.
+    // "config file already exists" is what 0.19.1 actually says; the phrase
+    // "already initialized" appears in other versions. Both mean the same thing
+    // to a caller, which is the point of naming the cause instead of matching
+    // prose at three different call sites.
+    if lc.contains("already initialized") || lc.contains("config file already exists") {
+        return Classified::NoVerdict(Cause::AlreadyInitialized);
+    }
+    if lc.contains("wrong password") || lc.contains("no key found") {
+        return Classified::NoVerdict(Cause::WrongPassword);
+    }
+
     // Order matters: HTTP status checks come before the generic `check failed`
     // rule, because an append-only 403 during `forget --prune` also prints
     // "failed to remove one or more snapshots" and must not read as damage.
@@ -142,13 +157,12 @@ fn first_line(s: &str) -> String {
         .find(|l| !l.trim().is_empty())
         .unwrap_or("")
         .trim()
-        .to_string()
+        .to_owned()
 }
 
 fn extract_pack_id(s: &str) -> Option<String> {
     // e.g. "pack 1a2b3c4d does not match its hash"
-    let idx = s.find("pack ")? + 5;
-    let rest = &s[idx..];
+    let rest = s.split_once("pack ")?.1;
     let id: String = rest
         .chars()
         .take_while(|c| c.is_ascii_alphanumeric())
@@ -159,6 +173,36 @@ fn extract_pack_id(s: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Real output: restic 0.19.1 refusing to init over an existing repository.
+    // The wording is "config file already exists", not "already initialized" --
+    // which is exactly why this knowledge belongs in one place instead of being
+    // matched on at the call site.
+    const ALREADY_THERE: &str = "Fatal: create repository at rest:http://me:pw@127.0.0.1:8023/me/ failed: config file already exists";
+
+    #[test]
+    fn an_existing_repository_is_recognised_by_its_real_message() {
+        assert!(matches!(
+            classify(1, ALREADY_THERE),
+            Classified::NoVerdict(Cause::AlreadyInitialized)
+        ));
+    }
+
+    #[test]
+    fn a_wrong_password_is_recognised_rather_than_matched_on_at_the_call_site() {
+        for msg in [
+            "Fatal: wrong password or no key found",
+            "Fatal: unable to open config file: wrong password",
+        ] {
+            assert!(
+                matches!(
+                    classify(1, msg),
+                    Classified::NoVerdict(Cause::WrongPassword)
+                ),
+                "{msg}"
+            );
+        }
+    }
 
     // Real output: restic 0.19.1, prune blocked by --append-only.
     const APPEND_ONLY: &str = r#"Remove(<snapshot/f77a5f056b>) failed: unexpected HTTP response (403): 403 Forbidden

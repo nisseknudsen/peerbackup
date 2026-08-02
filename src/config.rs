@@ -53,13 +53,114 @@ impl Default for Settings {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Peer {
-    pub name: String,
+    pub name: PeerName,
     /// restic repository URL, e.g. `rest:https://me:pw@alice.example.org:8000/me/`
     pub url: String,
     /// PEM bundle, if your friend uses a self-signed certificate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ca_cert: Option<PathBuf>,
 }
+
+/// A peer name that is safe to use as a path component and a systemd unit name.
+///
+/// Constructing one is the only way to get a name into [`Config::secret_path`]
+/// or a grant directory, so a traversal cannot reach either. The host side
+/// validated names from the start; the client side did not, which is how
+/// `peer add ../../../tmp/x` came to write a password file outside the config
+/// directory.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PeerName(String);
+
+impl PeerName {
+    pub fn new(name: &str) -> Result<Self, String> {
+        let ok = !name.is_empty()
+            && name.len() <= 64
+            && name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+        if ok {
+            Ok(Self(name.to_owned()))
+        } else {
+            Err(format!(
+                "peer name '{name}' must be 1-64 characters of [a-zA-Z0-9_-] only \
+                 (it becomes a file name and a systemd unit name)"
+            ))
+        }
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for PeerName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl Serialize for PeerName {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for PeerName {
+    /// Validates on the way in, so a hand-edited `config.toml` cannot
+    /// reintroduce a name that escapes the secrets directory.
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        Self::new(&s).map_err(serde::de::Error::custom)
+    }
+}
+
+impl PartialEq<str> for PeerName {
+    fn eq(&self, other: &str) -> bool {
+        self.0 == other
+    }
+}
+
+impl PartialEq<&str> for PeerName {
+    fn eq(&self, other: &&str) -> bool {
+        self.0 == *other
+    }
+}
+
+impl std::str::FromStr for PeerName {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::new(s)
+    }
+}
+
+/// Why the config could not be read. Kept apart from `io::Error` so a TOML
+/// syntax error is not laundered into one, and so the "run init first" hint
+/// belongs to the missing-file case rather than to every failure.
+#[derive(Debug)]
+pub enum ConfigError {
+    NotFound(PathBuf),
+    Io(PathBuf, io::Error),
+    Parse(PathBuf, String),
+}
+
+impl std::fmt::Display for ConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFound(p) => {
+                write!(
+                    f,
+                    "no config at {}; run `peerbackup init` first",
+                    p.display()
+                )
+            }
+            Self::Io(p, e) => write!(f, "could not read {}: {e}", p.display()),
+            Self::Parse(p, e) => write!(f, "{} is not valid TOML: {e}", p.display()),
+        }
+    }
+}
+
+impl std::error::Error for ConfigError {}
 
 impl Config {
     pub fn dir() -> PathBuf {
@@ -72,19 +173,24 @@ impl Config {
         Self::dir().join("config.toml")
     }
 
-    pub fn secret_path(peer: &str) -> PathBuf {
-        Self::dir().join("secrets").join(peer)
+    /// Where a peer's repository password lives.
+    ///
+    /// Takes a validated name rather than a `&str` so the type system carries
+    /// the guarantee. Before [`PeerName`] existed this took the raw argument,
+    /// and `peerbackup peer add ../../../tmp/x` wrote a password file outside
+    /// the config directory: `write_private` creates parent directories, so
+    /// the traversal target was created on the way.
+    pub fn secret_path(peer: &PeerName) -> PathBuf {
+        Self::dir().join("secrets").join(peer.as_str())
     }
 
-    pub fn load() -> io::Result<Self> {
+    pub fn load() -> Result<Self, ConfigError> {
         let p = Self::path();
-        let text = fs::read_to_string(&p).map_err(|e| {
-            io::Error::new(
-                e.kind(),
-                format!("{}: {e}  (run `peerbackup init` first)", p.display()),
-            )
+        let text = fs::read_to_string(&p).map_err(|e| match e.kind() {
+            io::ErrorKind::NotFound => ConfigError::NotFound(p.clone()),
+            _ => ConfigError::Io(p.clone(), e),
         })?;
-        toml::from_str(&text).map_err(|e| io::Error::other(format!("{}: {e}", p.display())))
+        toml::from_str(&text).map_err(|e| ConfigError::Parse(p, e.to_string()))
     }
 
     pub fn save(&self) -> io::Result<()> {
@@ -94,8 +200,8 @@ impl Config {
         write_private(&Self::path(), text.as_bytes())
     }
 
-    pub fn peer(&self, name: &str) -> Option<&Peer> {
-        self.peers.iter().find(|p| p.name == name)
+    pub fn peer(&self, name: &PeerName) -> Option<&Peer> {
+        self.peers.iter().find(|p| &p.name == name)
     }
 
     /// Everything a backup covers: what you asked for, plus the canary.
@@ -133,7 +239,15 @@ pub fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let parent = path.parent().unwrap_or(Path::new("."));
     fs::create_dir_all(parent)?;
 
-    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
+    // Append to the file name rather than replacing its extension.
+    // `with_extension` would turn both `al.ice` and `al.bob` into `al.tmp.PID`,
+    // so two peers written concurrently would clobber each other's temp file.
+    let name = path
+        .file_name()
+        .ok_or_else(|| io::Error::other(format!("{} has no file name to write", path.display())))?;
+    let mut tmp_name = name.to_os_string();
+    tmp_name.push(format!(".tmp.{}", std::process::id()));
+    let tmp = path.with_file_name(tmp_name);
 
     let write = || -> io::Result<()> {
         let mut f = fs::OpenOptions::new()
@@ -157,15 +271,35 @@ pub fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
 
 /// Random alphanumeric string from the kernel. Avoids pulling in a crate for
 /// something `/dev/urandom` already does, and this is Linux-only anyway.
+/// Random alphanumeric string from the kernel.
+///
+/// Rejection sampling rather than `% ALPHABET.len()`. The alphabet is 57
+/// characters and 256 is not a multiple of it, so the modulo would make the
+/// first 28 characters 25% more likely than the rest. That is a small bias and
+/// it would not be worth fixing anywhere else, but this generates the password
+/// that decrypts a backup repository, and four lines is cheap.
 pub fn random_token(len: usize) -> io::Result<String> {
     use std::io::Read;
     const ALPHABET: &[u8] = b"abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+    // The largest multiple of the alphabet that fits in a byte. Anything at or
+    // above it is redrawn rather than folded.
+    const LIMIT: u8 = (256 / ALPHABET.len() * ALPHABET.len()) as u8;
+
+    let mut urandom = fs::File::open("/dev/urandom")?;
+    let mut out = String::with_capacity(len);
     let mut buf = vec![0u8; len];
-    fs::File::open("/dev/urandom")?.read_exact(&mut buf)?;
-    Ok(buf
-        .iter()
-        .map(|b| ALPHABET[*b as usize % ALPHABET.len()] as char)
-        .collect())
+    while out.len() < len {
+        urandom.read_exact(&mut buf)?;
+        for b in &buf {
+            if *b < LIMIT {
+                out.push(ALPHABET[*b as usize % ALPHABET.len()] as char);
+                if out.len() == len {
+                    break;
+                }
+            }
+        }
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -174,11 +308,68 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     #[test]
+    fn a_peer_name_cannot_escape_the_secrets_directory() {
+        // `peer add ../../../tmp/x` used to write a password file there:
+        // secret_path joined the raw argument, and write_private creates parent
+        // directories, so the traversal target was created on the way.
+        for bad in [
+            "../../../tmp/pwned",
+            "..",
+            "a/b",
+            "/etc/shadow",
+            "",
+            "a b",
+            "a.b",
+            "péer",
+        ] {
+            assert!(PeerName::new(bad).is_err(), "{bad:?} must be refused");
+        }
+        let name = PeerName::new("alice").unwrap();
+        let p = Config::secret_path(&name);
+        assert_eq!(p.file_name().unwrap(), "alice");
+        assert!(p.parent().unwrap().ends_with("secrets"));
+    }
+
+    #[test]
+    fn a_hand_edited_config_cannot_reintroduce_a_bad_name() {
+        // The type is only a guarantee if it also guards the deserialize path.
+        let toml = r#"
+[settings]
+sources = []
+upload_limit_kib = 0
+verify_subset_pct = 1
+liveness_hours = 48
+subset_days = 10
+canary_days = 35
+
+[[peer]]
+name = "../../../tmp/pwned"
+url = "rest:http://x/"
+"#;
+        assert!(toml::from_str::<Config>(toml).is_err());
+    }
+
+    #[test]
+    fn two_peers_whose_names_differ_after_a_dot_get_different_temp_files() {
+        // with_extension would turn both `al.ice` and `al.bob` into
+        // `al.tmp.PID`. Peer names cannot contain dots any more, but
+        // write_private is also used for config.toml and is worth being right.
+        let dir = std::env::temp_dir().join(format!("pb-tmpname-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        write_private(&dir.join("al.ice"), b"one").unwrap();
+        write_private(&dir.join("al.bob"), b"two").unwrap();
+        assert_eq!(fs::read_to_string(dir.join("al.ice")).unwrap(), "one");
+        assert_eq!(fs::read_to_string(dir.join("al.bob")).unwrap(), "two");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn round_trips_through_toml() {
         let mut c = Config::default();
         c.settings.sources = vec![PathBuf::from("/srv/data")];
         c.peers.push(Peer {
-            name: "alice".into(),
+            name: PeerName::new("alice").unwrap(),
             url: "rest:https://me:pw@alice.example.org:8000/me/".into(),
             ca_cert: None,
         });

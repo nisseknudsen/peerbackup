@@ -40,7 +40,7 @@ impl ServerOpts {
                 .map(PathBuf::from)
                 .unwrap_or_else(default_data_dir),
             container: std::env::var("PB_CONTAINER")
-                .unwrap_or_else(|_| DEFAULT_CONTAINER.to_string()),
+                .unwrap_or_else(|_| DEFAULT_CONTAINER.to_owned()),
             max_size,
         })
     }
@@ -232,7 +232,7 @@ pub fn adduser(
     check_peer(peer)?;
 
     let (pw, generated) = match password {
-        Some(p) => (p.to_string(), false),
+        Some(p) => (p.to_owned(), false),
         None => {
             let p = random_token(24).map_err(|e| format!("could not generate a password: {e}"))?;
             (p, true)
@@ -244,9 +244,41 @@ pub fn adduser(
     }
 
     let out = Command::new("docker")
-        .args(["exec", &o.container, "create_user", peer, &pw])
-        .output()
-        .map_err(|e| format!("could not run docker: {e}"))?;
+        // `htpasswd -i` reads the password from stdin, which is what the image's
+        // own `create_user <name> <password>` would have put in argv, readable
+        // by any process on the host through /proc/<pid>/cmdline for the life of
+        // the call. This is the password that decrypts a friend's whole
+        // repository; the restic side already avoids argv and env for the same
+        // reason.
+        //
+        // This does what create_user does, minus the argv. -B is bcrypt, as the
+        // image's script uses, and $PASSWORD_FILE is set in the image so the
+        // file location stays the image's business rather than ours.
+        .args([
+            "exec",
+            "-i",
+            &o.container,
+            "sh",
+            "-c",
+            r#"htpasswd -B -i "$PASSWORD_FILE" "$1""#,
+            "sh",
+            peer,
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("could not run docker: {e}"))
+        .and_then(|mut child| {
+            use std::io::Write as _;
+            if let Some(mut sink) = child.stdin.take() {
+                let _ = sink.write_all(pw.as_bytes());
+                let _ = sink.write_all(b"\n");
+            }
+            child
+                .wait_with_output()
+                .map_err(|e| format!("could not read docker's output: {e}"))
+        })?;
     if !out.status.success() {
         let msg = String::from_utf8_lossy(&out.stderr);
         warn(msg.trim());
@@ -397,13 +429,45 @@ fn http_status(port: u16, path: &str, auth: Option<(&str, &str)>) -> String {
         "--max-time",
         "5",
     ]);
-    if let Some((user, pw)) = auth {
-        cmd.args(["-u", &format!("{user}:{pw}")]);
+    // Credentials go in on stdin via `--config -`, never in argv. Anything in
+    // argv is readable by any process on the machine through /proc/<pid>/cmdline
+    // for as long as the call runs, and this is the password that decrypts a
+    // friend's whole repository. The restic side already got this right by
+    // passing the password as a file rather than an env var.
+    if auth.is_some() {
+        cmd.args(["--config", "-"]);
     }
     cmd.arg(&url);
-    match cmd.output() {
+
+    let Some((user, pw)) = auth else {
+        return run_for_status(cmd, None);
+    };
+    // curl's config format. The value is quoted, so a backslash or a quote in
+    // the password has to be escaped or it would end the string early.
+    let escaped = pw.replace('\\', "\\\\").replace('"', "\\\"");
+    run_for_status(cmd, Some(format!("user = \"{user}:{escaped}\"\n")))
+}
+
+fn run_for_status(mut cmd: Command, stdin_text: Option<String>) -> String {
+    use std::io::Write as _;
+    use std::process::Stdio;
+
+    cmd.stdin(if stdin_text.is_some() {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    });
+    cmd.stdout(Stdio::piped()).stderr(Stdio::null());
+
+    let Ok(mut child) = cmd.spawn() else {
+        return String::new();
+    };
+    if let (Some(text), Some(mut sink)) = (stdin_text, child.stdin.take()) {
+        let _ = sink.write_all(text.as_bytes());
+    }
+    match child.wait_with_output() {
         Ok(o) => {
-            let code = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            let code = String::from_utf8_lossy(&o.stdout).trim().to_owned();
             if code == "000" { String::new() } else { code }
         }
         Err(_) => String::new(),
@@ -413,7 +477,7 @@ fn http_status(port: u16, path: &str, auth: Option<(&str, &str)>) -> String {
 fn hostname() -> String {
     for args in [vec!["-f"], vec![]] {
         if let Ok(o) = Command::new("hostname").args(&args).output() {
-            let h = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            let h = String::from_utf8_lossy(&o.stdout).trim().to_owned();
             if o.status.success() && !h.is_empty() {
                 return h;
             }
