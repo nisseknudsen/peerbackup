@@ -87,8 +87,6 @@ Docker. Hosting needs Linux and Docker. Building from source needs Rust 1.88+.
 
 ## Installation
 
-No prebuilt binaries yet.
-
 ```sh
 git clone https://github.com/nisseknudsen/peerbackup
 cd peerbackup
@@ -178,6 +176,24 @@ url = "rest:https://me:PASSWORD@alice.example.org:8000/me/"
 
 Passwords are stored separately in `~/.config/peerbackup/secrets/`, mode 0600.
 
+Settings are checked when the file is read, so a value that cannot mean what it
+says is refused by name rather than quietly turned into something else. The
+windows must be non-zero, and `verify_subset_pct` must be between 1 and 100.
+
+### Timeouts
+
+restic retries transport failures with exponential backoff and no overall
+deadline, so every operation except the backup itself runs under one. A backup
+has none on purpose: a 300GB first seed at 40Mbit legitimately takes seventeen
+hours. Override any of them, in seconds, if your link needs it:
+
+| Variable | Default | Bounds |
+|---|---|---|
+| `PEERBACKUP_PROBE_TIMEOUT` | 20 | Deciding whether a peer answers at all |
+| `PEERBACKUP_LIST_TIMEOUT` | 120 | `snapshots`, and creating a repository |
+| `PEERBACKUP_RESTORE_TIMEOUT` | 1800 | `restore`, and the test-file check |
+| `PEERBACKUP_VERIFY_TIMEOUT` | 3600 | Reading data back during `verify` |
+
 ### Scheduling
 
 There is no built-in scheduler.
@@ -226,7 +242,13 @@ PB_EXTRA_OPTIONS="--tls --tls-cert /certs/fullchain.pem --tls-key /certs/privkey
 ```
 
 Peers then use `rest:https://...`. With a self-signed certificate they also need
-a copy of it and must pass `--cacert` when connecting.
+a copy of it, and pass it when they connect:
+
+```sh
+peerbackup connect 'rest:https://...' --source /srv/data --cacert /path/to/ca.pem
+```
+
+`peerbackup peer add` takes the same flag.
 
 **Already running a reverse proxy** (Traefik, Caddy, nginx...) with its own
 certificate for other services on this host? Skip the above entirely — leave
@@ -435,10 +457,17 @@ reporting failure causes retries against peers that already hold the data.
 
 ## Development
 
+The fast loop is the unit tests, which need nothing installed and run in under
+a second:
+
 ```sh
 cargo test
+cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 ```
+
+Lints are declared in `Cargo.toml` rather than passed on the command line, so a
+local `cargo clippy` enforces exactly what CI does.
 
 Integration tests use a real rest-server and a real restic. None require root:
 

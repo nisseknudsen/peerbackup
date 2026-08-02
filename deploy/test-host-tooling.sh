@@ -240,7 +240,11 @@ echo "$OUT" | grep -qi 'PB_MAX_SIZE' \
   || ok "PB_MAX_SIZE accepts a human size like 10G"
 docker rm -f pb-size-probe >/dev/null 2>&1 || true
 
-if command -v docker >/dev/null 2>&1; then
+# `command -v docker` finds the CLI, which says nothing about whether the daemon
+# is reachable. On a machine with docker installed but not running, quickstart
+# stops at "cannot talk to docker" and this block reported two failures that had
+# nothing to do with the code under test.
+if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
   # Make docker itself refuse: a container name with a slash in it is invalid.
   # The point is the reaction, not the cause -- no URL, and a clear reason.
   OUT=$(PB_DATA="$WORK/dies" PB_PORT=51599 PB_CONTAINER="bad/name" \

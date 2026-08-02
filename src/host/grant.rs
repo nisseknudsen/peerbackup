@@ -18,7 +18,8 @@ use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
 use super::size::{human, parse_size};
-use super::{Ctx, Res, check_peer, have, is_mountpoint, statfs, unit_name, warn};
+use super::{Ctx, Res, have, is_mountpoint, statfs, unit_name, warn};
+use crate::config::PeerName;
 
 /// Tools provisioning cannot do without, checked before anything is created.
 ///
@@ -27,12 +28,11 @@ use super::{Ctx, Res, check_peer, have, is_mountpoint, statfs, unit_name, warn};
 /// grant that would never mount.
 const REQUIRED: [&str; 4] = ["fallocate", "mkfs.ext4", "systemd-escape", "losetup"];
 
-pub fn provision(ctx: &Ctx, peer: &str, size: &str) -> Res {
-    check_peer(peer)?;
+pub fn provision(ctx: &Ctx, peer: &PeerName, size: &str) -> Res {
     ctx.need_root()?;
 
-    let img = ctx.image_of(peer);
-    let dir = ctx.dir_of(peer);
+    let img = ctx.image_of(peer.as_str());
+    let dir = ctx.dir_of(peer.as_str());
     if img.exists() {
         return Err(format!(
             "{} already exists; use `peerbackup host release {peer}` first if you mean to replace it",
@@ -141,56 +141,69 @@ pub fn provision(ctx: &Ctx, peer: &str, size: &str) -> Res {
 
     verify_not_sparse(ctx, &img)?;
 
-    if !ctx.would(&format!("mkdir -p {}", dir.display())) {
-        std::fs::create_dir_all(&dir)
-            .map_err(|e| format!("could not create {}: {e}", dir.display()))?;
-    }
-
-    let unit = unit_name(&dir)?;
-    let unit_path = ctx.units.join(&unit);
-    ctx.info(&format!("writing {}", unit_path.display()));
-    if ctx.dry_run {
-        println!(
-            "  would write mount unit for {} -> {}",
-            img.display(),
-            dir.display()
-        );
-    } else {
-        let text = format!(
-            "[Unit]\n\
-             Description=peerbackup storage grant for {peer}\n\
-             Documentation=https://github.com/nisseknudsen/peerbackup\n\
-             \n\
-             [Mount]\n\
-             What={}\n\
-             Where={}\n\
-             Type=ext4\n\
-             Options=loop,rw,noatime\n\
-             \n\
-             [Install]\n\
-             WantedBy=multi-user.target\n",
-            img.display(),
-            dir.display()
-        );
-        std::fs::create_dir_all(&ctx.units)
-            .and_then(|()| std::fs::write(&unit_path, text))
-            .map_err(|e| format!("could not write {}: {e}", unit_path.display()))?;
-    }
-
     // Everything from here can fail with the image already on disk. Without a
     // rollback the next `provision` refuses ("already exists; use release"),
     // and `release` is the type-the-name-to-confirm destructor whose own
     // warning is that it permanently destroys the peer's backups. Recovering
     // from a half-provisioned grant should not require running that.
-    let finish = || -> Res {
+    //
+    // The boundary starts here, not after the mount unit is written. It used to
+    // begin three steps later, so creating the mount directory, deriving the
+    // unit name and writing the unit all returned early with a fully
+    // preallocated image -- up to the whole grant, e.g. 500GB -- left behind
+    // and no way forward except the destructor. `verify_not_sparse` removes the
+    // image on its own failure path, which is what makes this the right seam.
+    let finish = |unit: &mut String| -> Res {
+        if !ctx.would(&format!("mkdir -p {}", dir.display())) {
+            std::fs::create_dir_all(&dir)
+                .map_err(|e| format!("could not create {}: {e}", dir.display()))?;
+        }
+
+        *unit = unit_name(&dir)?;
+        let unit_path = ctx.units.join(&*unit);
+        ctx.info(&format!("writing {}", unit_path.display()));
+        if ctx.dry_run {
+            println!(
+                "  would write mount unit for {} -> {}",
+                img.display(),
+                dir.display()
+            );
+        } else {
+            let text = format!(
+                "[Unit]\n\
+                 Description=peerbackup storage grant for {peer}\n\
+                 Documentation=https://github.com/nisseknudsen/peerbackup\n\
+                 \n\
+                 [Mount]\n\
+                 What={}\n\
+                 Where={}\n\
+                 Type=ext4\n\
+                 Options=loop,rw,noatime\n\
+                 \n\
+                 [Install]\n\
+                 WantedBy=multi-user.target\n",
+                img.display(),
+                dir.display()
+            );
+            std::fs::create_dir_all(&ctx.units)
+                .and_then(|()| std::fs::write(&unit_path, text))
+                .map_err(|e| format!("could not write {}: {e}", unit_path.display()))?;
+        }
+
         ctx.run("systemctl", &["daemon-reload"])?;
-        ctx.run("systemctl", &["enable", "--now", &unit])?;
-        take_ownership(ctx, &dir, &unit)
+        ctx.run("systemctl", &["enable", "--now", unit])?;
+        take_ownership(ctx, &dir, unit)
     };
-    if let Err(e) = finish() {
+
+    // Carried out of the closure so the rollback can undo a unit that was named
+    // and possibly written before the step that failed.
+    let mut unit = String::new();
+    if let Err(e) = finish(&mut unit) {
         warn("provisioning failed part-way; undoing what was created");
-        ctx.run_best_effort("systemctl", &["disable", "--now", &unit]);
-        remove_quietly(ctx, &ctx.units.join(&unit));
+        if !unit.is_empty() {
+            ctx.run_best_effort("systemctl", &["disable", "--now", &unit]);
+            remove_quietly(ctx, &ctx.units.join(&unit));
+        }
         if !ctx.would(&format!("rmdir {}", dir.display())) {
             let _ = std::fs::remove_dir(&dir);
         }
@@ -206,7 +219,7 @@ pub fn provision(ctx: &Ctx, peer: &str, size: &str) -> Res {
     ctx.info(&format!(
         "grant created for '{peer}'. Numbers that matter, all three of them:"
     ));
-    list(ctx, Some(peer))?;
+    list(ctx, Some(peer.as_str()))?;
     ctx.info("");
     ctx.info("next: create their credential");
     ctx.info(&format!("  peerbackup host adduser {peer}"));
@@ -308,12 +321,11 @@ fn take_ownership(ctx: &Ctx, dir: &Path, unit: &str) -> Res {
     Ok(())
 }
 
-pub fn release(ctx: &Ctx, peer: &str) -> Res {
-    check_peer(peer)?;
+pub fn release(ctx: &Ctx, peer: &PeerName) -> Res {
     ctx.need_root()?;
 
-    let img = ctx.image_of(peer);
-    let dir = ctx.dir_of(peer);
+    let img = ctx.image_of(peer.as_str());
+    let dir = ctx.dir_of(peer.as_str());
     // Before deriving the unit name, which shells out: on a machine without
     // systemd-escape, `release nobody` should say there is no such grant rather
     // than report a systemd-escape failure.
@@ -333,7 +345,7 @@ pub fn release(ctx: &Ctx, peer: &str) -> Res {
         std::io::stdin()
             .read_line(&mut line)
             .map_err(|e| format!("could not read confirmation: {e}"))?;
-        if line.trim() != peer {
+        if line.trim() != peer.as_str() {
             return Err("aborted".into());
         }
     }
@@ -569,13 +581,27 @@ pub fn doctor(ctx: &Ctx) -> Res {
 
 /// The first of these variables that is set, as a uid or gid.
 fn numeric_env(keys: &[&str]) -> Result<Option<u32>, String> {
-    for k in keys {
-        match std::env::var(k) {
-            Ok(v) if !v.is_empty() => {
+    first_numeric(keys.iter().map(|k| (*k, std::env::var(k).ok())))
+}
+
+/// The same, over values supplied by the caller.
+///
+/// Split out so the refusal can be tested. It read `std::env` directly, so the
+/// only case a test could reach was "nothing is set" -- which is why the test
+/// named after refusing a non-numeric id never exercised one. Setting an
+/// environment variable from a test is a data race against every other test in
+/// the binary, and `unsafe` in edition 2024 for exactly that reason, so the
+/// answer is to take the values rather than to reach for them.
+fn first_numeric<'a>(
+    vars: impl IntoIterator<Item = (&'a str, Option<String>)>,
+) -> Result<Option<u32>, String> {
+    for (key, value) in vars {
+        match value {
+            Some(v) if !v.is_empty() => {
                 return v
                     .parse()
                     .map(Some)
-                    .map_err(|_| format!("{k}='{v}' is not a numeric id"));
+                    .map_err(|_| format!("{key}='{v}' is not a numeric id"));
             }
             _ => {}
         }
@@ -599,6 +625,10 @@ mod tests {
         }
     }
 
+    fn pn(s: &str) -> PeerName {
+        PeerName::new(s).unwrap()
+    }
+
     fn tmp(tag: &str) -> std::path::PathBuf {
         let d = std::env::temp_dir().join(format!("pb-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
@@ -606,19 +636,27 @@ mod tests {
     }
 
     #[test]
-    fn provision_refuses_a_bad_peer_name_before_touching_anything() {
-        let dir = tmp("g1");
-        let ctx = ctx_in(&dir);
-        assert!(provision(&ctx, "../etc", "1G").is_err());
-        assert!(provision(&ctx, "a b", "1G").is_err());
-        assert!(!dir.exists(), "nothing may be created for an invalid name");
+    fn a_bad_peer_name_cannot_reach_provisioning_at_all() {
+        // This used to call `provision(&ctx, "../etc", "1G")` and assert it
+        // returned an error. It no longer compiles: the entry points take a
+        // validated `PeerName`, so a traversal cannot be constructed to hand
+        // them. The guarantee moved from a runtime check repeated at each entry
+        // point into the type, and this is what is left to assert -- that the
+        // names which would break a path or a systemd unit are refused at
+        // construction, before any host code sees them.
+        for bad in ["../etc", "a b", "a/b", "a.b", "a;rm -rf /", "", "péer"] {
+            assert!(PeerName::new(bad).is_err(), "{bad:?} must be refused");
+        }
+        for good in ["alice", "bob-2", "a_b", "A1"] {
+            assert!(PeerName::new(good).is_ok(), "{good} should be allowed");
+        }
     }
 
     #[test]
     fn provision_refuses_a_bad_size_before_touching_anything() {
         let dir = tmp("g2");
         let ctx = ctx_in(&dir);
-        let err = provision(&ctx, "alice", "banana").unwrap_err();
+        let err = provision(&ctx, &pn("alice"), "banana").unwrap_err();
         assert!(err.contains("bad size"), "got: {err}");
         assert!(!dir.exists());
     }
@@ -630,7 +668,7 @@ mod tests {
         let dir = tmp("g3");
         std::fs::create_dir_all(&dir).unwrap();
         let ctx = ctx_in(&dir);
-        let err = provision(&ctx, "alice", "900000G").unwrap_err();
+        let err = provision(&ctx, &pn("alice"), "900000G").unwrap_err();
         assert!(
             err.contains("refusing to overcommit"),
             "dry run must still refuse an impossible grant, got: {err}"
@@ -677,7 +715,7 @@ mod tests {
         let dir = tmp("g8");
         std::fs::create_dir_all(&dir).unwrap();
         let ctx = ctx_in(&dir);
-        let err = release(&ctx, "nobody").unwrap_err();
+        let err = release(&ctx, &pn("nobody")).unwrap_err();
         assert!(err.contains("no grant found"), "got: {err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -702,7 +740,37 @@ mod tests {
 
     #[test]
     fn a_non_numeric_uid_is_refused_by_name() {
-        assert!(numeric_env(&["PB_TEST_NOT_SET_AT_ALL"]).unwrap().is_none());
+        // The point of parsing rather than interpolating: a bad PB_UID is not
+        // exploitable, but it must name the variable that is wrong instead of
+        // producing an opaque chown failure several steps later.
+        let e = first_numeric([("PB_UID", Some("nisse".to_owned()))]).unwrap_err();
+        assert!(e.contains("PB_UID"), "must name the variable: {e}");
+        assert!(e.contains("nisse"), "must show the value: {e}");
+    }
+
+    #[test]
+    fn the_first_variable_that_is_set_wins_and_empty_does_not_count() {
+        // PB_UID wins over SUDO_UID so it can match the service file; an unset
+        // or empty one falls through to the person who ran sudo.
+        let pairs = |a: Option<&str>, b: Option<&str>| {
+            [
+                ("PB_UID", a.map(str::to_owned)),
+                ("SUDO_UID", b.map(str::to_owned)),
+            ]
+        };
+        assert_eq!(
+            first_numeric(pairs(Some("1000"), Some("1001"))).unwrap(),
+            Some(1000)
+        );
+        assert_eq!(
+            first_numeric(pairs(None, Some("1001"))).unwrap(),
+            Some(1001)
+        );
+        assert_eq!(
+            first_numeric(pairs(Some(""), Some("1001"))).unwrap(),
+            Some(1001)
+        );
+        assert_eq!(first_numeric(pairs(None, None)).unwrap(), None);
     }
 
     #[test]
@@ -711,7 +779,7 @@ mod tests {
         std::fs::create_dir_all(dir.join("images")).unwrap();
         std::fs::write(dir.join("images").join("alice.img"), b"x").unwrap();
         let ctx = ctx_in(&dir);
-        let err = provision(&ctx, "alice", "1G").unwrap_err();
+        let err = provision(&ctx, &pn("alice"), "1G").unwrap_err();
         assert!(err.contains("already exists"), "got: {err}");
         assert!(
             err.contains("release alice"),

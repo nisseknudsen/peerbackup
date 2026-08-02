@@ -58,13 +58,12 @@ impl ResticEngine {
         }
     }
 
-    /// Quick check that the peer answers, before starting anything expensive.
+    /// Build a restic invocation against this peer's repository.
     ///
-    /// Without this, verifying an unreachable peer waits out the full
-    /// verification timeout, because restic keeps retrying. An hour of nothing
-    /// happening is not something anyone will sit through, and the answer is
-    /// known within seconds anyway.
-    ///
+    /// Every call gets the repository, the password file and the certificate,
+    /// so no caller has to remember them. The password goes in as a file rather
+    /// than an environment variable or an argument: both are readable by other
+    /// processes, and this one decrypts the whole repository.
     fn command(&self, args: &[&str]) -> Command {
         let mut c = Command::new(&self.binary);
         c.arg("-r").arg(&self.repo_url);
@@ -224,6 +223,11 @@ impl BackupEngine for ResticEngine {
     }
 
     fn verify_subset(&self, percent: u8) -> VerifyOutcome {
+        // A backstop, not the validation. `Settings::validate` refuses a
+        // configured value outside 1..=100 and names the key, because clamping
+        // 0 to 1 here meant someone who asked for no read-back silently got
+        // some, three layers from where they wrote it. This stays because the
+        // trait is a public seam and restic rejects a 0% subset outright.
         let pct = percent.clamp(1, 100);
         let cmd = self.command(&["check", "--read-data-subset", &format!("{pct}%")]);
 
@@ -367,12 +371,12 @@ pub const EXIT_INCOMPLETE: i32 = 3;
 
 /// Did this backup fail to read some of its sources?
 ///
+/// Belt and braces alongside the exit code: older restic reported some partial
+/// reads on exit 0, and the summary carries an explicit count either way.
+///
 /// Indices come from `find` and a literal length, so they land on character
 /// boundaries; the lint cannot see that.
 #[allow(clippy::string_slice)]
-///
-/// Belt and braces alongside the exit code: older restic reported some partial
-/// reads on exit 0, and the summary carries an explicit count either way.
 fn is_incomplete(combined: &str) -> bool {
     if combined.contains("could not be read") {
         return true;

@@ -28,6 +28,13 @@
 //!   * The maintenance reserve is advisory. Nothing enforces it, because
 //!     rest-server's `--max-size` is per instance and one instance serves every
 //!     grantee.
+//!
+//! Peer names arrive here as [`crate::config::PeerName`], which is validated on
+//! construction. This module used to carry its own `peer_valid`/`check_peer`
+//! pair and call it by hand at each entry point -- the same character set, but
+//! without the length limit, and re-checked rather than carried in the type.
+//! The host side is where a name becomes a file name and a systemd unit name,
+//! so it is the side that most wants the guarantee to be structural.
 
 pub mod grant;
 pub mod server;
@@ -187,25 +194,6 @@ pub fn is_root() -> bool {
     unsafe { libc::geteuid() == 0 }
 }
 
-/// A peer name becomes a path component and a systemd unit name, so it gets the
-/// narrowest character set that still reads naturally.
-pub fn peer_valid(name: &str) -> bool {
-    !name.is_empty()
-        && name
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-}
-
-pub fn check_peer(name: &str) -> Res {
-    if peer_valid(name) {
-        Ok(())
-    } else {
-        Err(format!(
-            "peer name '{name}' must be [a-zA-Z0-9_-] only (it becomes a path and a unit name)"
-        ))
-    }
-}
-
 /// Is this path a mount point?
 ///
 /// Compares the device id of the directory against its parent, which is what
@@ -305,16 +293,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn peer_names_that_would_break_a_path_or_a_unit_are_refused() {
-        for good in ["alice", "bob-2", "a_b", "A1"] {
-            assert!(peer_valid(good), "{good} should be allowed");
-        }
-        for bad in ["", "../etc", "a b", "a/b", "a.b", "a;rm -rf /", "péer"] {
-            assert!(!peer_valid(bad), "{bad:?} must be refused");
-        }
-    }
-
-    #[test]
     fn a_plain_directory_is_not_a_mountpoint() {
         // The guard's whole job rests on this returning false for an ordinary
         // directory, so a container never starts against unmounted storage.
@@ -354,5 +332,66 @@ mod tests {
     fn have_finds_a_tool_that_exists_and_not_one_that_does_not() {
         assert!(have("sh"), "sh must be on PATH");
         assert!(!have("definitely-not-a-real-binary-xyzzy"));
+    }
+
+    fn ctx(dry_run: bool) -> Ctx {
+        Ctx {
+            root: PathBuf::from("/tmp/pb-unused"),
+            units: PathBuf::from("/tmp/pb-unused"),
+            reserve_pct: 15,
+            host_margin_gb: 20,
+            dry_run,
+            quiet: true,
+            force: false,
+        }
+    }
+
+    #[test]
+    fn a_dry_run_describes_the_command_and_does_not_run_it() {
+        // The printed form is load-bearing: the shell suite reads
+        // "would run: fallocate -l <bytes> ..." to prove the size a user typed
+        // reaches the allocation. Changing the wording breaks that test from a
+        // long way away, so pin it here where the reason is visible.
+        let marker = std::env::temp_dir().join(format!("pb-dry-{}", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+        ctx(true)
+            .run("touch", &[marker.as_os_str()])
+            .expect("a dry run always succeeds");
+        assert!(!marker.exists(), "a dry run must not touch anything");
+    }
+
+    #[test]
+    fn a_real_run_reports_the_command_and_the_reason_when_it_fails() {
+        let e = ctx(false)
+            .run("sh", &["-c", "echo nope >&2; exit 3"])
+            .unwrap_err();
+        assert!(e.contains("exit 3"), "must carry the exit code: {e}");
+        assert!(e.contains("nope"), "must carry stderr: {e}");
+        assert!(e.contains("sh -c"), "must show what was run: {e}");
+    }
+
+    #[test]
+    fn a_command_that_does_not_exist_is_an_error_not_a_silent_success() {
+        let e = ctx(false)
+            .run("definitely-not-a-real-binary-xyzzy", &["x"])
+            .unwrap_err();
+        assert!(e.contains("could not run"), "got: {e}");
+    }
+
+    #[test]
+    fn a_successful_run_really_runs() {
+        let marker = std::env::temp_dir().join(format!("pb-run-{}", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+        ctx(false).run("touch", &[marker.as_os_str()]).unwrap();
+        assert!(marker.exists());
+        let _ = std::fs::remove_file(&marker);
+    }
+
+    #[test]
+    fn a_best_effort_run_warns_instead_of_failing() {
+        // Teardown steps are expected to fail when the thing is already gone.
+        // `release` calls this for `systemctl disable` and `losetup -d`, and a
+        // grant that was never enabled must still be releasable.
+        ctx(false).run_best_effort("sh", &["-c", "exit 1"]);
     }
 }

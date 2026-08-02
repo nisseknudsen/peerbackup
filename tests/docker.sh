@@ -29,6 +29,7 @@ cleanup() {
 trap cleanup EXIT
 
 command -v docker >/dev/null || { echo "docker required"; exit 1; }
+docker info >/dev/null 2>&1 || { echo "docker daemon not reachable"; exit 1; }
 
 # Run the client exactly the way the README tells people to.
 pb() {

@@ -102,13 +102,28 @@ pub fn classify(code: i32, output: &str) -> Classified {
     // Order matters: HTTP status checks come before the generic `check failed`
     // rule, because an append-only 403 during `forget --prune` also prints
     // "failed to remove one or more snapshots" and must not read as damage.
-    if lc.contains("403") || lc.contains("forbidden") {
+    //
+    // Matched as `(403)`, not as a bare `403`. restic identifiers are hex, so
+    // the digits 403, 507 and 401 turn up inside ordinary pack, tree and blob
+    // ids -- and because these rules run before the `check failed` rule below,
+    // a bare match downgraded real corruption to "we could not look at it".
+    // Measured against the shipped classifier:
+    //
+    //     "error for tree 6403bc1e: ...\ncheck failed"
+    //         -> NoVerdict(AppendOnlyRefused), should have been Damage
+    //
+    // A peer with damaged packs then reads `unchecked` forever and never turns
+    // red, which is the one failure this program exists to catch. restic always
+    // emits the parenthesised form (see the fixtures below), so requiring it
+    // costs nothing and removes the collision.
+    if http_status(&lc, 403) || lc.contains("forbidden") {
         return Classified::NoVerdict(Cause::AppendOnlyRefused);
     }
-    if lc.contains("507") || lc.contains("insufficient storage") || lc.contains("no space left") {
+    if http_status(&lc, 507) || lc.contains("insufficient storage") || lc.contains("no space left")
+    {
         return Classified::NoVerdict(Cause::OutOfSpace);
     }
-    if lc.contains("401") || lc.contains("unauthorized") {
+    if http_status(&lc, 401) || lc.contains("unauthorized") {
         return Classified::NoVerdict(Cause::Unauthorized);
     }
     if lc.contains("repository is already locked") || lc.contains("unable to create lock") {
@@ -150,6 +165,16 @@ pub fn classify(code: i32, output: &str) -> Classified {
     Classified::NoVerdict(Cause::Unclassified {
         detail: format!("restic exited {code}: {}", first_line(&clean)),
     })
+}
+
+/// Did restic report this HTTP status, as opposed to merely printing an id that
+/// happens to contain the digits?
+///
+/// restic writes `unexpected HTTP response (403): 403 Forbidden`. The
+/// parenthesised form is the one that cannot appear inside a hex identifier,
+/// which is the whole reason this is a function rather than a `contains`.
+fn http_status(lowercased: &str, code: u16) -> bool {
+    lowercased.contains(&format!("({code})"))
 }
 
 fn first_line(s: &str) -> String {
@@ -322,6 +347,46 @@ Fatal: unable to open config file: unexpected HTTP response (401): 401 Unauthori
             Classified::Damage(Corruption::CheckFailed { .. }) => {}
             other => panic!("bare check failure should be damage, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_hex_id_containing_a_status_code_does_not_hide_damage() {
+        // The bug this pins: the status rules matched a bare `403`/`507`/`401`
+        // anywhere in the output, and they run before the `check failed` rule.
+        // restic ids are hex, so those digits appear in ordinary pack, tree and
+        // blob ids -- and a peer whose packs are damaged then reported
+        // `unchecked` forever instead of turning red.
+        for output in [
+            "error for tree 6403bc1e:\n  id 6403bc1e not found in repository\ncheck failed",
+            "Load(<data/a507f2>) failed: cannot load\ncheck failed: repository contains errors",
+            "pack 3401ffab: not referenced in any index\ncheck failed",
+        ] {
+            match classify(1, output) {
+                Classified::Damage(_) => {}
+                Classified::NoVerdict(c) => panic!(
+                    "a hex id swallowed real damage, classified as no-verdict ({c}): {output}"
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn the_real_status_lines_are_still_recognised() {
+        // The other half of the same change: tightening the match must not stop
+        // an actual 403/507/401 from being recognised, or every append-only
+        // refusal starts reading as corruption.
+        assert!(matches!(
+            classify(3, APPEND_ONLY),
+            Classified::NoVerdict(Cause::AppendOnlyRefused)
+        ));
+        assert!(matches!(
+            classify(1, OUT_OF_SPACE),
+            Classified::NoVerdict(Cause::OutOfSpace)
+        ));
+        assert!(matches!(
+            classify(1, UNAUTHORIZED),
+            Classified::NoVerdict(Cause::Unauthorized)
+        ));
     }
 
     #[test]

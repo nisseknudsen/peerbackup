@@ -31,9 +31,15 @@ jobs:
 
       - name: resolve restic version
         id: ver
+        # The dispatch input arrives through the environment, not interpolated
+        # into the script body. Triggering this needs write access, so the
+        # exposure is small, but `${{ }}` inside `run:` is textual substitution
+        # before the shell ever sees it, and that is worth not doing.
+        env:
+          INPUT_RESTIC_VERSION: ${{ github.event.inputs.restic_version }}
         run: |
           set -euo pipefail
-          v="${{ github.event.inputs.restic_version }}"
+          v="$INPUT_RESTIC_VERSION"
           if [ -n "$v" ]; then
             echo "version=$v"      >> "$GITHUB_OUTPUT"
             echo "verify=false"    >> "$GITHUB_OUTPUT"
@@ -44,11 +50,13 @@ jobs:
           fi
 
       - name: install restic
+        env:
+          V: ${{ steps.ver.outputs.version }}
+          VERIFY: ${{ steps.ver.outputs.verify }}
         run: |
           set -euo pipefail
-          V="${{ steps.ver.outputs.version }}"
           curl -sSLO "https://github.com/restic/restic/releases/download/v${V}/restic_${V}_linux_amd64.bz2"
-          if [ "${{ steps.ver.outputs.verify }}" = "true" ]; then
+          if [ "$VERIFY" = "true" ]; then
             echo "${RESTIC_SHA256}  restic_${V}_linux_amd64.bz2" | sha256sum -c -
           else
             curl -sSL "https://github.com/restic/restic/releases/download/v${V}/SHA256SUMS" -o SHA256SUMS

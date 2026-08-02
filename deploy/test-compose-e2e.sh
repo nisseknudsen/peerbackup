@@ -32,6 +32,7 @@ cleanup() { docker compose -f "$HERE/../compose.yml" down -v >/dev/null 2>&1 || 
 trap cleanup EXIT
 
 command -v docker >/dev/null || { echo "docker required"; exit 1; }
+docker info >/dev/null 2>&1 || { echo "docker daemon not reachable"; exit 1; }
 "$RESTIC" version >/dev/null 2>&1 || { echo "restic required (set RESTIC_BIN)"; exit 1; }
 
 hdr "bring up the stack"

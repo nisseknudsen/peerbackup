@@ -6,16 +6,16 @@
 
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 use super::outcome::{Cause, VerifyOutcome};
 use super::{
     BackupEngine, EngineError, RestoredFile, Snapshot, SnapshotId, SnapshotMeta, SnapshotOpts,
 };
 
-/// Scripted engine. Each call pops the next queued response; when the queue is
-/// empty the configured default is returned.
+/// Scripted engine. `verify_subset` answers `verify_default`; the constructors
+/// below cover the specific faults the command tests need to inject.
 pub struct FakeEngine {
-    pub verify_queue: RefCell<Vec<VerifyOutcome>>,
     pub verify_default: VerifyOutcome,
     pub snapshot_result: RefCell<Option<Result<Snapshot, EngineError>>>,
     /// What `probe` answers. `None` means reachable.
@@ -29,13 +29,18 @@ pub struct FakeEngine {
     /// What `list_snapshots` answers. A canary restore needs one to pick.
     pub snapshots: Vec<SnapshotMeta>,
     /// Every operation asked of this engine, in order.
-    pub calls: RefCell<Vec<String>>,
+    ///
+    /// Shared rather than owned so a test can keep a handle to the log while
+    /// the engine itself disappears inside the command under test. `backup_in`
+    /// and `verify_in` build their engines from a closure and drop them, so an
+    /// owned `RefCell` here could never be read afterwards -- which is why this
+    /// recorded every call and nothing ever asserted on one.
+    pub calls: Rc<RefCell<Vec<String>>>,
 }
 
 impl FakeEngine {
     pub fn always(outcome: VerifyOutcome) -> Self {
         Self {
-            verify_queue: RefCell::new(Vec::new()),
             verify_default: outcome,
             snapshot_result: RefCell::new(None),
             probe_result: None,
@@ -46,26 +51,7 @@ impl FakeEngine {
                 paths: vec![PathBuf::from("/srv/data")],
                 tags: vec!["peerbackup".into()],
             }],
-            calls: RefCell::new(Vec::new()),
-        }
-    }
-
-    /// Queue outcomes in the order they should be returned.
-    pub fn scripted(mut outcomes: Vec<VerifyOutcome>, default: VerifyOutcome) -> Self {
-        outcomes.reverse(); // pop() takes from the end
-        Self {
-            verify_queue: RefCell::new(outcomes),
-            verify_default: default,
-            snapshot_result: RefCell::new(None),
-            probe_result: None,
-            restored_digest: None,
-            snapshots: vec![SnapshotMeta {
-                id: SnapshotId("fake0001".into()),
-                time: "2026-07-01T10:00:00Z".into(),
-                paths: vec![PathBuf::from("/srv/data")],
-                tags: vec!["peerbackup".into()],
-            }],
-            calls: RefCell::new(Vec::new()),
+            calls: Rc::new(RefCell::new(Vec::new())),
         }
     }
 
@@ -143,10 +129,7 @@ impl BackupEngine for FakeEngine {
         self.calls
             .borrow_mut()
             .push(format!("verify_subset({percent})"));
-        self.verify_queue
-            .borrow_mut()
-            .pop()
-            .unwrap_or_else(|| self.verify_default.clone())
+        self.verify_default.clone()
     }
 
     fn list_snapshots(&self) -> Result<Vec<SnapshotMeta>, EngineError> {
@@ -164,27 +147,24 @@ impl BackupEngine for FakeEngine {
 mod tests {
     use super::*;
 
-    // The scripting mechanism itself is not worth a test -- asserting that a
-    // queue written three lines earlier pops in order tests `Vec`. What is
-    // worth testing is that this stands in for a real engine faithfully enough
-    // for the command tests in `cli` to mean something, so these check the two
-    // behaviours those tests rely on.
-
-    #[test]
-    fn a_queued_outcome_is_returned_before_the_default() {
-        let e = FakeEngine::scripted(
-            vec![VerifyOutcome::Bad(
-                super::super::outcome::Corruption::CheckFailed { detail: "x".into() },
-            )],
-            VerifyOutcome::Good { coverage_pct: 1 },
-        );
-        assert!(e.verify_subset(1).is_bad(), "queued outcome must win");
-        assert!(e.verify_subset(1).is_good(), "then the default");
-    }
+    // What is worth testing here is that this stands in for a real engine
+    // faithfully enough for the command tests in `cli` to mean something.
 
     #[test]
     fn an_unreachable_engine_reports_it_from_probe() {
         let e = FakeEngine::unreachable("connection refused");
         assert!(e.probe().is_some());
+    }
+
+    #[test]
+    fn the_call_log_survives_the_engine_it_recorded() {
+        // The property the `cli` ordering test depends on: a handle taken before
+        // the engine is handed over still sees what the engine was asked to do.
+        let e = FakeEngine::always(VerifyOutcome::Good { coverage_pct: 1 });
+        let log = e.calls.clone();
+        e.probe();
+        e.verify_subset(1);
+        drop(e);
+        assert_eq!(&*log.borrow(), &["probe()", "verify_subset(1)"]);
     }
 }

@@ -35,7 +35,12 @@ RemainAfterExit=yes
 WorkingDirectory=/usr/local/share/peerbackup
 
 Environment=PB_DATA=/srv/peerbackup/mnt
-Environment=PB_PORT=8000
+# The same port quickstart, compose.yml and the README all use. This said 8000,
+# so following the README's "Running it as a service" section published a server
+# on a different port from every other documented path -- including the invite
+# URLs quickstart prints. 8000 is also the one that collides constantly, which
+# is why 51515 was picked in the first place.
+Environment=PB_PORT=51515
 # Must match the owner of the mounted grant directories, or the container
 # writes files the host owner cannot read. See the README.
 Environment=PB_UID=1000

@@ -22,6 +22,7 @@ cleanup() { docker rm -f "$CONTAINER" >/dev/null 2>&1 || true; }
 trap cleanup EXIT
 
 command -v docker >/dev/null || { echo "docker required"; exit 1; }
+docker info >/dev/null 2>&1 || { echo "docker daemon not reachable"; exit 1; }
 "$RESTIC" version >/dev/null 2>&1 || { echo "restic required (set RESTIC_BIN)"; exit 1; }
 [ -x "$BIN" ] || { echo "build first: cargo build"; exit 1; }
 
@@ -168,13 +169,25 @@ if "$RESTIC" -r "$REPO" snapshots >/dev/null 2>&1; then
 else
   bad "could not open the repository with restic alone"
 fi
-# Exactly the command the recovery file prints.
+# Exactly the command the recovery file prints -- actually run, not just
+# extracted. It used to be pulled out, checked for emptiness and then ignored
+# while the test ran a hand-written restic invocation beside it, so the file
+# could have printed a command that does not work and this would still pass.
+# The whole claim of the recovery file is that those lines work on a machine
+# that has nothing but restic.
 RESTORE_CMD=$(grep -oP "(?<=^  )restic -r .*restore latest.*" "$WORK/recovery.txt" | head -1)
-if [ -z "$RESTORE_CMD" ]; then bad "recovery file has no restore command"; fi
-if "$RESTIC" -r "$REPO" restore latest --tag peerbackup --target "$WORK/rescued" >/dev/null 2>&1; then
-  ok "plain restic restores"
+if [ -z "$RESTORE_CMD" ]; then
+  bad "recovery file has no restore command"
 else
-  bad "restic could not restore"
+  # Two substitutions, and only two: the placeholder target, and the binary,
+  # so RESTIC_BIN is honoured. Everything else runs as written.
+  RESTORE_CMD=${RESTORE_CMD//\/where\/to\/put\/it/$WORK\/rescued}
+  RESTORE_CMD=${RESTORE_CMD/#restic /$RESTIC }
+  if eval "$RESTORE_CMD" >/dev/null 2>&1; then
+    ok "the restore command printed in the recovery file works verbatim"
+  else
+    bad "the recovery file's own restore command failed: $RESTORE_CMD"
+  fi
 fi
 
 RESCUED=$(find "$WORK/rescued" -name photo.bin | head -1)

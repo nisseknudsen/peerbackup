@@ -5,8 +5,8 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
 
-use super::{Ctx, DEFAULT_CONTAINER, DEFAULT_PORT, REST_SERVER_IMAGE, Res, check_peer, have, warn};
-use crate::config::random_token;
+use super::{Ctx, DEFAULT_CONTAINER, DEFAULT_PORT, REST_SERVER_IMAGE, Res, have, warn};
+use crate::config::{PeerName, random_token};
 
 pub struct ServerOpts {
     pub port: u16,
@@ -60,8 +60,7 @@ fn default_data_dir() -> PathBuf {
 /// Uses a plain directory rather than a preallocated image, so the size limit
 /// is rest-server's and is shared across all peers. `provision` is the version
 /// with a per-peer limit the kernel enforces.
-pub fn quickstart(ctx: &Ctx, peer: &str, o: &ServerOpts) -> Res {
-    check_peer(peer)?;
+pub fn quickstart(ctx: &Ctx, peer: &PeerName, o: &ServerOpts) -> Res {
     if !have("docker") {
         return Err("docker is required".into());
     }
@@ -225,14 +224,12 @@ pub fn quickstart(ctx: &Ctx, peer: &str, o: &ServerOpts) -> Res {
 /// generated password when it generated one.
 pub fn adduser(
     ctx: &Ctx,
-    peer: &str,
+    peer: &PeerName,
     password: Option<&str>,
     o: &ServerOpts,
 ) -> Result<Option<String>, String> {
-    check_peer(peer)?;
-
     let (pw, generated) = match password {
-        Some(p) => (p.to_owned(), false),
+        Some(p) => (check_password(p)?.to_owned(), false),
         None => {
             let p = random_token(24).map_err(|e| format!("could not generate a password: {e}"))?;
             (p, true)
@@ -262,7 +259,7 @@ pub fn adduser(
             "-c",
             r#"htpasswd -B -i "$PASSWORD_FILE" "$1""#,
             "sh",
-            peer,
+            peer.as_str(),
         ])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -303,7 +300,11 @@ pub fn adduser(
     // a fresh grant. 200 means they already have one.
     let mut code = String::new();
     for _ in 0..40 {
-        code = http_status(o.port, &format!("/{peer}/config"), Some((peer, &pw)));
+        code = http_status(
+            o.port,
+            &format!("/{peer}/config"),
+            Some((peer.as_str(), &pw)),
+        );
         if code == "404" || code == "200" {
             break;
         }
@@ -337,19 +338,57 @@ pub fn adduser(
     }
 }
 
+/// Which compose file `host up`/`host down` should drive.
+///
+/// As a binary there is no script directory to hang this off, so the file is
+/// looked up where a person would keep it: named outright, or beside them.
+/// Takes the override rather than reading it, so the resolution order is
+/// testable without setting an environment variable from a test -- which races
+/// every other test in the binary.
+fn compose_file(override_path: Option<PathBuf>) -> Result<PathBuf, String> {
+    if let Some(p) = override_path {
+        return Ok(p);
+    }
+    let here = PathBuf::from("compose.yml");
+    if here.exists() {
+        return Ok(here);
+    }
+    Err(
+        "no compose.yml here. Run this from the directory holding it, or set \
+         PB_COMPOSE_FILE=/path/to/compose.yml"
+            .into(),
+    )
+}
+
+/// Refuse a supplied password that the two things downstream cannot carry.
+///
+/// The password reaches `htpasswd -i` as one line on stdin, and reaches curl as
+/// one `user = "..."` line in a config file. Both are line-oriented, so an
+/// embedded newline silently truncates: `htpasswd` stores everything before it,
+/// while the operator believes the whole string is the credential and sends that
+/// to their friend. The verification step then reports a puzzling 401 for a
+/// login that was, from its own point of view, created successfully.
+///
+/// Generated passwords are alphanumeric and cannot trip this. It exists for the
+/// `host adduser <peer> <password>` path, where the value comes from a human.
+fn check_password(pw: &str) -> Result<&str, String> {
+    if pw.is_empty() {
+        return Err("the password is empty; omit the argument to generate one".into());
+    }
+    if let Some(c) = pw.chars().find(|c| c.is_control()) {
+        return Err(format!(
+            "the password contains a control character ({}), which cannot be stored.\n       \
+             htpasswd reads one line from stdin, so everything from there on would be\n       \
+             dropped and the stored login would not match what you send your friend.\n       \
+             Omit the argument to generate one instead.",
+            c.escape_default()
+        ));
+    }
+    Ok(pw)
+}
+
 pub fn compose(ctx: &Ctx, up: bool) -> Res {
-    // As a binary there is no script directory to hang this off, so the file is
-    // looked up where a person would keep it: beside them, or named outright.
-    let file = std::env::var_os("PB_COMPOSE_FILE")
-        .map(PathBuf::from)
-        .or_else(|| {
-            let here = PathBuf::from("compose.yml");
-            here.exists().then_some(here)
-        })
-        .ok_or(
-            "no compose.yml here. Run this from the directory holding it, or set \
-             PB_COMPOSE_FILE=/path/to/compose.yml",
-        )?;
+    let file = compose_file(std::env::var_os("PB_COMPOSE_FILE").map(PathBuf::from))?;
     let f = file.to_string_lossy().into_owned();
     if up {
         ctx.run("docker", &["compose", "-f", &f, "up", "-d"])
@@ -521,12 +560,66 @@ mod tests {
     }
 
     #[test]
+    fn the_compose_file_override_wins_and_a_missing_one_says_what_to_do() {
+        let named = PathBuf::from("/somewhere/else/compose.yml");
+        assert_eq!(compose_file(Some(named.clone())).unwrap(), named);
+        // The override is taken as given: naming a file that is not there must
+        // fail in `docker compose`, which says which file, rather than silently
+        // falling back to whatever happens to be in the current directory.
+        assert_eq!(
+            compose_file(Some(PathBuf::from("/no/such/compose.yml"))).unwrap(),
+            PathBuf::from("/no/such/compose.yml")
+        );
+        // With no override and no file beside us, the error has to name the way
+        // out. Tests run from the repository root, where compose.yml exists, so
+        // only assert the message when it genuinely is not there.
+        if !PathBuf::from("compose.yml").exists() {
+            let e = compose_file(None).unwrap_err();
+            assert!(e.contains("PB_COMPOSE_FILE"), "got: {e}");
+        } else {
+            assert_eq!(compose_file(None).unwrap(), PathBuf::from("compose.yml"));
+        }
+    }
+
+    #[test]
+    fn a_password_that_cannot_survive_htpasswd_is_refused_up_front() {
+        // htpasswd -i reads one line. A password with a newline in it was stored
+        // truncated while the operator sent their friend the whole string, and
+        // the only symptom was a 401 from a login that had just been "verified".
+        for bad in [
+            "with\nnewline",
+            "with\rreturn",
+            "tab\there",
+            "nul\0byte",
+            "",
+        ] {
+            assert!(check_password(bad).is_err(), "{bad:?} must be refused");
+        }
+        // Everything a human might reasonably pick still works, including the
+        // shell-hostile characters, because nothing here goes through a shell.
+        for good in [
+            "hunter2",
+            "p@ssw0rd",
+            "a b c",
+            "\"quoted\"",
+            "back\\slash",
+            "£10",
+        ] {
+            assert_eq!(check_password(good).unwrap(), good);
+        }
+    }
+
+    #[test]
     fn a_missing_directory_is_not_writable() {
         assert!(!writable(std::path::Path::new("/nope/not/here")));
     }
 
     #[test]
-    fn quickstart_refuses_a_bad_peer_name() {
+    fn quickstart_cannot_be_handed_a_name_that_would_break_a_path() {
+        // Was `quickstart(&ctx, "a b", &o)`, asserting an error. That no longer
+        // compiles -- the parameter is a validated `PeerName` -- so what is left
+        // to check is that the container name and invite URL are built from a
+        // name the type already vouched for.
         let ctx = Ctx {
             root: PathBuf::from("/tmp/pb-unused"),
             units: PathBuf::from("/tmp/pb-unused"),
@@ -542,7 +635,14 @@ mod tests {
             container: "x".into(),
             max_size: 1,
         };
-        assert!(quickstart(&ctx, "a b", &o).is_err());
-        assert!(quickstart(&ctx, "", &o).is_err());
+        assert!(PeerName::new("a b").is_err());
+        assert!(PeerName::new("").is_err());
+        // A valid name still reaches the docker check and fails there, not on
+        // validation, which is what proves the name was accepted.
+        let e = quickstart(&ctx, &PeerName::new("alice").unwrap(), &o).unwrap_err();
+        assert!(
+            !e.contains("peer name"),
+            "a legitimate name must not be refused as a name: {e}"
+        );
     }
 }
