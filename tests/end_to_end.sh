@@ -41,13 +41,67 @@ echo "the file that matters" > "$WORK/data/notes.txt"
 head -c 3000000 /dev/urandom > "$WORK/data/photo.bin"
 ORIGINAL_SHA=$(sha256sum "$WORK/data/photo.bin" | awk '{print $1}')
 
+# Everything below needs the server. When setup fails, the run is not a set of
+# test results -- it is one infrastructure failure wearing thirteen of them. So
+# each step is checked and the suite stops at the first one, rather than
+# reporting a cascade that all traces back to here.
+#
+# The version this replaced printed "PASS rest-server running" unconditionally:
+# `docker run`'s status was never read, the readiness loop could exhaust all
+# forty attempts without anyone noticing, and `create_user`'s output went to
+# /dev/null. A registry timeout therefore produced a green setup line followed
+# by twelve red ones about peers and recovery files.
+IMAGE=restic/rest-server:0.14.0
+
+# Docker Hub times out often enough on a cold runner that it is worth retrying
+# before calling it a failure, and worth saying which it was when it is one.
+pull_image() {
+  local attempt
+  for attempt in 1 2 3; do
+    docker image inspect "$1" >/dev/null 2>&1 && return 0
+    docker pull -q "$1" >/dev/null 2>&1 && return 0
+    echo "  pulling $1 failed (attempt $attempt/3), retrying" >&2
+    sleep $((attempt * 5))
+  done
+  return 1
+}
+
+wait_http() { # $1 = port, $2 = attempts. Any HTTP status counts: with
+              # --private-repos the server answers 401 on / forever.
+  for _ in $(seq 1 "$2"); do
+    curl -s -o /dev/null "http://127.0.0.1:$1/" && return 0
+    sleep 0.25
+  done
+  return 1
+}
+
+setup_failed() { # $1 = what went wrong
+  bad "$1"
+  docker logs "$CONTAINER" 2>&1 | tail -10 | sed 's/^/      /'
+  printf '\n  setup failed, so nothing below would test peerbackup. Stopping.\n'
+  exit 1
+}
+
+pull_image "$IMAGE" || {
+  printf '  \033[31mFAIL\033[0m  could not pull %s from the registry\n' "$IMAGE"
+  printf '\n  This is the registry, not peerbackup. Stopping rather than\n'
+  printf '  reporting a dozen failures that are all this one.\n'
+  exit 1
+}
+
 docker run -d --name "$CONTAINER" -p "127.0.0.1:$PORT:8000" \
   --user "$(id -u):$(id -g)" \
   -e OPTIONS="--private-repos --append-only" \
-  -v "$WORK/srv:/data" restic/rest-server:0.14.0 >/dev/null
-for _ in $(seq 1 40); do curl -s -o /dev/null "http://127.0.0.1:$PORT/" && break; sleep 0.25; done
-docker exec "$CONTAINER" create_user me pw >/dev/null 2>&1
-docker restart "$CONTAINER" >/dev/null 2>&1; sleep 2
+  -v "$WORK/srv:/data" "$IMAGE" >/dev/null \
+  || setup_failed "could not start the rest-server container"
+wait_http "$PORT" 40 || setup_failed "rest-server never answered on port $PORT"
+docker exec "$CONTAINER" create_user me pw >/dev/null 2>&1 \
+  || setup_failed "could not create the rest-server login"
+# It only reads the htpasswd file at startup, so the restart is what makes the
+# credential usable -- and the server has to come back before anything else runs.
+docker restart "$CONTAINER" >/dev/null 2>&1 \
+  || setup_failed "rest-server did not restart after the login was created"
+wait_http "$PORT" 40 || setup_failed "rest-server did not come back after its restart"
 ok "rest-server running"
 
 hdr "init"
@@ -140,7 +194,11 @@ if echo "$OUT" | grep -q "FAILED"; then
 else
   ok "a stopped peer is not reported as failed"
 fi
-docker start "$CONTAINER" >/dev/null 2>&1; sleep 2
+# The disaster-recovery section below reads the repository back, so the server
+# has to actually be serving again -- not merely have been asked to start.
+docker start "$CONTAINER" >/dev/null 2>&1 \
+  || setup_failed "rest-server did not restart after being stopped"
+wait_http "$PORT" 40 || setup_failed "rest-server did not come back after being stopped"
 
 hdr "recovery export"
 "$BIN" recovery export --out "$WORK/recovery.txt" >/dev/null 2>&1
