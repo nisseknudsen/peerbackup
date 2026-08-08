@@ -64,8 +64,8 @@ pub struct SnapshotMeta {
 /// the point: bytes restored is not the same as the *right* bytes restored.
 ///
 /// `path` and `bytes` are for reporting; only `sha256` is compared today.
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct RestoredFile {
     pub path: PathBuf,
     pub sha256: String,
@@ -76,9 +76,10 @@ pub struct RestoredFile {
 ///
 /// `exit_code` is kept for diagnostics even though nothing branches on it yet;
 /// restic's codes are part of the contract this wrapper depends on.
-#[allow(dead_code)]
+///
 /// Verification does not use this: it returns [`VerifyOutcome`].
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct EngineError {
     /// restic's message, already stripped of its Go trace.
     pub message: String,

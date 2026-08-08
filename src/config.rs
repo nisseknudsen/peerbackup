@@ -38,6 +38,51 @@ pub struct Settings {
     pub canary_days: u64,
 }
 
+impl Settings {
+    /// Refuse settings that cannot mean what they say.
+    ///
+    /// Two reasons, both of which showed up as silent behaviour further down.
+    ///
+    /// `verify_subset_pct = 0` was accepted here and clamped to 1 three layers
+    /// away, in the restic engine. Someone who writes 0 means "do not read
+    /// anything back", and getting 1% instead is a small lie about the one
+    /// number on the dashboard that says how much was checked. Refusing says
+    /// which value is wrong and where.
+    ///
+    /// The windows are multiplied into seconds (`liveness_hours * 3600`, and
+    /// days * 86400) to decide whether a peer is stale. Release builds do not
+    /// check arithmetic overflow, so an absurd value silently wrapped to a tiny
+    /// window and every peer read `unchecked` forever. The ceilings below are
+    /// far past any real schedule and leave the multiplications nowhere near
+    /// `u64`.
+    pub fn validate(&self) -> Result<(), String> {
+        if !(1..=100).contains(&self.verify_subset_pct) {
+            return Err(format!(
+                "verify_subset_pct must be between 1 and 100, not {}. \
+                 It is the share of stored data `verify` reads back.",
+                self.verify_subset_pct
+            ));
+        }
+        // A century, in each unit.
+        for (name, value, max) in [
+            ("liveness_hours", self.liveness_hours, 24 * 365 * 100),
+            ("subset_days", self.subset_days, 365 * 100),
+            ("canary_days", self.canary_days, 365 * 100),
+        ] {
+            if value == 0 {
+                return Err(format!(
+                    "{name} is 0, so no check could ever be recent enough and every peer \
+                     would read `unchecked` forever"
+                ));
+            }
+            if value > max {
+                return Err(format!("{name} of {value} is out of range (max {max})"));
+            }
+        }
+        Ok(())
+    }
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -142,6 +187,8 @@ pub enum ConfigError {
     NotFound(PathBuf),
     Io(PathBuf, io::Error),
     Parse(PathBuf, String),
+    /// Valid TOML, but a setting that cannot mean what it says.
+    Invalid(PathBuf, String),
 }
 
 impl std::fmt::Display for ConfigError {
@@ -156,6 +203,7 @@ impl std::fmt::Display for ConfigError {
             }
             Self::Io(p, e) => write!(f, "could not read {}: {e}", p.display()),
             Self::Parse(p, e) => write!(f, "{} is not valid TOML: {e}", p.display()),
+            Self::Invalid(p, e) => write!(f, "{}: {e}", p.display()),
         }
     }
 }
@@ -190,7 +238,12 @@ impl Config {
             io::ErrorKind::NotFound => ConfigError::NotFound(p.clone()),
             _ => ConfigError::Io(p.clone(), e),
         })?;
-        toml::from_str(&text).map_err(|e| ConfigError::Parse(p, e.to_string()))
+        let cfg: Self =
+            toml::from_str(&text).map_err(|e| ConfigError::Parse(p.clone(), e.to_string()))?;
+        cfg.settings
+            .validate()
+            .map_err(|e| ConfigError::Invalid(p, e))?;
+        Ok(cfg)
     }
 
     pub fn save(&self) -> io::Result<()> {
@@ -269,9 +322,10 @@ pub fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
     })
 }
 
-/// Random alphanumeric string from the kernel. Avoids pulling in a crate for
-/// something `/dev/urandom` already does, and this is Linux-only anyway.
 /// Random alphanumeric string from the kernel.
+///
+/// Avoids pulling in a crate for something `/dev/urandom` already does, and
+/// this is Linux-only anyway.
 ///
 /// Rejection sampling rather than `% ALPHABET.len()`. The alphabet is 57
 /// characters and 256 is not a multiple of it, so the modulo would make the
@@ -320,6 +374,7 @@ mod tests {
             "",
             "a b",
             "a.b",
+            "a;rm -rf /",
             "péer",
         ] {
             assert!(PeerName::new(bad).is_err(), "{bad:?} must be refused");
@@ -362,6 +417,77 @@ url = "rest:http://x/"
         assert_eq!(fs::read_to_string(dir.join("al.ice")).unwrap(), "one");
         assert_eq!(fs::read_to_string(dir.join("al.bob")).unwrap(), "two");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn settings_that_cannot_mean_what_they_say_are_refused_on_load() {
+        // Each of these used to be accepted and then quietly turned into
+        // something else much further down.
+        assert!(
+            Settings::default().validate().is_ok(),
+            "the defaults must be valid"
+        );
+
+        let pct = |v: u8| Settings {
+            verify_subset_pct: v,
+            ..Settings::default()
+        };
+        let e = pct(0).validate().unwrap_err();
+        assert!(e.contains("verify_subset_pct"), "must name the key: {e}");
+        assert!(pct(101).validate().is_err());
+        assert!(pct(100).validate().is_ok());
+
+        // Zero windows: nothing could ever be fresh, so every peer would read
+        // `unchecked` forever.
+        for zeroed in [
+            Settings {
+                liveness_hours: 0,
+                ..Settings::default()
+            },
+            Settings {
+                subset_days: 0,
+                ..Settings::default()
+            },
+            Settings {
+                canary_days: 0,
+                ..Settings::default()
+            },
+        ] {
+            assert!(zeroed.validate().is_err());
+        }
+
+        // Absurd windows: `liveness_hours * 3600` wraps in a release build,
+        // which turns "never stale" into "always stale".
+        assert!(
+            Settings {
+                liveness_hours: u64::MAX,
+                ..Settings::default()
+            }
+            .validate()
+            .is_err(),
+            "an overflowing window must be refused"
+        );
+    }
+
+    #[test]
+    fn a_valid_window_never_overflows_when_turned_into_seconds() {
+        // What the ceilings are actually for. `status` computes
+        // `canary_days.max(subset_days) * 86400 * 2`, the widest of them.
+        let s = Settings {
+            liveness_hours: 24 * 365 * 100,
+            subset_days: 365 * 100,
+            canary_days: 365 * 100,
+            ..Settings::default()
+        };
+        s.validate().unwrap();
+        assert!(s.liveness_hours.checked_mul(3600).is_some());
+        assert!(
+            s.canary_days
+                .max(s.subset_days)
+                .checked_mul(86400)
+                .and_then(|v| v.checked_mul(2))
+                .is_some()
+        );
     }
 
     #[test]

@@ -174,7 +174,12 @@ pub fn init() -> Res {
 ///
 /// Equivalent to `init`, adding the directories to the config, then `peer add`.
 /// Split out because four steps before the first backup is three too many.
-pub fn connect(url: &str, sources: &[PathBuf], name: Option<&str>) -> Res {
+pub fn connect(
+    url: &str,
+    sources: &[PathBuf],
+    name: Option<&str>,
+    ca_cert: Option<PathBuf>,
+) -> Res {
     if !Config::path().exists() {
         let cfg = Config::default();
         cfg.save().map_err(err("could not write config"))?;
@@ -203,7 +208,12 @@ pub fn connect(url: &str, sources: &[PathBuf], name: Option<&str>) -> Res {
             "could not work out a name for this peer from the URL; pass --name, e.g. --name alice",
         )?,
     };
-    peer_add(&name, url, None)?;
+    // Threaded through rather than hardcoded to `None`. It used to be the
+    // latter, so a peer whose friend uses a self-signed certificate had to
+    // abandon the one-command path for `init` + `peer add` -- which the README
+    // never said, because its TLS section tells them to pass `--cacert` "when
+    // connecting".
+    peer_add(&name, url, ca_cert)?;
 
     println!();
     println!("Backing up:");
@@ -220,13 +230,19 @@ pub fn connect(url: &str, sources: &[PathBuf], name: Option<&str>) -> Res {
 /// Short peer name from a URL host, when one can be derived sensibly.
 ///
 /// Returns `None` for bare IP addresses rather than naming a peer "192".
+///
+/// Bounded to the authority segment, the same way [`redact`] is and for the same
+/// reason: the credential separator is the last `@` *before the path*, and an
+/// `@` inside the path is not one. Taking the last `@` in the whole URL made
+/// `rest:http://alice.example.org/me@home/` suggest "home".
 fn peer_name_from_url(url: &str) -> Option<String> {
     let after_scheme = url.split("://").nth(1).unwrap_or(url);
-    let host = after_scheme
+    let authority = after_scheme.split('/').next().unwrap_or(after_scheme);
+    let host = authority
         .rsplit('@')
         .next()
-        .unwrap_or(after_scheme)
-        .split(['/', ':'])
+        .unwrap_or(authority)
+        .split(':')
         .next()
         .unwrap_or("peer");
     let first = host.split('.').next().unwrap_or("peer");
@@ -719,10 +735,7 @@ pub fn status_cmd() -> Res {
     // stale are both `unchecked`, but the thing to do about them is different.
     // Telling someone to run `verify` against a peer holding none of their data
     // sends them to check something that was never there.
-    let (never, stale): (Vec<&PeerStatus>, Vec<&PeerStatus>) = rows
-        .iter()
-        .filter(|r| r.state == PeerState::Unknown)
-        .partition(|r| r.last_backup.is_none());
+    let (never, stale) = partition_unknown(&rows);
 
     if !never.is_empty() {
         println!();
@@ -739,12 +752,33 @@ pub fn status_cmd() -> Res {
         );
     }
 
-    // Exit codes, in the order that matters. `Bad` is observed damage. But a
-    // peer stuck on `unknown` past its own windows -- unreachable for weeks,
-    // out of space, rejecting credentials -- used to exit 0, which meant this
-    // program was silent from cron in exactly the situation it exists for. The
-    // three-state model is right; collapsing it to two at the exit code was
-    // not, and it collapsed in the reassuring direction.
+    verdict(&rows)
+}
+
+/// Split the `unknown` peers into "never received a backup" and "checks have
+/// gone stale". Both print differently and both must reach the exit code.
+fn partition_unknown(rows: &[PeerStatus]) -> (Vec<&PeerStatus>, Vec<&PeerStatus>) {
+    rows.iter()
+        .filter(|r| r.state == PeerState::Unknown)
+        .partition(|r| r.last_backup.is_none())
+}
+
+/// What `status` should exit with.
+///
+/// Separated from the printing so it can be tested. It was inline, and untested,
+/// and that is how the `never` case below came to be silent.
+///
+/// `Bad` is observed damage. But a peer stuck on `unknown` past its own windows
+/// -- unreachable for weeks, out of space, rejecting credentials -- used to exit
+/// 0, which meant this program was silent from cron in exactly the situation it
+/// exists for. The three-state model is right; collapsing it to two at the exit
+/// code was not, and it collapsed in the reassuring direction.
+///
+/// Peers that have never received a backup at all were the remaining hole: they
+/// were partitioned out for printing and then left out of the exit code, so a
+/// peer holding none of your data exited 0 as long as some other peer was fine.
+/// That is the most alarming state of the three, and it was the only silent one.
+fn verdict(rows: &[PeerStatus]) -> Res {
     if rows.iter().any(|r| r.state == PeerState::Bad) {
         return Err("one or more peers reported a problem".into());
     }
@@ -754,13 +788,28 @@ pub fn status_cmd() -> Res {
                 .into(),
         );
     }
-    if !stale.is_empty() {
-        return Err(format!(
-            "{} peer(s) have not been checked within their windows",
-            stale.len()
+
+    let (never, stale) = partition_unknown(rows);
+    let mut problems = Vec::new();
+    if !never.is_empty() {
+        problems.push(format!(
+            "{} peer(s) hold no backup at all ({})",
+            never.len(),
+            join_names(&never)
         ));
     }
-    Ok(())
+    if !stale.is_empty() {
+        problems.push(format!(
+            "{} peer(s) have not been checked within their windows ({})",
+            stale.len(),
+            join_names(&stale)
+        ));
+    }
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        Err(problems.join("; "))
+    }
 }
 
 /// Why a peer's most recent attempt did not succeed, if it did not.
@@ -992,6 +1041,16 @@ mod tests {
         );
         // A bare IP yields no useful name, so ask instead of calling it "192".
         assert_eq!(peer_name_from_url("rest:http://192.168.1.5:8000/me/"), None);
+        // An `@` in the path is not a credential separator. Taking the last one
+        // in the whole URL suggested "home" for this.
+        assert_eq!(
+            peer_name_from_url("rest:http://alice.example.org/me@home/").as_deref(),
+            Some("alice")
+        );
+        assert_eq!(
+            peer_name_from_url("rest:https://me:pw@alice.example.org/me@home/").as_deref(),
+            Some("alice")
+        );
     }
 
     #[test]
@@ -1052,6 +1111,84 @@ mod tests {
                 "password survived redaction: {got}"
             );
         }
+    }
+
+    // ------------------------------------------------------- status exit code
+
+    fn row(name: &str, state: PeerState, last_backup: Option<u64>) -> PeerStatus {
+        PeerStatus {
+            name: pn(name),
+            state,
+            last_backup,
+            last_subset: None,
+            last_canary: None,
+            coverage_pct: None,
+            problem: None,
+        }
+    }
+
+    #[test]
+    fn a_peer_holding_no_backup_at_all_exits_non_zero() {
+        // The hole this closes: `never` peers were printed and then dropped from
+        // the exit code, so a peer holding none of your data exited 0 as long as
+        // some other peer looked fine. From cron the exit code is the whole
+        // signal, and this is the most alarming of the three unknown states.
+        let rows = [
+            row("alice", PeerState::Good, Some(100)),
+            row("bob", PeerState::Unknown, None),
+        ];
+        let e = verdict(&rows).unwrap_err();
+        assert!(e.contains("no backup at all"), "got: {e}");
+        assert!(e.contains("bob"), "must name the peer: {e}");
+        assert!(!e.contains("alice"), "must not blame the healthy peer: {e}");
+    }
+
+    #[test]
+    fn observed_damage_outranks_everything_else() {
+        let rows = [
+            row("alice", PeerState::Bad, Some(100)),
+            row("bob", PeerState::Unknown, None),
+        ];
+        let e = verdict(&rows).unwrap_err();
+        assert!(e.contains("reported a problem"), "got: {e}");
+    }
+
+    #[test]
+    fn a_stale_peer_still_exits_non_zero_and_says_which() {
+        let rows = [
+            row("alice", PeerState::Good, Some(100)),
+            row("bob", PeerState::Unknown, Some(50)),
+        ];
+        let e = verdict(&rows).unwrap_err();
+        assert!(e.contains("not been checked"), "got: {e}");
+        assert!(e.contains("bob"), "got: {e}");
+    }
+
+    #[test]
+    fn never_and_stale_are_reported_together_not_one_instead_of_the_other() {
+        let rows = [
+            row("alice", PeerState::Good, Some(100)),
+            row("bob", PeerState::Unknown, None),
+            row("carol", PeerState::Unknown, Some(50)),
+        ];
+        let e = verdict(&rows).unwrap_err();
+        assert!(e.contains("bob"), "the never-backed-up peer: {e}");
+        assert!(e.contains("carol"), "the stale peer: {e}");
+    }
+
+    #[test]
+    fn every_peer_healthy_exits_zero() {
+        let rows = [
+            row("alice", PeerState::Good, Some(100)),
+            row("bob", PeerState::Good, Some(100)),
+        ];
+        assert!(verdict(&rows).is_ok());
+    }
+
+    #[test]
+    fn no_peers_at_all_is_not_a_failure_here() {
+        // `status_cmd` returns early with its own message before reaching this.
+        assert!(verdict(&[]).is_ok());
     }
 
     // ------------------------------------------------- backup and verify
@@ -1177,16 +1314,51 @@ mod tests {
     fn verify_probes_before_checking_so_a_dead_peer_costs_seconds() {
         // Without the probe, an unreachable peer burns the whole verification
         // timeout while restic retries.
+        //
+        // Asserted on the call log rather than inferred from a record count.
+        // The count only shows that one thing was recorded; what matters is
+        // that the expensive calls were never made at all.
         let h = harness("probe");
         Canary::create_at(&h.rt.canary_dir(), &h.rt.canary_manifest()).unwrap();
-        verify_in(&h.rt, &h.cfg, None, |_| {
-            FakeEngine::unreachable("connection refused")
+        let log = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let handle = log.clone();
+        verify_in(&h.rt, &h.cfg, None, move |_| FakeEngine {
+            calls: handle.clone(),
+            ..FakeEngine::unreachable("connection refused")
         })
         .unwrap();
 
+        assert_eq!(
+            &*log.borrow(),
+            &["probe()"],
+            "a failed probe must end the peer's turn before anything expensive"
+        );
         let r = records(&h);
         assert_eq!(r.len(), 1, "a probe failure ends the peer's turn");
         assert_eq!(r[0].verdict, Verdict::Unknown, "unreachable is not damage");
+    }
+
+    #[test]
+    fn verify_checks_the_data_then_the_canary_when_the_peer_answers() {
+        // The other side of the ordering: a reachable peer gets the subset check
+        // and then the canary restore, and the canary needs a snapshot listed
+        // first. Pinning the sequence is what makes the probe test above mean
+        // "stopped early" rather than "did nothing for some other reason".
+        let h = harness("order");
+        Canary::create_at(&h.rt.canary_dir(), &h.rt.canary_manifest()).unwrap();
+        let log = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let handle = log.clone();
+        verify_in(&h.rt, &h.cfg, None, move |_| FakeEngine {
+            calls: handle.clone(),
+            ..FakeEngine::always(VerifyOutcome::Good { coverage_pct: 1 })
+        })
+        .unwrap();
+
+        let calls = log.borrow();
+        assert_eq!(calls[0], "probe()");
+        assert_eq!(calls[1], "verify_subset(1)");
+        assert_eq!(calls[2], "list_snapshots()");
+        assert!(calls[3].starts_with("restore_path("), "got {}", calls[3]);
     }
 
     #[test]

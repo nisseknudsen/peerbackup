@@ -155,6 +155,32 @@ if [ -d /dev/shm ]; then
   rm -rf /dev/shm/pb-sparse-test 2>/dev/null || true
 fi
 
+hdr "a failure after allocation rolls back instead of stranding the image"
+# The rollback used to begin only after the mount unit was written, so a failure
+# in any of the three steps before that -- creating the grant directory,
+# deriving the unit name, writing the unit -- returned early with a fully
+# preallocated image on disk. Up to the whole grant, and the only way forward
+# was "host release": the type-the-name destructor whose own warning is that it
+# permanently destroys the peer's backups.
+#
+# Force the unit write to fail by making its parent a regular file.
+touch "$WORK/not-a-dir"
+ROLLBACK_OUT=$(SYSTEMD_UNIT_DIR="$WORK/not-a-dir/units" $HOST provision rollbackpeer 64M 2>&1)
+RB_IMG="$PEERBACKUP_ROOT/images/rollbackpeer.img"
+if [ -f "$RB_IMG" ]; then
+  bad "provision stranded an allocated image; only a destructive release could clear it"
+  echo "$ROLLBACK_OUT" | sed 's/^/        /' | tail -4
+else
+  ok "the image is removed when provisioning fails before the unit is written"
+fi
+if echo "$ROLLBACK_OUT" | grep -qi 'nothing was left behind'; then
+  ok "the error says the grant can simply be provisioned again"
+else
+  bad "no rollback message: $(echo "$ROLLBACK_OUT" | tail -2)"
+fi
+rmdir "$PEERBACKUP_ROOT/mnt/rollbackpeer" 2>/dev/null || true
+rm -f "$WORK/not-a-dir"
+
 hdr "the mount unit is written correctly"
 UNIT=""
 for _u in "$SYSTEMD_UNIT_DIR"/*testpeer*.mount; do

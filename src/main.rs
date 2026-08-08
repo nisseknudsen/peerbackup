@@ -8,6 +8,8 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
+use crate::config::PeerName;
+
 /// Every command returns a message a human can act on, or nothing.
 pub type Res = Result<(), String>;
 
@@ -34,6 +36,9 @@ enum Command {
         /// Short name for this peer (default: taken from the URL)
         #[arg(long)]
         name: Option<String>,
+        /// Certificate file, if they use a self-signed one
+        #[arg(long)]
+        cacert: Option<PathBuf>,
     },
 
     /// Create the config file and test files
@@ -129,26 +134,26 @@ enum HostCmd {
     /// Start a server and print an invite, in one command and without root
     Quickstart {
         /// Short name for the friend you are hosting for
-        peer: String,
+        peer: PeerName,
     },
     /// Create a size-limited grant the kernel enforces (needs root)
     Provision {
-        peer: String,
+        peer: PeerName,
         /// e.g. 500G, 1T, 512M
         size: String,
     },
     /// Create a login, restart the server, and verify it works
     Adduser {
-        peer: String,
+        peer: PeerName,
         /// Leave empty to generate one
         password: Option<String>,
     },
     /// Destroy a grant and give the capacity back (needs root)
-    Release { peer: String },
+    Release { peer: PeerName },
     /// Grants, sizes and usage
     List {
         /// Only this peer
-        peer: Option<String>,
+        peer: Option<PeerName>,
     },
     /// Refuse to start unless every grant is really mounted
     Guard,
@@ -179,7 +184,7 @@ fn run_host(cmd: HostCmd) -> Res {
         )
         .map(|_| ()),
         HostCmd::Release { peer } => host::grant::release(&ctx, &peer),
-        HostCmd::List { peer } => host::grant::list(&ctx, peer.as_deref()),
+        HostCmd::List { peer } => host::grant::list(&ctx, peer.as_ref().map(PeerName::as_str)),
         HostCmd::Guard => host::grant::guard(&ctx),
         HostCmd::Doctor => host::grant::doctor(&ctx),
         HostCmd::Up => host::server::compose(&ctx, true),
@@ -196,7 +201,12 @@ fn main() {
     );
 
     let result = match cli.command {
-        Command::Connect { url, sources, name } => cli::connect(&url, &sources, name.as_deref()),
+        Command::Connect {
+            url,
+            sources,
+            name,
+            cacert,
+        } => cli::connect(&url, &sources, name.as_deref(), cacert),
         Command::Init => cli::init(),
         Command::Peer(PeerCmd::Add { name, url, cacert }) => cli::peer_add(&name, &url, cacert),
         Command::Peer(PeerCmd::List) => cli::peer_list(),

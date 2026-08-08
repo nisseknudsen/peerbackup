@@ -43,6 +43,12 @@ string_slice = "warn"
 # A backup tool is not a hot loop, and a smaller static binary is easier to hand
 # to a friend than a marginally faster one.
 opt-level = "s"
+# On for the same reason. Release builds disable these by default, so a value
+# that overflows wraps silently -- and the arithmetic here turns config into the
+# windows that decide whether a peer is stale. `Settings::validate` refuses the
+# values that could reach an overflow; this is the backstop for the ones nobody
+# thought of, and it costs nothing measurable at this workload.
+overflow-checks = true
 lto = true
 codegen-units = 1
 strip = true

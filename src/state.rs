@@ -177,29 +177,74 @@ impl Evidence {
 
     /// Records newer than `oldest`, newest last. Pass `0` for everything.
     ///
+    /// `status` needs at most `canary_days` of history, but this read the whole
+    /// file and parsed every line of it. Hourly backups and daily verifies to
+    /// three peers is tens of thousands of lines a year, growing forever,
+    /// re-read on every invocation of the command people run most.
     ///
-    /// `status` needs at most `canary_days` of history, but read the whole file
-    /// and parsed every line of it. Hourly backups and daily verifies to three
-    /// peers is tens of thousands of lines a year, growing forever, re-parsed
-    /// on every invocation of the command people run most.
+    /// Seeks to the end and walks backwards a block at a time, stopping at the
+    /// first record older than the cutoff. The file is append-only and written
+    /// in time order, so everything before that point is older too.
     ///
-    /// Reads from the end and stops early. The file is append-only and written
-    /// in time order, so the first record older than the cutoff means the rest
-    /// are too.
+    /// The intermediate version of this stopped *parsing* early but still began
+    /// with `read_to_string`, so the JSON cost was bounded and the I/O was not
+    /// -- while the comment claimed both. Now the whole cost is the window.
     pub fn read_since(path: &Path, oldest: u64) -> Vec<Record> {
-        let Ok(text) = fs::read_to_string(path) else {
+        use std::io::{Seek, SeekFrom};
+
+        // Comfortably more than a window's worth of records for a normal
+        // schedule, so the common case is one read.
+        const BLOCK: usize = 64 * 1024;
+
+        let Ok(mut f) = fs::File::open(path) else {
             return Vec::new();
         };
+        let Ok(len) = f.seek(SeekFrom::End(0)) else {
+            return Vec::new();
+        };
+
         let mut out: Vec<Record> = Vec::new();
-        for line in text.lines().rev() {
-            let Ok(r) = serde_json::from_str::<Record>(line) else {
-                continue; // A truncated tail, or a record from a future version.
-            };
-            if r.at < oldest {
+        let mut pos = len;
+        // Bytes already read that belong to a line beginning further left.
+        let mut carry: Vec<u8> = Vec::new();
+
+        'blocks: while pos > 0 {
+            let take = BLOCK.min(pos as usize);
+            pos -= take as u64;
+            if f.seek(SeekFrom::Start(pos)).is_err() {
                 break;
             }
-            out.push(r);
+            let mut buf = vec![0u8; take];
+            if f.read_exact(&mut buf).is_err() {
+                break;
+            }
+            buf.extend_from_slice(&carry);
+
+            // While there is still file to the left, the bytes before the first
+            // newline are the tail of a line that starts in the next block.
+            // At pos == 0 there is nothing to the left, so they are a whole line.
+            let split = (pos > 0)
+                .then(|| buf.iter().position(|b| *b == b'\n'))
+                .flatten();
+            let (keep, lines): (Vec<u8>, &[u8]) = match split {
+                Some(i) => (buf[..i].to_vec(), &buf[i + 1..]),
+                None => (Vec::new(), &buf[..]),
+            };
+
+            for line in lines.split(|b| *b == b'\n').rev() {
+                let Ok(r) = serde_json::from_slice::<Record>(line) else {
+                    // A truncated tail, a blank line, or a record from a future
+                    // version. None of them should cost the history.
+                    continue;
+                };
+                if r.at < oldest {
+                    break 'blocks;
+                }
+                out.push(r);
+            }
+            carry = keep;
         }
+
         out.reverse();
         out
     }
@@ -480,6 +525,41 @@ mod tests {
             4,
             "0 means everything"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn records_spanning_a_block_boundary_are_not_lost_or_duplicated() {
+        // read_since walks the file backwards in 64KiB blocks, so a record that
+        // straddles a boundary is only correct if the leftover bytes are carried
+        // into the next block. At roughly 130 bytes a record, 2000 records is
+        // several blocks.
+        let dir = std::env::temp_dir().join(format!("pb-blocks-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("evidence.jsonl");
+
+        let total = 2000u64;
+        for at in 1..=total {
+            Evidence::append_to(&path, &rec(Kind::Backup, Verdict::Good, at)).unwrap();
+        }
+        assert!(
+            fs::metadata(&path).unwrap().len() > 64 * 1024,
+            "the fixture must be larger than one block or this proves nothing"
+        );
+
+        let all = Evidence::read_since(&path, 0);
+        assert_eq!(all.len(), total as usize, "every record must survive");
+        assert_eq!(all.first().unwrap().at, 1, "oldest first, as written");
+        assert_eq!(all.last().unwrap().at, total);
+        let ats: Vec<u64> = all.iter().map(|r| r.at).collect();
+        assert!(ats.windows(2).all(|w| w[1] == w[0] + 1), "order must hold");
+
+        // And the window still stops early across blocks.
+        let recent = Evidence::read_since(&path, total - 99);
+        assert_eq!(recent.len(), 100);
+        assert_eq!(recent.first().unwrap().at, total - 99);
+
         let _ = fs::remove_dir_all(&dir);
     }
 

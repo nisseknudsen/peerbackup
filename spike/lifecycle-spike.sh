@@ -86,6 +86,7 @@ fi
 : > "$LOG"
 
 command -v docker >/dev/null || { echo "docker required"; exit 1; }
+docker info >/dev/null 2>&1 || { echo "docker daemon not reachable"; exit 1; }
 "$RESTIC" version >/dev/null 2>&1 || { echo "restic required (set RESTIC_BIN)"; exit 1; }
 note "restic:      $("$RESTIC" version | head -1)"
 note "rest-server: $IMAGE"

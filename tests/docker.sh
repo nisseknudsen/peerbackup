@@ -29,6 +29,7 @@ cleanup() {
 trap cleanup EXIT
 
 command -v docker >/dev/null || { echo "docker required"; exit 1; }
+docker info >/dev/null 2>&1 || { echo "docker daemon not reachable"; exit 1; }
 
 # Run the client exactly the way the README tells people to.
 pb() {
@@ -60,8 +61,15 @@ PS_OUT=$(docker ps --filter "name=$SERVER" --format '{{.Status}}')
 [[ "$PS_OUT" == *Up* ]] \
   && ok "host compose file starts a server" || { bad "host compose failed"; docker compose -f "$HOST_COMPOSE" logs | tail -5; exit 1; }
 
-docker exec "$SERVER" create_user me pw >/dev/null 2>&1
-docker restart "$SERVER" >/dev/null 2>&1; sleep 2
+# Checked, not assumed. This printed PASS whatever happened, so a server that
+# came up but could not write its htpasswd file reported "login created" and
+# then failed further down as a peerbackup problem.
+docker exec "$SERVER" create_user me pw >/dev/null 2>&1 \
+  || { bad "could not create the rest-server login"
+       docker compose -f "$HOST_COMPOSE" logs | tail -5; exit 1; }
+docker restart "$SERVER" >/dev/null 2>&1 \
+  || { bad "rest-server did not restart after the login was created"; exit 1; }
+for _ in $(seq 1 60); do curl -s -o /dev/null "http://127.0.0.1:$PORT/" && break; sleep 0.25; done
 ok "login created"
 
 # The host must be able to read what it is storing.

@@ -61,6 +61,22 @@ jobs:
         run: cargo test
         timeout-minutes: 5
 
+  audit:
+    name: dependency advisories
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Built from source rather than pulled from a third-party action. The
+      # dependency set here is seven direct crates and pinned by Cargo.lock, and
+      # the point of this job is supply chain, so it should not be the one place
+      # that adds an unreviewed action to the pipeline. Cached after the first
+      # run.
+      - name: install cargo-audit
+        run: cargo install cargo-audit --locked
+      - run: cargo audit
+
   client-e2e:
     name: client lifecycle + disaster recovery
     runs-on: ubuntu-latest
