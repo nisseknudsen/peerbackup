@@ -28,11 +28,18 @@ pub fn canary_dir() -> PathBuf {
     state_dir().join("canary")
 }
 
+/// Seconds since the epoch.
+///
+/// A clock set before 1970 is the one case `duration_since` fails, and this used
+/// to answer `0` for it. Zero is not a harmless default here: every record then
+/// looks future-dated relative to it, `status` reads the whole log and calls
+/// every peer fresh, and the dashboard goes green because the clock is broken.
+/// Saturating to the epoch keeps the failure visible -- every window is exceeded
+/// and every peer reads `unchecked` -- instead of inverting it.
 pub fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+        .map_or(0, |d| d.as_secs())
 }
 
 // --------------------------------------------------------------------- canary
@@ -127,6 +134,18 @@ pub enum Kind {
     Subset,
     /// The canary was restored and compared against its recorded digest.
     Canary,
+}
+
+impl Kind {
+    /// For naming a kind in a message when the record carried no detail.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Kind::Backup => "backup",
+            Kind::Subset => "read-back",
+            Kind::Canary => "test file",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -280,49 +299,113 @@ pub struct PeerStatus {
     pub last_backup: Option<u64>,
     pub last_subset: Option<u64>,
     pub last_canary: Option<u64>,
-    /// Share of stored data read back in the most recent successful check.
+    /// Share of stored data read back in the most recent successful check,
+    /// and only while that check is still within its window.
     pub coverage_pct: Option<u8>,
     pub problem: Option<String>,
+    /// This peer has records dated further ahead than the clock can explain.
+    /// They are excluded from freshness rather than believed; see
+    /// [`CLOCK_SKEW_TOLERANCE_SECS`].
+    pub clock_skew: bool,
 }
+
+/// How far ahead of the local clock a record may be dated and still be treated
+/// as evidence.
+///
+/// Records carry the wall clock of the machine that wrote them, and that clock
+/// can be wrong: a homeserver with no RTC, a container started with a skewed
+/// time, a hypervisor with a drifting TSC. A record dated in the future used to
+/// be unconditionally "fresh", because the freshness test is
+/// `now - at <= window` on saturating arithmetic and `now - at` clamps to zero.
+/// One backup taken while the clock was ahead therefore pinned a peer green
+/// permanently, and a clock set backwards greened every peer at once.
+///
+/// A few minutes of tolerance covers ordinary NTP correction. Anything past it
+/// is not evidence of anything, and is reported rather than believed.
+const CLOCK_SKEW_TOLERANCE_SECS: u64 = 300;
 
 /// Work out where each peer stands from the evidence on disk.
 ///
 /// Reads local records only. It never contacts a peer, so it is instant, works
 /// offline, and cannot confuse "your friend's router is rebooting" with "your
 /// backup is damaged".
+///
+/// Two orderings are in play here and they are deliberately different.
+///
+/// **Supersession is decided by position in the log, not by timestamp,** and
+/// only a `Good` supersedes. The log is append-only and written in the order
+/// things happened, so folding it in order says what currently stands whatever
+/// the clock was doing. Deciding it by timestamp let a future-dated `Good` bury
+/// a real `Bad`, and let two records written in the same second -- `verify`
+/// writes its subset and canary results within one -- resolve in the wrong
+/// order, because the comparison was strictly `>`.
+///
+/// **Freshness is decided by timestamp,** because it is the only thing that can
+/// answer "how long ago". Records dated past [`CLOCK_SKEW_TOLERANCE_SECS`] are
+/// excluded from it entirely.
 pub fn status(cfg: &Config, records: &[Record], now_ts: u64) -> Vec<PeerStatus> {
     let s = &cfg.settings;
     let liveness = s.liveness_hours * 3600;
     let subset_max = s.subset_days * 86400;
     let canary_max = s.canary_days * 86400;
+    let horizon = now_ts.saturating_add(CLOCK_SKEW_TOLERANCE_SECS);
 
     cfg.peers
         .iter()
         .map(|peer| {
             let mine: Vec<&Record> = records.iter().filter(|r| r.peer == peer.name).collect();
+
+            // Damage of a given kind that nothing has since refuted, folded in
+            // log order: `Bad` raises it, `Good` clears it, and `Unknown` leaves
+            // it exactly where it was. That last arm is the point -- "we could
+            // not check" says nothing about whether the damage is still there,
+            // so a timed-out verify after a pack-hash mismatch must not read as
+            // the mismatch having gone away.
+            let unresolved = |k: Kind| {
+                let mut standing: Option<&Record> = None;
+                for r in mine.iter().filter(|r| r.kind == k) {
+                    match r.verdict {
+                        Verdict::Bad => standing = Some(r),
+                        Verdict::Good => standing = None,
+                        Verdict::Unknown => {}
+                    }
+                }
+                standing
+            };
+
             // Only successful checks count towards freshness. Counting attempts
             // means a peer that is full, unreachable or misconfigured keeps
             // reporting "backed up just now" while receiving nothing.
             let last = |k: Kind| {
                 mine.iter()
-                    .filter(|r| r.kind == k && r.verdict == Verdict::Good)
+                    .filter(|r| r.kind == k && r.verdict == Verdict::Good && r.at <= horizon)
                     .map(|r| r.at)
                     .max()
             };
 
-            // Anything that came back wrong and has not since been superseded by
-            // a good check of the same kind.
-            let bad = mine.iter().rev().find(|r| r.verdict == Verdict::Bad);
-            let problem = bad.and_then(|r| {
-                let newer_good = mine
-                    .iter()
-                    .any(|o| o.kind == r.kind && o.at > r.at && o.verdict == Verdict::Good);
-                (!newer_good).then(|| {
+            // Every kind whose latest word is `Bad`, not just the single most
+            // recent `Bad` overall.
+            //
+            // The rule this replaces looked at one record: the newest `Bad` of
+            // any kind, cleared by a newer `Good` of that same kind. An older
+            // `Bad` of a *different* kind that nothing had superseded was never
+            // examined. One verify where both the subset check and the canary
+            // fail, followed by one where the canary recovers and the subset
+            // check merely times out, was enough to report `ok` and exit 0 with
+            // an unrefuted pack-hash mismatch in the log -- the single failure
+            // this program exists to prevent.
+            let problems: Vec<String> = [Kind::Backup, Kind::Subset, Kind::Canary]
+                .into_iter()
+                .filter_map(unresolved)
+                .map(|r| {
                     r.detail
                         .clone()
-                        .unwrap_or_else(|| "a check failed".to_owned())
+                        .unwrap_or_else(|| format!("{} check failed", r.kind.label()))
                 })
-            });
+                .collect();
+            let problem = (!problems.is_empty()).then(|| problems.join("; "));
+
+            let clock_skew = mine.iter().any(|r| r.at > horizon);
 
             let last_backup = last(Kind::Backup);
             let last_subset = last(Kind::Subset);
@@ -331,22 +414,28 @@ pub fn status(cfg: &Config, records: &[Record], now_ts: u64) -> Vec<PeerStatus> 
             let fresh =
                 |t: Option<u64>, window: u64| t.is_some_and(|t| now_ts.saturating_sub(t) <= window);
 
+            let subset_fresh = fresh(last_subset, subset_max);
             let state = if problem.is_some() {
                 PeerState::Bad
-            } else if fresh(last_backup, liveness)
-                && fresh(last_subset, subset_max)
-                && fresh(last_canary, canary_max)
+            } else if fresh(last_backup, liveness) && subset_fresh && fresh(last_canary, canary_max)
             {
                 PeerState::Good
             } else {
                 PeerState::Unknown
             };
 
-            let coverage_pct = mine
-                .iter()
-                .filter(|r| r.kind == Kind::Subset && r.verdict == Verdict::Good)
-                .max_by_key(|r| r.at)
-                .and_then(|r| r.coverage_pct);
+            // Gated on the subset check still being fresh. Ungated, a peer whose
+            // last successful check was three weeks ago printed `unchecked` and
+            // `100%` on the same row, which reads as "all of it was read back
+            // and we are unsure about something else".
+            let coverage_pct = subset_fresh
+                .then(|| {
+                    mine.iter()
+                        .rev()
+                        .find(|r| r.kind == Kind::Subset && r.verdict == Verdict::Good)
+                        .and_then(|r| r.coverage_pct)
+                })
+                .flatten();
 
             PeerStatus {
                 name: peer.name.clone(),
@@ -356,6 +445,7 @@ pub fn status(cfg: &Config, records: &[Record], now_ts: u64) -> Vec<PeerStatus> 
                 last_canary,
                 coverage_pct,
                 problem,
+                clock_skew,
             }
         })
         .collect()
@@ -404,6 +494,237 @@ mod tests {
 
     // A realistic unix timestamp: the tests subtract up to 60 days from it.
     const NOW: u64 = 1_800_000_000;
+
+    fn detailed(kind: Kind, verdict: Verdict, at: u64, detail: &str) -> Record {
+        Record {
+            detail: Some(detail.to_owned()),
+            ..rec(kind, verdict, at)
+        }
+    }
+
+    #[test]
+    fn corruption_of_one_kind_is_not_cleared_by_a_good_check_of_another() {
+        // The critical finding. The rule this replaces looked at the single most
+        // recent `Bad` of any kind and cleared it with a newer `Good` of that
+        // same kind, so an unsuperseded `Bad` of a *different* kind was never
+        // examined. This exact log printed `alice ok` and exited 0 with an
+        // unrefuted pack-hash mismatch an hour old in it.
+        let recs = vec![
+            rec(Kind::Subset, Verdict::Good, NOW - 7200),
+            detailed(
+                Kind::Subset,
+                Verdict::Bad,
+                NOW - 3600,
+                "pack 4f2a hash mismatch",
+            ),
+            detailed(
+                Kind::Canary,
+                Verdict::Bad,
+                NOW - 1800,
+                "transient restore failure",
+            ),
+            rec(Kind::Canary, Verdict::Good, NOW - 600),
+            rec(Kind::Backup, Verdict::Good, NOW - 300),
+        ];
+        let r = &status(&cfg_with_peer(), &recs, NOW)[0];
+        assert_eq!(r.state, PeerState::Bad, "observed damage must be reported");
+        assert!(
+            r.problem.as_deref().unwrap_or_default().contains("4f2a"),
+            "must name the damage it found: {:?}",
+            r.problem
+        );
+    }
+
+    #[test]
+    fn a_check_that_could_not_run_does_not_clear_observed_damage() {
+        // "Could not check" says nothing about whether the damage is still
+        // there. Letting an Unknown supersede a Bad turns a peer with a known
+        // pack-hash mismatch into a peer we are merely unsure about, and the
+        // detail stops being printed at all.
+        let recs = vec![
+            detailed(
+                Kind::Subset,
+                Verdict::Bad,
+                NOW - 86400 * 2,
+                "pack 4f2a hash mismatch",
+            ),
+            detailed(
+                Kind::Canary,
+                Verdict::Bad,
+                NOW - 86400 * 2,
+                "test file did not match",
+            ),
+            detailed(
+                Kind::Subset,
+                Verdict::Unknown,
+                NOW - 3600,
+                "timed out after 3600s",
+            ),
+            rec(Kind::Canary, Verdict::Good, NOW - 3500),
+            rec(Kind::Backup, Verdict::Good, NOW - 3400),
+        ];
+        let r = &status(&cfg_with_peer(), &recs, NOW)[0];
+        assert_eq!(r.state, PeerState::Bad);
+        assert!(
+            r.problem.as_deref().unwrap_or_default().contains("4f2a"),
+            "{:?}",
+            r.problem
+        );
+    }
+
+    #[test]
+    fn every_kind_that_currently_stands_bad_is_reported_not_just_one() {
+        let recs = vec![
+            detailed(
+                Kind::Subset,
+                Verdict::Bad,
+                NOW - 3600,
+                "pack 4f2a hash mismatch",
+            ),
+            detailed(
+                Kind::Canary,
+                Verdict::Bad,
+                NOW - 1800,
+                "test file did not match",
+            ),
+        ];
+        let p = status(&cfg_with_peer(), &recs, NOW)[0]
+            .problem
+            .clone()
+            .unwrap();
+        assert!(p.contains("4f2a"), "{p}");
+        assert!(p.contains("test file"), "{p}");
+    }
+
+    #[test]
+    fn a_good_check_of_the_same_kind_does_still_clear_it() {
+        // The other direction: supersession has to keep working, or a peer that
+        // was repaired reads FAILED forever.
+        let recs = vec![
+            detailed(
+                Kind::Subset,
+                Verdict::Bad,
+                NOW - 7200,
+                "pack 4f2a hash mismatch",
+            ),
+            rec(Kind::Subset, Verdict::Good, NOW - 3600),
+            rec(Kind::Backup, Verdict::Good, NOW - 300),
+            rec(Kind::Canary, Verdict::Good, NOW - 300),
+        ];
+        let r = &status(&cfg_with_peer(), &recs, NOW)[0];
+        assert_eq!(r.state, PeerState::Good, "{:?}", r.problem);
+    }
+
+    #[test]
+    fn supersession_is_decided_by_log_order_not_by_timestamp() {
+        // `verify` writes its subset and canary results inside the same second,
+        // and `now()` has one-second resolution. Comparing timestamps strictly
+        // left a same-second Bad-then-Good peer FAILED until the next run; the
+        // reverse order must not be resolved the reassuring way either.
+        let bad_then_good = vec![
+            detailed(
+                Kind::Subset,
+                Verdict::Bad,
+                NOW - 60,
+                "pack 4f2a hash mismatch",
+            ),
+            rec(Kind::Subset, Verdict::Good, NOW - 60),
+            rec(Kind::Backup, Verdict::Good, NOW - 60),
+            rec(Kind::Canary, Verdict::Good, NOW - 60),
+        ];
+        assert_eq!(
+            status(&cfg_with_peer(), &bad_then_good, NOW)[0].state,
+            PeerState::Good
+        );
+
+        let good_then_bad = vec![
+            rec(Kind::Subset, Verdict::Good, NOW - 60),
+            detailed(
+                Kind::Subset,
+                Verdict::Bad,
+                NOW - 60,
+                "pack 4f2a hash mismatch",
+            ),
+        ];
+        assert_eq!(
+            status(&cfg_with_peer(), &good_then_bad, NOW)[0].state,
+            PeerState::Bad
+        );
+    }
+
+    #[test]
+    fn a_future_dated_record_does_not_pin_a_peer_green() {
+        // The second critical finding. `now - at` saturates to zero for a record
+        // dated ahead, so it satisfied every window forever. One backup taken
+        // while the clock was ahead greened a peer permanently, even though
+        // every subsequent backup failed.
+        let recs = vec![
+            rec(Kind::Backup, Verdict::Good, NOW + 86400 * 365),
+            rec(Kind::Subset, Verdict::Good, NOW + 86400 * 365),
+            rec(Kind::Canary, Verdict::Good, NOW + 86400 * 365),
+        ];
+        let r = &status(&cfg_with_peer(), &recs, NOW)[0];
+        assert_eq!(r.state, PeerState::Unknown);
+        assert!(r.clock_skew, "the reason must be reportable");
+        assert_eq!(r.last_backup, None, "a future date is not a backup time");
+    }
+
+    #[test]
+    fn a_clock_set_backwards_does_not_green_every_peer() {
+        // The mirror case: correct records, a `now` behind them.
+        let recs = vec![
+            rec(Kind::Backup, Verdict::Good, NOW),
+            rec(Kind::Subset, Verdict::Good, NOW),
+            rec(Kind::Canary, Verdict::Good, NOW),
+        ];
+        let long_ago = NOW - 86400 * 365 * 5;
+        assert_eq!(
+            status(&cfg_with_peer(), &recs, long_ago)[0].state,
+            PeerState::Unknown
+        );
+    }
+
+    #[test]
+    fn a_future_dated_good_cannot_bury_a_real_bad() {
+        // Supersession by log order is what makes this safe: the Bad is written
+        // after the Good, so it stands, whatever the two timestamps say.
+        let recs = vec![
+            rec(Kind::Subset, Verdict::Good, NOW + 86400 * 365),
+            detailed(
+                Kind::Subset,
+                Verdict::Bad,
+                NOW - 60,
+                "pack 4f2a hash mismatch",
+            ),
+        ];
+        assert_eq!(
+            status(&cfg_with_peer(), &recs, NOW)[0].state,
+            PeerState::Bad
+        );
+    }
+
+    #[test]
+    fn a_small_clock_wobble_is_tolerated() {
+        // NTP correcting a few seconds must not read as a broken clock.
+        let recs = vec![
+            rec(Kind::Backup, Verdict::Good, NOW + 30),
+            rec(Kind::Subset, Verdict::Good, NOW + 30),
+            rec(Kind::Canary, Verdict::Good, NOW + 30),
+        ];
+        let r = &status(&cfg_with_peer(), &recs, NOW)[0];
+        assert_eq!(r.state, PeerState::Good);
+        assert!(!r.clock_skew);
+    }
+
+    #[test]
+    fn coverage_is_not_reported_once_the_check_behind_it_has_gone_stale() {
+        // `alice unchecked ... 100%` on one row reads as "all of it was read
+        // back and we are unsure about something else".
+        let recs = vec![rec(Kind::Subset, Verdict::Good, NOW - 86400 * 30)];
+        let r = &status(&cfg_with_peer(), &recs, NOW)[0];
+        assert_eq!(r.state, PeerState::Unknown);
+        assert_eq!(r.coverage_pct, None);
+    }
 
     #[test]
     fn all_checks_fresh_means_ok() {

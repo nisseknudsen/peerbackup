@@ -720,6 +720,17 @@ pub fn status_cmd() -> Res {
         println!("{}: {}", r.name, r.problem.as_ref().unwrap());
     }
 
+    // Said out loud rather than silently absorbed. The records are excluded from
+    // freshness, so the peer reads `unchecked` instead of green -- but a peer
+    // that reads `unchecked` for a reason that has nothing to do with the peer
+    // is exactly the sort of thing that gets ignored for a month.
+    for r in rows.iter().filter(|r| r.clock_skew) {
+        println!();
+        println!("{}: some results are dated in the future", r.name);
+        println!("  This machine's clock has been wrong. Those results are ignored,");
+        println!("  so run `peerbackup verify` once the clock is right.");
+    }
+
     // An unchecked peer usually just needs `verify`. But if its last attempt
     // failed, say so: "unchecked" alone reads as "nothing happened yet" when
     // the truth may be that every backup is being rejected.
@@ -1124,6 +1135,7 @@ mod tests {
             last_canary: None,
             coverage_pct: None,
             problem: None,
+            clock_skew: false,
         }
     }
 
