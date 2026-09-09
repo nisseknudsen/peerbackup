@@ -62,10 +62,16 @@ peerbackup connect - --source /srv/data < invite.txt
 
 ```sh
 # Host
+# Create the storage directory yourself, owned by you. If Docker creates it as
+# a missing bind-mount source it makes it root-owned, the container runs as
+# you, and the server dies on its first write -- after `docker run -d` has
+# already exited 0.
+mkdir -p /srv/peerbackup-data
+
 docker run -d --name peerbackup-rest --restart unless-stopped \
   --user "$(id -u):$(id -g)" -p 51515:8000 \
   -v /srv/peerbackup-data:/data \
-  -e OPTIONS="--private-repos --append-only" \
+  -e OPTIONS="--private-repos --append-only --max-size 536870912000" \
   restic/rest-server:0.14.0 \
   && docker exec -it peerbackup-rest create_user alice \
   && docker restart peerbackup-rest
@@ -264,6 +270,11 @@ WantedBy=timers.target
 `quickstart` is enough to get going. The rest of this section covers what you
 need for anything long-lived.
 
+`quickstart` and `docker compose` both name the container `peerbackup-rest`, so
+they are two ways to run the same server, not two servers. Moving from one to
+the other means `docker rm -f peerbackup-rest` first. `quickstart` also has no
+way to pass `PB_EXTRA_OPTIONS`, so TLS means using compose.
+
 ### TLS
 
 Backups are encrypted before upload, but the login password is sent with every
@@ -362,11 +373,20 @@ sudo systemctl daemon-reload && sudo systemctl enable --now peerbackup-rest
 
 Set `PB_UID` and `PB_GID` in the service file to your own user.
 
+The unit's `PB_DATA=/srv/peerbackup/mnt` assumes per-peer images. If you used
+`quickstart`, your data is somewhere else -- `~/.local/share/peerbackup-data` by
+default -- so change that line to match, or the service serves an empty
+directory on the same port.
+
 If you are using per-peer images, the service refuses to start when storage is
 not mounted. Without that check a boot where Docker wins the race would write to
 your root filesystem with no size limit, and the first symptom would be a full
 disk. Worth confirming once by masking a mount unit and rebooting; the service
 should fail.
+
+If you are not using them, `host guard` finds no grants, says so, and lets the
+service start. It used to refuse in that case, which meant anyone who had run
+`quickstart` installed a service that could never start.
 
 ### Maintenance windows
 
@@ -375,10 +395,15 @@ you open a window:
 
 ```sh
 docker compose down
+# Same storage and the same size limit as the real server. `$PB_DATA` is
+# whatever you set it to; with per-peer grants it is /srv/peerbackup/mnt, not
+# the quickstart default below. Point this at the wrong directory and your peer
+# connects to an empty server on the right port.
 docker run --rm -d --name peerbackup-maint \
   --user "$(id -u):$(id -g)" -p 51515:8000 \
-  -v ~/.local/share/peerbackup-data:/data \
-  -e OPTIONS="--private-repos" restic/rest-server:0.14.0
+  -v "${PB_DATA:-$HOME/.local/share/peerbackup-data}:/data" \
+  -e OPTIONS="--private-repos --max-size ${PB_MAX_SIZE:-536870912000}" \
+  restic/rest-server:0.14.0
 # peer runs their cleanup, then:
 docker rm -f peerbackup-maint
 docker compose up -d
