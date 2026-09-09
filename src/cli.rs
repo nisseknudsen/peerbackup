@@ -119,7 +119,7 @@ impl Runtime {
     /// failing a backup that actually succeeded would be its own lie.
     fn record(
         &self,
-        peer: &PeerName,
+        peer: &Peer,
         kind: Kind,
         verdict: Verdict,
         detail: Option<String>,
@@ -127,7 +127,10 @@ impl Runtime {
     ) -> Res {
         let r = Record {
             at: now(),
-            peer: peer.clone(),
+            peer: peer.name.clone(),
+            // Which repository this was about, so re-using a name for a
+            // different friend's server cannot inherit its history.
+            repo: Some(crate::state::repo_id(&peer.url)),
             kind,
             verdict,
             // Sanitised on the way in, so the log itself is clean rather than
@@ -142,9 +145,10 @@ impl Runtime {
         match Evidence::append_to(&self.evidence(), &r) {
             Ok(()) => Ok(()),
             Err(e) if verdict == Verdict::Bad => Err(format!(
-                "{peer} reported damage and it could not be recorded to {}: {e}\n  \
+                "{} reported damage and it could not be recorded to {}: {e}\n  \
                  The next `status` would call this peer healthy. Fix the state \
                  directory and re-run `peerbackup verify`.",
+                peer.name,
                 self.evidence().display()
             )),
             Err(e) => {
@@ -351,14 +355,14 @@ pub fn peer_add(name: &str, url: &str, ca_cert: Option<PathBuf>) -> Res {
     }
     println!("  matches");
 
-    cfg.peers.push(peer);
+    cfg.peers.push(peer.clone());
     cfg.save().map_err(err("could not save config"))?;
     // Only the canary. This round trip proves the peer is reachable, writable
     // and readable back byte-for-byte -- it does not prove any of your data is
     // there, because none of it was sent. Recording a Backup here made `status`
     // report a brand new peer as "backed up just now", which is the most
     // reassuring possible lie for this program to tell.
-    Runtime::from_env().record(&name, Kind::Canary, Verdict::Good, None, None)?;
+    Runtime::from_env().record(&peer, Kind::Canary, Verdict::Good, None, None)?;
 
     println!();
     println!("Peer '{name}' added and working.");
@@ -477,7 +481,7 @@ fn backup_in<E: BackupEngine>(
                 println!("  restic could not read everything it was asked to back up.");
                 println!("  Check the paths in `sources` and their permissions.");
                 rt.record(
-                    &peer.name,
+                    peer,
                     Kind::Backup,
                     Verdict::Unknown,
                     Some("restic could not read all sources".into()),
@@ -487,13 +491,13 @@ fn backup_in<E: BackupEngine>(
             }
             Ok(snap) => {
                 println!("done ({})", snap.id);
-                rt.record(&peer.name, Kind::Backup, Verdict::Good, None, None)?;
+                rt.record(peer, Kind::Backup, Verdict::Good, None, None)?;
             }
             Err(e) => {
                 println!("FAILED");
                 println!("  {e}");
                 rt.record(
-                    &peer.name,
+                    peer,
                     Kind::Backup,
                     Verdict::Unknown,
                     Some(e.to_string()),
@@ -564,7 +568,7 @@ fn verify_in<E: BackupEngine>(
         if let Some(cause) = engine.probe() {
             println!("  not reachable: {cause}");
             rt.record(
-                &peer.name,
+                peer,
                 Kind::Subset,
                 Verdict::Unknown,
                 Some(cause.to_string()),
@@ -578,31 +582,19 @@ fn verify_in<E: BackupEngine>(
         match engine.verify_subset(pct) {
             VerifyOutcome::Good { coverage_pct } => {
                 println!("ok");
-                rt.record(
-                    &peer.name,
-                    Kind::Subset,
-                    Verdict::Good,
-                    None,
-                    Some(coverage_pct),
-                )?;
+                rt.record(peer, Kind::Subset, Verdict::Good, None, Some(coverage_pct))?;
             }
             VerifyOutcome::Bad(c) => {
                 println!("FAILED");
                 println!("    {c}");
-                rt.record(
-                    &peer.name,
-                    Kind::Subset,
-                    Verdict::Bad,
-                    Some(c.to_string()),
-                    None,
-                )?;
+                rt.record(peer, Kind::Subset, Verdict::Bad, Some(c.to_string()), None)?;
                 bad += 1;
             }
             VerifyOutcome::Indeterminate(c) => {
                 println!("could not check");
                 println!("    {c}");
                 rt.record(
-                    &peer.name,
+                    peer,
                     Kind::Subset,
                     Verdict::Unknown,
                     Some(c.to_string()),
@@ -616,12 +608,12 @@ fn verify_in<E: BackupEngine>(
         match restore_canary(&engine, &canary) {
             CanaryCheck::Matches => {
                 println!("matches");
-                rt.record(&peer.name, Kind::Canary, Verdict::Good, None, None)?;
+                rt.record(peer, Kind::Canary, Verdict::Good, None, None)?;
             }
             CanaryCheck::DoesNotMatch => {
                 println!("DOES NOT MATCH");
                 rt.record(
-                    &peer.name,
+                    peer,
                     Kind::Canary,
                     Verdict::Bad,
                     Some("restored test file did not match what was sent".into()),
@@ -632,13 +624,13 @@ fn verify_in<E: BackupEngine>(
             CanaryCheck::Damaged(d) => {
                 println!("DAMAGED");
                 println!("    {d}");
-                rt.record(&peer.name, Kind::Canary, Verdict::Bad, Some(d), None)?;
+                rt.record(peer, Kind::Canary, Verdict::Bad, Some(d), None)?;
                 bad += 1;
             }
             CanaryCheck::CouldNotCheck(e) => {
                 println!("could not restore");
                 println!("    {e}");
-                rt.record(&peer.name, Kind::Canary, Verdict::Unknown, Some(e), None)?;
+                rt.record(peer, Kind::Canary, Verdict::Unknown, Some(e), None)?;
             }
         }
     }
