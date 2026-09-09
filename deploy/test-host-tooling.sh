@@ -80,16 +80,32 @@ else
   ok "accepted legitimate peer name 'friend-a_1'"
 fi
 
-hdr "guard: refuses to start when storage is not mounted"
+hdr "guard: refuses when a grant is not mounted, and only then"
 
-# 1. No grant directories at all: must refuse, not shrug.
+# 1. No grants and no images: this host does not use per-peer grants at all, so
+#    there is nothing for the guard to protect. It used to refuse here, which
+#    reads as fail-closed and is not: anyone who ran `host quickstart` has no
+#    grants by design, and installing the service unit gave them a service that
+#    could never start.
 # ${var:?} so an unset PEERBACKUP_ROOT aborts instead of rm -rf /mnt.
-rm -rf "${PEERBACKUP_ROOT:?}/mnt"; mkdir -p "$PEERBACKUP_ROOT/mnt"
+rm -rf "${PEERBACKUP_ROOT:?}/mnt" "${PEERBACKUP_ROOT:?}/images"
+mkdir -p "$PEERBACKUP_ROOT/mnt"
 if "${HOST[@]}" guard >/dev/null 2>&1; then
-  bad "guard PASSED with zero grants — would start a server with nothing mounted"
+  ok "guard lets a host with no grants start"
 else
-  ok "guard refuses when there are no grants"
+  bad "guard refused on a host that uses no per-peer grants"
 fi
+
+# 1b. An image with no mount under it is the case it is actually for: a grant was
+#     provisioned, so writes are expected to land inside it, and they would not.
+mkdir -p "$PEERBACKUP_ROOT/images"
+: > "$PEERBACKUP_ROOT/images/alice.img"
+if "${HOST[@]}" guard >/dev/null 2>&1; then
+  bad "guard PASSED with a provisioned image and nothing mounted"
+else
+  ok "guard refuses when a grant exists but is not mounted"
+fi
+rm -f "$PEERBACKUP_ROOT/images/alice.img"
 
 # 2. A grant directory that exists but is NOT a mountpoint. This is the exact
 #    boot race the guard exists for: bind mount resolves to the root filesystem.
