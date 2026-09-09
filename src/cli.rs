@@ -663,8 +663,15 @@ fn verify_in<E: BackupEngine>(
         //
         // The local record of what was sent is the one thing the host cannot
         // rewrite.
+        // Compared in short form. `backup` records the full 64-character id from
+        // restic's summary line, and `snapshots --json` reports `short_id` --
+        // so a direct comparison never matched and every verify reported the
+        // last backup as missing. The end-to-end suite caught it; the unit test
+        // did not, because the fake engine uses one id for both.
         if let Some(expected) = last_backup_snapshot(&history, peer)
-            && !listed.iter().any(|s| s.id.0 == expected)
+            && !listed
+                .iter()
+                .any(|s| s.id.short() == SnapshotId(expected.clone()).short())
         {
             println!("  MISSING: the backup recorded as {expected} is no longer there");
             rt.record(
@@ -1821,6 +1828,19 @@ mod tests {
     }
 
     #[test]
+    fn a_full_id_recorded_by_backup_matches_the_short_id_a_peer_lists() {
+        // restic's backup summary carries the full 64-character id; `snapshots
+        // --json` reports `short_id`, the first eight. Comparing them directly
+        // never matched, so every verify reported the last backup as missing --
+        // a false FAILED on a healthy peer, which the end-to-end suite caught
+        // and the unit tests did not, because the fake engine uses one id for
+        // both.
+        let full = "80aec4e00642cb0da6162c2d7bb17c6744bfa11caa0d393f7ebe7bdaf8e9bf58";
+        let short = SnapshotId("80aec4e0".into());
+        assert_eq!(short.short(), SnapshotId(full.to_owned()).short());
+    }
+
+    #[test]
     fn a_peer_that_dropped_a_backup_it_accepted_is_reported() {
         // Storage is append-only precisely so a compromised *client* cannot
         // erase its own history. Nothing checked that the host was holding up
@@ -1846,7 +1866,7 @@ mod tests {
         // The peer now lists something else entirely.
         let err = verify_in(&h.rt, &h.cfg, None, |_| FakeEngine {
             snapshots: vec![SnapshotMeta {
-                id: SnapshotId("rolledback".into()),
+                id: SnapshotId("dead0000".into()),
                 time: "2026-01-01T00:00:00Z".into(),
                 paths: vec![PathBuf::from("/srv/data")],
                 tags: vec![BACKUP_TAG.into()],
