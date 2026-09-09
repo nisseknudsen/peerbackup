@@ -76,6 +76,8 @@ hdr() { printf '\n\033[1m=== %s ===\033[0m\n' "$*"; }
 # PB_TEST_ROOT lets the caller put the work tree on a filesystem that really
 # preallocates. Without it we land on whatever /tmp is, which in a container is
 # overlayfs and cannot back a real quota.
+# shellcheck source=tests/lib/scratch.sh
+. "$(cd "$(dirname "$0")/.." && pwd)/tests/lib/scratch.sh"
 WORK=$(mktemp -d "${PB_TEST_ROOT:-/tmp}/pb-root-test-XXXXXX")
 # mktemp gives 0700; the server user has to be able to traverse to its grant.
 chmod 755 "$WORK"
@@ -252,9 +254,14 @@ if command -v setpriv >/dev/null 2>&1; then
     bad "the server user cannot write to the grant: $PROBE_ERR"
     ls -ld "$DIR" | sed 's/^/        /'
   fi
+else
+  # Silence here meant the section's one real assertion vanished on any runner
+  # without util-linux, and nothing said so.
+  skip "setpriv is not installed, so the server user's write access was not checked"
 fi
 
 hdr "the quota is real, not advisory"
+HOSTFREE_BEFORE=$(df -Pk "$WORK" | awk 'NR==2{print $4}')
 LIST=$($HOST list 2>&1)
 echo "$LIST" | sed 's/^/        /' | head -4
 # ext4 with -m 0 on 64M leaves roughly 50M usable after metadata.
@@ -273,8 +280,21 @@ if [ "$DDRC" -ne 0 ] && grep -qi 'no space' "$WORK/dd.out"; then
 else
   bad "writing 200M into a 64M grant did not fail with ENOSPC (rc=$DDRC)"
 fi
+# The real question is whether 200M of writes landed inside the grant or on the
+# host filesystem. Asserting only that `df` printed a number could not fail.
 HOSTFREE_AFTER=$(df -Pk "$WORK" | awk 'NR==2{print $4}')
-[ -n "$HOSTFREE_AFTER" ] && ok "host filesystem still reports free space (grant was contained)"
+if [ -z "$HOSTFREE_AFTER" ] || [ -z "${HOSTFREE_BEFORE:-}" ]; then
+  bad "could not read free space before and after, so containment was not checked"
+else
+  # The grant is 64M. Anything approaching the 200M we tried to write means the
+  # writes escaped it.
+  LOST=$(( HOSTFREE_BEFORE - HOSTFREE_AFTER ))
+  if [ "$LOST" -lt 102400 ]; then
+    ok "the host filesystem lost ${LOST}KiB, so the writes stayed inside the grant"
+  else
+    bad "the host filesystem lost ${LOST}KiB; the writes escaped the grant"
+  fi
+fi
 rm -f "$DIR/filler"
 
 hdr "release tears down in the right order"
@@ -318,9 +338,9 @@ if mountpoint -q "$DIR2"; then
   umount "$DIR2" 2>/dev/null || true
   losetup -D 2>/dev/null || true
 else
-  ok "skipped: could not mount second image"
+  skip "could not mount the second image, so the ordering check did not run"
 fi
 
 hdr "Summary"
-printf '  passed: %d   failed: %d\n' "$PASS" "$FAIL"
+printf '  passed: %d   failed: %d   skipped: %d\n' "$PASS" "$FAIL" "$SKIP"
 [ "$FAIL" -eq 0 ] || exit 1
