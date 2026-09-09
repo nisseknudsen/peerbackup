@@ -136,6 +136,19 @@ impl Runtime {
         detail: Option<String>,
         cov: Option<u8>,
     ) -> Res {
+        self.record_snapshot(peer, kind, verdict, detail, cov, None)
+    }
+
+    /// The same, naming the snapshot the record is about.
+    fn record_snapshot(
+        &self,
+        peer: &Peer,
+        kind: Kind,
+        verdict: Verdict,
+        detail: Option<String>,
+        cov: Option<u8>,
+        snapshot: Option<String>,
+    ) -> Res {
         let r = Record {
             at: now(),
             peer: peer.name.clone(),
@@ -151,7 +164,7 @@ impl Runtime {
             // source paths verbatim, bytes a peer chose.
             detail: detail.as_deref().map(redact::detail),
             coverage_pct: cov,
-            snapshot: None,
+            snapshot,
         };
         match Evidence::append_to(&self.evidence(), &r) {
             Ok(()) => Ok(()),
@@ -502,7 +515,18 @@ fn backup_in<E: BackupEngine>(
             }
             Ok(snap) => {
                 println!("done ({})", snap.id);
-                rt.record(peer, Kind::Backup, Verdict::Good, None, None)?;
+                // The id is kept so `verify` can ask the peer whether it still
+                // has it. Storage is append-only so that a compromised client
+                // cannot erase its own history; nothing checked that the *host*
+                // was holding up their end.
+                rt.record_snapshot(
+                    peer,
+                    Kind::Backup,
+                    Verdict::Good,
+                    None,
+                    None,
+                    Some(snap.id.0.clone()),
+                )?;
             }
             Err(e) => {
                 println!("FAILED");
@@ -568,6 +592,9 @@ fn verify_in<E: BackupEngine>(
     let canary =
         Canary::load_at(&rt.canary_manifest()).map_err(err("could not read the canary"))?;
     let pct = cfg.settings.verify_subset_pct;
+    // Read once, before anything is written this run, so the "last backup" it
+    // reports is the last one from a previous run.
+    let history = Evidence::read(&rt.evidence(), 0, &[]).records;
     let mut bad = 0;
     // Something was actually read back and found correct. Without this, a run in
     // which every peer was unreachable returned `Ok` -- and the README says
@@ -598,7 +625,7 @@ fn verify_in<E: BackupEngine>(
         // to read. That was recorded as `Subset/Good` with the full requested
         // coverage, so `status` showed a read-back percentage for a peer holding
         // none of the user's data. Checking nothing is not a successful check.
-        match engine.list_snapshots() {
+        let listed = match engine.list_snapshots() {
             Ok(s) if s.is_empty() => {
                 println!("  holds no backups yet, so there is nothing to check");
                 rt.record(
@@ -610,7 +637,7 @@ fn verify_in<E: BackupEngine>(
                 )?;
                 continue;
             }
-            Ok(_) => {}
+            Ok(s) => s,
             Err(e) => {
                 println!("  could not list what is stored: {e}");
                 rt.record(
@@ -622,6 +649,42 @@ fn verify_in<E: BackupEngine>(
                 )?;
                 continue;
             }
+        };
+
+        // Does the peer still hold the last backup it accepted?
+        //
+        // Storage is append-only precisely so a compromised *client* cannot
+        // erase its own history. Nothing checked that the host was holding up
+        // their end: a host who restored their disk from an old image, or who
+        // reverted the repository deliberately, passed every check this program
+        // makes. `restic check` finds an old repository internally consistent,
+        // the canary is unchanged so it still restores, and `status` reads only
+        // local records -- which still say a backup succeeded this morning.
+        //
+        // The local record of what was sent is the one thing the host cannot
+        // rewrite.
+        // Compared in short form. `backup` records the full 64-character id from
+        // restic's summary line, and `snapshots --json` reports `short_id` --
+        // so a direct comparison never matched and every verify reported the
+        // last backup as missing. The end-to-end suite caught it; the unit test
+        // did not, because the fake engine uses one id for both.
+        if let Some(expected) = last_backup_snapshot(&history, peer)
+            && !listed
+                .iter()
+                .any(|s| s.id.short() == SnapshotId(expected.clone()).short())
+        {
+            println!("  MISSING: the backup recorded as {expected} is no longer there");
+            rt.record(
+                peer,
+                Kind::Backup,
+                Verdict::Bad,
+                Some(format!(
+                    "the peer no longer lists snapshot {expected}, which it accepted \
+                     from us. Storage is append-only, so it should still be there."
+                )),
+                None,
+            )?;
+            bad += 1;
         }
 
         print!("  checking {pct}% of the stored data... ");
@@ -748,6 +811,26 @@ impl From<String> for VerifyFailure {
     fn from(s: String) -> Self {
         Self::Damage(s)
     }
+}
+
+/// The snapshot id of the most recent successful backup to this peer, if the
+/// evidence log records one.
+///
+/// Matched on the repository id as well as the name, so a peer whose URL now
+/// points somewhere else is not asked for a snapshot a different server made.
+fn last_backup_snapshot(records: &[Record], peer: &Peer) -> Option<String> {
+    let id = crate::state::repo_id(&peer.url);
+    records
+        .iter()
+        .rev()
+        .find(|r| {
+            r.peer == peer.name
+                && r.kind == Kind::Backup
+                && r.verdict == Verdict::Good
+                && r.repo.as_deref() == Some(id.as_str())
+                && r.snapshot.is_some()
+        })
+        .and_then(|r| r.snapshot.clone())
 }
 
 /// What restoring the test file told us. Three states, like every other check
@@ -1742,6 +1825,116 @@ mod tests {
         assert!(err.contains("2 of 2"), "both peers must fail: {err}");
         assert_eq!(records(&h).len(), 2);
         assert!(records(&h).iter().all(|r| r.verdict == Verdict::Unknown));
+    }
+
+    #[test]
+    fn a_full_id_recorded_by_backup_matches_the_short_id_a_peer_lists() {
+        // restic's backup summary carries the full 64-character id; `snapshots
+        // --json` reports `short_id`, the first eight. Comparing them directly
+        // never matched, so every verify reported the last backup as missing --
+        // a false FAILED on a healthy peer, which the end-to-end suite caught
+        // and the unit tests did not, because the fake engine uses one id for
+        // both.
+        let full = "80aec4e00642cb0da6162c2d7bb17c6744bfa11caa0d393f7ebe7bdaf8e9bf58";
+        let short = SnapshotId("80aec4e0".into());
+        assert_eq!(short.short(), SnapshotId(full.to_owned()).short());
+    }
+
+    #[test]
+    fn a_peer_that_dropped_a_backup_it_accepted_is_reported() {
+        // Storage is append-only precisely so a compromised *client* cannot
+        // erase its own history. Nothing checked that the host was holding up
+        // their end: a host who restored their disk from an old image, or who
+        // reverted the repository deliberately, passed every check this program
+        // makes. `restic check` finds an old repository internally consistent,
+        // the canary never changes so it still restores, and `status` reads only
+        // local records -- which still say a backup succeeded this morning.
+        let h = harness("dropped");
+        Canary::create_at(&h.rt.canary_dir(), &h.rt.canary_manifest()).unwrap();
+
+        // A backup that succeeded, recorded with its id.
+        backup_in(&h.rt, &h.cfg, None, |_| {
+            FakeEngine::always(VerifyOutcome::Good { coverage_pct: 1 })
+        })
+        .unwrap();
+        let sent = records(&h)
+            .into_iter()
+            .find(|r| r.kind == Kind::Backup)
+            .and_then(|r| r.snapshot)
+            .expect("backup must record which snapshot it made");
+
+        // The peer now lists something else entirely.
+        let err = verify_in(&h.rt, &h.cfg, None, |_| FakeEngine {
+            snapshots: vec![SnapshotMeta {
+                id: SnapshotId("dead0000".into()),
+                time: "2026-01-01T00:00:00Z".into(),
+                paths: vec![PathBuf::from("/srv/data")],
+                tags: vec![BACKUP_TAG.into()],
+            }],
+            ..FakeEngine::always(VerifyOutcome::Good { coverage_pct: 1 })
+        })
+        .unwrap_err();
+        assert_eq!(err.code(), 1, "this is observed loss, not an unknown");
+
+        let dropped = records(&h)
+            .into_iter()
+            .rfind(|r| r.kind == Kind::Backup && r.verdict == Verdict::Bad)
+            .expect("the loss must be recorded");
+        assert!(
+            dropped.detail.unwrap().contains(&sent),
+            "must name the snapshot that went missing"
+        );
+    }
+
+    #[test]
+    fn a_peer_that_still_holds_it_is_not_reported() {
+        // The direction that has to keep working. `FakeEngine`'s default
+        // snapshot id is what `backup` recorded, so nothing is missing.
+        let h = harness("stillthere");
+        Canary::create_at(&h.rt.canary_dir(), &h.rt.canary_manifest()).unwrap();
+        backup_in(&h.rt, &h.cfg, None, |_| {
+            FakeEngine::always(VerifyOutcome::Good { coverage_pct: 1 })
+        })
+        .unwrap();
+        verify_in(&h.rt, &h.cfg, None, |_| {
+            FakeEngine::always(VerifyOutcome::Good { coverage_pct: 1 })
+        })
+        .unwrap();
+        assert!(
+            records(&h).iter().all(|r| r.verdict != Verdict::Bad),
+            "a peer holding what it was sent is not a problem"
+        );
+    }
+
+    #[test]
+    fn a_snapshot_sent_to_a_different_repository_is_not_demanded() {
+        // The id is matched on the repository as well as the name, so a peer
+        // whose URL now points elsewhere is not asked for a snapshot a different
+        // server made.
+        let h = harness("otherrepo");
+        let mut moved = Peer {
+            name: pn("alice"),
+            url: "rest:http://somewhere-else/alice/".into(),
+            ca_cert: None,
+        };
+        let recs = vec![Record {
+            at: now(),
+            peer: pn("alice"),
+            repo: Some(crate::state::repo_id("rest:http://the-old-one/alice/")),
+            kind: Kind::Backup,
+            verdict: Verdict::Good,
+            detail: None,
+            coverage_pct: None,
+            snapshot: Some("longgone".into()),
+        }];
+        assert_eq!(last_backup_snapshot(&recs, &moved), None);
+
+        moved.url = "rest:http://the-old-one/alice/".into();
+        assert_eq!(
+            last_backup_snapshot(&recs, &moved).as_deref(),
+            Some("longgone")
+        );
+        drop(h);
     }
 
     // ---------------------------------------------------------- restore choice

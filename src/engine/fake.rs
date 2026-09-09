@@ -53,6 +53,15 @@ pub struct FakeEngine {
     pub calls: Rc<RefCell<Vec<String>>>,
 }
 
+/// The id `snapshot` reports, in the shape restic uses.
+///
+/// restic's `backup --json` summary carries the full 64-character id, while
+/// `snapshots --json` reports `short_id`, the first eight. The fake used one
+/// value for both, which is why a comparison that could never match passed every
+/// unit test and failed the end-to-end suite.
+const FAKE_FULL_ID: &str = "fake0001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const FAKE_SHORT_ID: &str = "fake0001";
+
 impl FakeEngine {
     pub fn always(outcome: VerifyOutcome) -> Self {
         Self {
@@ -61,7 +70,7 @@ impl FakeEngine {
             probe_result: None,
             restored_digest: None,
             snapshots: vec![SnapshotMeta {
-                id: SnapshotId("fake0001".into()),
+                id: SnapshotId(FAKE_SHORT_ID.into()),
                 time: "2026-07-01T10:00:00Z".into(),
                 paths: vec![PathBuf::from("/srv/data")],
                 tags: vec!["peerbackup".into()],
@@ -92,7 +101,7 @@ impl FakeEngine {
     pub fn incomplete_snapshot() -> Self {
         Self {
             snapshot_result: Some(Ok(Snapshot {
-                id: SnapshotId("fake0001".into()),
+                id: SnapshotId(FAKE_FULL_ID.into()),
                 incomplete: true,
             })),
             ..Self::always(VerifyOutcome::Good { coverage_pct: 1 })
@@ -110,7 +119,7 @@ impl BackupEngine for FakeEngine {
         match &self.snapshot_result {
             Some(r) => r.clone(),
             None => Ok(Snapshot {
-                id: SnapshotId("fake0001".into()),
+                id: SnapshotId(FAKE_FULL_ID.into()),
                 incomplete: false,
             }),
         }

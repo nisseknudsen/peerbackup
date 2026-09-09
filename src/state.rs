@@ -252,6 +252,12 @@ pub struct Record {
     pub detail: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub coverage_pct: Option<u8>,
+    /// The snapshot this record is about, when there is one.
+    ///
+    /// Written by `backup`, read by `verify`: a peer that no longer lists a
+    /// snapshot it accepted has dropped data it acknowledged, and nothing else
+    /// in this program would notice. Storage is append-only precisely so that
+    /// cannot happen, so it happening is worth reporting.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshot: Option<String>,
 }
