@@ -8,7 +8,7 @@ use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
-use super::outcome::{Cause, VerifyOutcome};
+use super::outcome::{Cause, Corruption, VerifyOutcome};
 use super::{
     BackupEngine, EngineError, RestoredFile, Snapshot, SnapshotId, SnapshotMeta, SnapshotOpts,
 };
@@ -28,6 +28,10 @@ pub struct FakeEngine {
     pub restored_digest: Option<String>,
     /// What `list_snapshots` answers. A canary restore needs one to pick.
     pub snapshots: Vec<SnapshotMeta>,
+    /// Makes `restore_path` fail the way a repository with a corrupt pack does:
+    /// an `EngineError` carrying `damage`. That path had no coverage at all,
+    /// which is how it came to record `Unknown` for observed corruption.
+    pub restore_damage: Option<Corruption>,
     /// Every operation asked of this engine, in order.
     ///
     /// Shared rather than owned so a test can keep a handle to the log while
@@ -51,6 +55,7 @@ impl FakeEngine {
                 paths: vec![PathBuf::from("/srv/data")],
                 tags: vec!["peerbackup".into()],
             }],
+            restore_damage: None,
             calls: Rc::new(RefCell::new(Vec::new())),
         }
     }
@@ -108,6 +113,16 @@ impl BackupEngine for FakeEngine {
         self.calls
             .borrow_mut()
             .push(format!("restore_path({snapshot}, {})", path.display()));
+        if let Some(d) = &self.restore_damage {
+            return Err(EngineError {
+                message: format!("Fatal: {d}"),
+                exit_code: Some(1),
+                cause: Cause::Unclassified {
+                    detail: d.to_string(),
+                },
+                damage: Some(d.clone()),
+            });
+        }
         let sha256 = self.restored_digest.clone().unwrap_or_else(|| {
             std::fs::read(path).map_or_else(|_| "0".repeat(64), |b| crate::state::sha256_bytes(&b))
         });

@@ -86,6 +86,7 @@ impl ResticEngine {
                 cause: Cause::Unclassified {
                     detail: e.to_string(),
                 },
+                damage: None,
             }),
             Ok(None) => {
                 let secs = timeout.map(|d| d.as_secs()).unwrap_or(0);
@@ -93,6 +94,7 @@ impl ResticEngine {
                     message: format!("restic did not finish within {secs}s and was killed"),
                     exit_code: None,
                     cause: Cause::TimedOut { after_secs: secs },
+                    damage: None,
                 })
             }
             Ok(Some(out)) if out.status.success() => Ok(out),
@@ -109,13 +111,18 @@ impl ResticEngine {
     fn to_engine_error(&self, out: &Output) -> EngineError {
         let combined = combined_output(out);
         let code = out.status.code();
-        let cause = match classify(code.unwrap_or(-1), &combined) {
-            // Damage found during a backup or restore is still an operational
-            // failure here; the damage verdict belongs to verification.
-            Classified::Damage(d) => Cause::Unclassified {
-                detail: d.to_string(),
-            },
-            Classified::NoVerdict(c) => c,
+        let (cause, damage) = match classify(code.unwrap_or(-1), &combined) {
+            // The operation still failed, so `cause` keeps saying so -- but the
+            // damage verdict travels with it now instead of being discarded.
+            // The canary restore is the one place peerbackup reads bytes back
+            // and compares them, and it goes through here.
+            Classified::Damage(d) => (
+                Cause::Unclassified {
+                    detail: d.to_string(),
+                },
+                Some(d),
+            ),
+            Classified::NoVerdict(c) => (c, None),
         };
         EngineError {
             // restic writes `Fatal: create repository at
@@ -125,6 +132,7 @@ impl ResticEngine {
             message: crate::redact::message(&strip_go_trace(&combined)),
             exit_code: code,
             cause,
+            damage,
         }
     }
 }
@@ -169,6 +177,7 @@ impl BackupEngine for ResticEngine {
                 cause: Cause::Unclassified {
                     detail: "no snapshot_id in the --json summary".into(),
                 },
+                damage: None,
             }
         })?;
         Ok(Snapshot {
@@ -203,6 +212,7 @@ impl BackupEngine for ResticEngine {
             cause: Cause::Unclassified {
                 detail: e.to_string(),
             },
+            damage: None,
         };
         let bytes = std::fs::metadata(&landed).map_err(io_err)?.len();
         let sha256 = sha256_file(&landed).map_err(io_err)?;
@@ -283,6 +293,7 @@ impl BackupEngine for ResticEngine {
             cause: Cause::Unclassified {
                 detail: e.to_string(),
             },
+            damage: None,
         })
     }
 }

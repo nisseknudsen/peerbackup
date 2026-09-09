@@ -597,11 +597,11 @@ fn verify_in<E: BackupEngine>(
         print!("  restoring a test file... ");
         io::stdout().flush().ok();
         match restore_canary(&engine, &canary) {
-            Ok(true) => {
+            CanaryCheck::Matches => {
                 println!("matches");
                 rt.record(&peer.name, Kind::Canary, Verdict::Good, None, None)?;
             }
-            Ok(false) => {
+            CanaryCheck::DoesNotMatch => {
                 println!("DOES NOT MATCH");
                 rt.record(
                     &peer.name,
@@ -612,7 +612,13 @@ fn verify_in<E: BackupEngine>(
                 )?;
                 bad += 1;
             }
-            Err(e) => {
+            CanaryCheck::Damaged(d) => {
+                println!("DAMAGED");
+                println!("    {d}");
+                rt.record(&peer.name, Kind::Canary, Verdict::Bad, Some(d), None)?;
+                bad += 1;
+            }
+            CanaryCheck::CouldNotCheck(e) => {
                 println!("could not restore");
                 println!("    {e}");
                 rt.record(&peer.name, Kind::Canary, Verdict::Unknown, Some(e), None)?;
@@ -628,19 +634,58 @@ fn verify_in<E: BackupEngine>(
     Ok(())
 }
 
-fn restore_canary(engine: &impl BackupEngine, canary: &Canary) -> Result<bool, String> {
-    let file = canary.first().ok_or("the canary is empty")?;
-    let latest = engine
-        .list_snapshots()
-        .map_err(|e| e.to_string())?
-        .into_iter()
-        .next()
-        .ok_or("no snapshots on this peer yet")?;
-    let tmp = Scratch::new("verify")?;
-    let got = engine
-        .restore_path(&latest.id, &file.path, tmp.path())
-        .map_err(|e| e.to_string())?;
-    Ok(got.sha256 == file.sha256)
+/// What restoring the test file told us. Three states, like every other check
+/// here, because "could not restore it" and "restored it and it was wrong" are
+/// different facts about the peer's data.
+enum CanaryCheck {
+    Matches,
+    DoesNotMatch,
+    /// restic reported damage while fetching it: a pack that did not hash to its
+    /// id, a blob that failed authentication, data the repository references and
+    /// does not have. Evidence about the bytes, not about the connection.
+    Damaged(String),
+    CouldNotCheck(String),
+}
+
+/// Restore the test file and compare it against the digest recorded when it was
+/// created.
+///
+/// This is the only place peerbackup reads real bytes back out of a peer and
+/// checks them, which makes it half of verification -- and it is why an
+/// `EngineError` arriving here with `damage` set has to become a `Bad` verdict
+/// rather than an "we could not check". Reported as `Unknown`, a repository with
+/// a corrupt pack holding the canary produced `could not restore`, exit 0, and a
+/// peer that read `unchecked` forever while restic had already said the data was
+/// wrong.
+fn restore_canary(engine: &impl BackupEngine, canary: &Canary) -> CanaryCheck {
+    let Some(file) = canary.first() else {
+        return CanaryCheck::CouldNotCheck("the canary is empty".into());
+    };
+    let latest = match engine.list_snapshots() {
+        Ok(s) => match s.into_iter().next() {
+            Some(s) => s,
+            None => {
+                return CanaryCheck::CouldNotCheck("no snapshots on this peer yet".into());
+            }
+        },
+        Err(e) => return from_engine_error(&e),
+    };
+    let tmp = match Scratch::new("verify") {
+        Ok(t) => t,
+        Err(e) => return CanaryCheck::CouldNotCheck(e),
+    };
+    match engine.restore_path(&latest.id, &file.path, tmp.path()) {
+        Ok(got) if got.sha256 == file.sha256 => CanaryCheck::Matches,
+        Ok(_) => CanaryCheck::DoesNotMatch,
+        Err(e) => from_engine_error(&e),
+    }
+}
+
+fn from_engine_error(e: &crate::engine::EngineError) -> CanaryCheck {
+    match &e.damage {
+        Some(d) => CanaryCheck::Damaged(d.to_string()),
+        None => CanaryCheck::CouldNotCheck(e.to_string()),
+    }
 }
 
 // --------------------------------------------------------------------- status
@@ -1248,6 +1293,7 @@ mod tests {
             message: "server out of space".into(),
             exit_code: Some(1),
             cause: Cause::OutOfSpace,
+            damage: None,
         };
         assert!(
             backup_in(&h.rt, &h.cfg, None, |_| FakeEngine::failing_snapshot(
@@ -1381,6 +1427,52 @@ mod tests {
             .find(|r| r.kind == Kind::Canary)
             .unwrap();
         assert_eq!(canary.verdict, Verdict::Bad);
+    }
+
+    #[test]
+    fn corruption_found_while_restoring_the_test_file_is_damage_not_a_missed_check() {
+        // The canary restore is the only place peerbackup reads real bytes back
+        // and compares them, so it is half of verification -- but damage found
+        // there was relabelled `Unclassified` at the engine seam, recorded as
+        // `Unknown`, and `verify` exited 0. A repository with a corrupt pack
+        // holding the canary read `unchecked` forever while restic had already
+        // said the data was wrong.
+        let h = harness("canarydamage");
+        Canary::create_at(&h.rt.canary_dir(), &h.rt.canary_manifest()).unwrap();
+        let err = verify_in(&h.rt, &h.cfg, None, |_| FakeEngine {
+            restore_damage: Some(Corruption::PackHashMismatch {
+                pack: "4f2a1b3c".into(),
+            }),
+            ..FakeEngine::always(VerifyOutcome::Good { coverage_pct: 1 })
+        })
+        .unwrap_err();
+        assert!(err.contains("failed"), "verify must not exit 0: {err}");
+
+        let canary = records(&h)
+            .into_iter()
+            .find(|r| r.kind == Kind::Canary)
+            .unwrap();
+        assert_eq!(canary.verdict, Verdict::Bad, "observed damage is Bad");
+        assert!(
+            canary.detail.unwrap().contains("4f2a1b3c"),
+            "must name what restic found"
+        );
+    }
+
+    #[test]
+    fn a_peer_that_merely_will_not_answer_is_still_not_damage() {
+        // The other direction, and the one that matters most: a failure to
+        // reach the peer must never age into "your backup is corrupt".
+        let h = harness("canaryunreach");
+        Canary::create_at(&h.rt.canary_dir(), &h.rt.canary_manifest()).unwrap();
+        verify_in(&h.rt, &h.cfg, None, |_| {
+            FakeEngine::unreachable("connection refused")
+        })
+        .unwrap();
+        assert!(
+            records(&h).iter().all(|r| r.verdict != Verdict::Bad),
+            "nothing here is evidence about the data"
+        );
     }
 
     // ---------------------------------------------------------- restore choice
