@@ -13,6 +13,8 @@ set -uo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(cd "$HERE/.." && pwd)"
+# shellcheck source=tests/lib/scratch.sh
+. "$REPO/tests/lib/scratch.sh"
 PB_BIN="${PB_BIN:-$REPO/target/debug/peerbackup}"
 # Unquoted at call sites: a command plus its subcommand.
 PB_HOST="$PB_BIN host"
@@ -37,7 +39,9 @@ docker info >/dev/null 2>&1 || { echo "docker daemon not reachable"; exit 1; }
 
 hdr "bring up the stack"
 cleanup
-rm -rf "$PB_ROOT"; mkdir -p "$PB_ROOT/mnt/alice" "$PB_ROOT/mnt/bob" "$PB_ROOT/src"
+scratch_claim "$PB_ROOT" || exit 1
+rm -rf "${PB_ROOT:?}"; mkdir -p "$PB_ROOT/mnt/alice" "$PB_ROOT/mnt/bob" "$PB_ROOT/src"
+scratch_claim "$PB_ROOT" || exit 1
 echo "peerbackup e2e payload" > "$PB_ROOT/src/f.txt"
 
 docker compose -f "$HERE/../compose.yml" config >/dev/null 2>&1 \

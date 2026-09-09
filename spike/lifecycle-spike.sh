@@ -19,7 +19,12 @@
 
 set -uo pipefail
 
+# shellcheck source=tests/lib/scratch.sh
+. "$(cd "$(dirname "$0")/.." && pwd)/tests/lib/scratch.sh"
+# Takes a directory as $1 and wipes it, and CI runs this under sudo:
+# `sudo ./spike/lifecycle-spike.sh /` was `rm -rf /`.
 WORK="${1:-/tmp/pb-spike}"
+scratch_claim "$WORK" || exit 1
 RESTIC="${RESTIC_BIN:-restic}"
 IMAGE="restic/rest-server:0.14.0"
 PORT="${PORT:-8000}"
@@ -80,7 +85,8 @@ if [ "${REUSE_DATA:-0}" = "1" ] && [ -d "$SRC" ]; then
   rm -rf "$SRV" "$OUT"; mkdir -p "$SRV" "$OUT"
   SKIP_GEN=1
 else
-  rm -rf "$WORK"; mkdir -p "$SRC" "$SRV" "$OUT"
+  rm -rf "${WORK:?}"; mkdir -p "$SRC" "$SRV" "$OUT"
+  scratch_claim "$WORK" || exit 1
   SKIP_GEN=0
 fi
 : > "$LOG"

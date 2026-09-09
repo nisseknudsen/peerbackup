@@ -7,6 +7,8 @@
 
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
+# shellcheck source=tests/lib/scratch.sh
+. "$HERE/tests/lib/scratch.sh"
 WORK="${WORK:-/tmp/pb-docker-e2e}"
 PORT="${PORT:-8023}"
 SERVER=peerbackup-rest   # the name compose.host.yml uses
@@ -41,8 +43,12 @@ pb() {
 }
 
 hdr "setup"
+# Before the first rm -rf, and before cleanup's root container gets near it:
+# WORK comes from the environment, and this suite wipes it as root.
+scratch_claim "$WORK" || exit 1
 cleanup
-rm -rf "$WORK"; mkdir -p "$WORK"/{cfg,state,srv,data,other}
+rm -rf "${WORK:?}"; mkdir -p "$WORK"/{cfg,state,srv,data,other}
+scratch_claim "$WORK" || exit 1
 echo "in the mounted directory" > "$WORK/data/kept.txt"
 echo "in the unmounted one"     > "$WORK/other/missed.txt"
 

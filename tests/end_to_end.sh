@@ -7,6 +7,8 @@
 
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
+# shellcheck source=tests/lib/scratch.sh
+. "$HERE/tests/lib/scratch.sh"
 RESTIC="${RESTIC_BIN:-restic}"
 BIN="${PEERBACKUP_BIN:-$HERE/target/debug/peerbackup}"
 WORK="${WORK:-/tmp/pb-e2e-client}"
@@ -36,7 +38,9 @@ export PEERBACKUP_VERIFY_TIMEOUT=120
 
 hdr "setup"
 cleanup
-rm -rf "$WORK"; mkdir -p "$WORK"/{cfg,state,srv,data}
+scratch_claim "$WORK" || exit 1
+rm -rf "${WORK:?}"; mkdir -p "$WORK"/{cfg,state,srv,data}
+scratch_claim "$WORK" || exit 1
 echo "the file that matters" > "$WORK/data/notes.txt"
 head -c 3000000 /dev/urandom > "$WORK/data/photo.bin"
 ORIGINAL_SHA=$(sha256sum "$WORK/data/photo.bin" | awk '{print $1}')
