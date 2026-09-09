@@ -71,16 +71,50 @@ pub struct Ctx {
     pub force: bool,
 }
 
+/// Read a boolean environment variable, refusing anything ambiguous.
+///
+/// This matched the literal string `"1"` and treated everything else as false,
+/// so `DRY_RUN=true peerbackup host provision alice 500G` allocated 500GB,
+/// formatted it and mounted it. For a switch whose entire job is to prevent
+/// that, silently reading an unrecognised value as "no" is the wrong default;
+/// saying so is cheap.
+fn env_flag(key: &str) -> Result<bool, String> {
+    let Some(v) = std::env::var_os(key) else {
+        return Ok(false);
+    };
+    match v.to_string_lossy().trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "" | "0" | "false" | "no" | "off" => Ok(false),
+        other => Err(format!(
+            "{key}={other} is not a yes or a no. Use 1/true/yes/on or 0/false/no/off."
+        )),
+    }
+}
+
+/// The two switches that change whether a `host` command is safe, passed on the
+/// command line.
+///
+/// They are flags rather than only environment variables because every command
+/// that needs them also needs root, and `sudo` resets the environment by
+/// default. `DRY_RUN=1 sudo peerbackup host provision alice 500G` -- the ordering
+/// almost everyone types -- dropped the variable and performed a real 500GB
+/// provision. Nothing in the code or the docs said the safe form was
+/// `sudo DRY_RUN=1 peerbackup ...`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Flags {
+    pub dry_run: bool,
+    pub force: bool,
+}
+
 impl Ctx {
-    pub fn from_env() -> Self {
+    pub fn from_env(flags: Flags) -> Result<Self, String> {
         let env_num = |k: &str, d: u64| {
             std::env::var(k)
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(d)
         };
-        let flag = |k: &str| std::env::var(k).is_ok_and(|v| v == "1");
-        Self {
+        Ok(Self {
             root: std::env::var_os("PEERBACKUP_ROOT")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("/srv/peerbackup")),
@@ -89,10 +123,19 @@ impl Ctx {
                 .unwrap_or_else(|| PathBuf::from("/etc/systemd/system")),
             reserve_pct: env_num("MAINTENANCE_RESERVE_PCT", 15),
             host_margin_gb: env_num("HOST_MARGIN_GB", 20),
-            dry_run: flag("DRY_RUN"),
-            quiet: flag("QUIET"),
-            force: flag("FORCE"),
-        }
+            // `DRY_RUN` keeps working: it fails in the safe direction, so an
+            // ambient one costs someone a command that did not happen.
+            dry_run: flags.dry_run || env_flag("DRY_RUN")?,
+            quiet: env_flag("QUIET")?,
+            // The bare `FORCE` is deliberately *not* read any more. It was the
+            // only way to skip the confirmation on the command that permanently
+            // destroys a friend's backups, it is undocumented, and it is a
+            // common shell habit exported by plenty of build and deploy scripts
+            // -- so `sudo -E peerbackup host release alice` from the wrong shell
+            // destroyed 500GB with no prompt. A switch that fails in the unsafe
+            // direction has to be asked for by name.
+            force: flags.force || env_flag("PB_FORCE")?,
+        })
     }
 
     pub fn images(&self) -> PathBuf {
@@ -393,5 +436,69 @@ mod tests {
         // `release` calls this for `systemctl disable` and `losetup -d`, and a
         // grant that was never enabled must still be releasable.
         ctx(false).run_best_effort("sh", &["-c", "exit 1"]);
+    }
+
+    #[test]
+    fn a_boolean_env_var_that_is_not_a_yes_or_a_no_is_refused() {
+        // This matched the literal string "1", so `DRY_RUN=true peerbackup host
+        // provision alice 500G` really allocated, formatted and mounted 500GB.
+        // For a switch whose entire job is to prevent that, reading an
+        // unrecognised value as "no" is the wrong default.
+        //
+        // Uses a variable name no other test touches: `std::env::set_var` is
+        // unsafe in edition 2024 because it races every concurrent reader in
+        // this binary.
+        let key = "PB_TEST_FLAG_PARSE";
+        for (v, want) in [
+            ("1", Some(true)),
+            ("true", Some(true)),
+            ("TRUE", Some(true)),
+            ("yes", Some(true)),
+            ("on", Some(true)),
+            ("0", Some(false)),
+            ("false", Some(false)),
+            ("no", Some(false)),
+            ("", Some(false)),
+            ("maybe", None),
+            ("2", None),
+        ] {
+            // SAFETY: this key is used by no other test and by no other thread.
+            unsafe { std::env::set_var(key, v) };
+            match want {
+                Some(b) => assert_eq!(env_flag(key).unwrap(), b, "{v:?}"),
+                None => assert!(env_flag(key).is_err(), "{v:?} must be refused"),
+            }
+        }
+        // SAFETY: as above.
+        unsafe { std::env::remove_var(key) };
+        assert!(!env_flag(key).unwrap(), "unset is a no");
+    }
+
+    #[test]
+    fn the_command_line_can_ask_for_a_dry_run_and_for_force() {
+        // Every command that needs these also needs root, and sudo resets the
+        // environment, so `DRY_RUN=1 sudo peerbackup host provision alice 500G`
+        // -- the ordering people type -- did a real provision.
+        let c = Ctx::from_env(Flags {
+            dry_run: true,
+            force: true,
+        })
+        .unwrap();
+        assert!(c.dry_run);
+        assert!(c.force);
+    }
+
+    #[test]
+    fn a_bare_force_in_the_environment_no_longer_skips_the_confirmation() {
+        // `FORCE=1` is undocumented, unnamespaced and exported by plenty of
+        // build scripts, and it was the only way to skip the prompt on the
+        // command that permanently destroys a friend's backups.
+        //
+        // SAFETY: `FORCE` is read by nothing else in this binary.
+        unsafe { std::env::set_var("FORCE", "1") };
+        let c = Ctx::from_env(Flags::default()).unwrap();
+        // SAFETY: as above.
+        unsafe { std::env::remove_var("FORCE") };
+        assert!(!c.force, "the bare FORCE must not be honoured");
     }
 }

@@ -281,7 +281,7 @@ hdr "release tears down in the right order"
 LOOPDEV=$(losetup -j "$IMG" | cut -d: -f1)
 [ -n "$LOOPDEV" ] && ok "a loop device is attached ($LOOPDEV)" || bad "no loop device attached"
 
-FORCE=1 $HOST release testpeer >"$WORK/release.out" 2>&1; RRC=$?
+$HOST release --force testpeer >"$WORK/release.out" 2>&1; RRC=$?
 [ "$RRC" -eq 0 ] && ok "release exited 0" || { bad "release exited $RRC"; sed 's/^/        /' "$WORK/release.out" | tail -5; }
 
 mountpoint -q "$DIR" 2>/dev/null && bad "grant is STILL MOUNTED after release" || ok "grant unmounted"
@@ -302,7 +302,7 @@ DIR2="$PEERBACKUP_ROOT/mnt/testpeer2"
 mount -o loop "$IMG2" "$DIR2" 2>/dev/null
 if mountpoint -q "$DIR2"; then
   exec 9<"$DIR2"          # hold a descriptor so umount fails
-  FORCE=1 $HOST release testpeer2 >"$WORK/release2.out" 2>&1
+  $HOST release --force testpeer2 >"$WORK/release2.out" 2>&1
   exec 9<&-
   if [ -f "$IMG2" ]; then
     ok "release stopped rather than deleting a still-mounted image"

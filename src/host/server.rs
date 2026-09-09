@@ -70,14 +70,16 @@ pub fn quickstart(ctx: &Ctx, peer: &PeerName, o: &ServerOpts) -> Res {
         );
     }
 
-    std::fs::create_dir_all(&o.data).map_err(|e| {
-        format!(
-            "cannot create {} ({e})\n       Pick somewhere you can write: \
-             PB_DATA=/path peerbackup host quickstart {peer}",
-            o.data.display()
-        )
-    })?;
-    if !writable(&o.data) {
+    if !ctx.would(&format!("mkdir -p {}", o.data.display())) {
+        std::fs::create_dir_all(&o.data).map_err(|e| {
+            format!(
+                "cannot create {} ({e})\n       Pick somewhere you can write: \
+                 PB_DATA=/path peerbackup host quickstart {peer}",
+                o.data.display()
+            )
+        })?;
+    }
+    if !ctx.dry_run && !writable(&o.data) {
         return Err(format!(
             "{} exists but is not writable by this user\n       \
              Either: sudo chown -R $(id -un) '{}'\n       \
@@ -108,9 +110,15 @@ pub fn quickstart(ctx: &Ctx, peer: &PeerName, o: &ServerOpts) -> Res {
             o.port
         ));
     } else {
-        let _ = Command::new("docker")
-            .args(["rm", "-f", &o.container])
-            .output();
+        // A dry run reached this and really deleted the container. `quickstart`
+        // is the command someone rehearses precisely because they are not sure
+        // what it will do, and `rm -f` on a stopped container takes its
+        // configuration with it.
+        if !ctx.would(&format!("docker rm -f {}", o.container)) {
+            let _ = Command::new("docker")
+                .args(["rm", "-f", &o.container])
+                .output();
+        }
         if !port_free(o.port) {
             return Err(format!(
                 "port {} is already in use on this machine\n       \
@@ -127,24 +135,32 @@ pub fn quickstart(ctx: &Ctx, peer: &PeerName, o: &ServerOpts) -> Res {
             "OPTIONS=--private-repos --append-only --max-size {}",
             o.max_size
         );
+        let run_args = [
+            "run",
+            "-d",
+            "--name",
+            &o.container,
+            "--restart",
+            "unless-stopped",
+            "--user",
+            &user,
+            "-p",
+            &ports,
+            "-v",
+            &volume,
+            "-e",
+            &options,
+            REST_SERVER_IMAGE,
+        ];
+        if ctx.would(&format!("docker {}", run_args.join(" "))) {
+            ctx.info("");
+            ctx.info(&format!(
+                "would then create the login for '{peer}' and print an invite URL."
+            ));
+            return Ok(());
+        }
         let out = Command::new("docker")
-            .args([
-                "run",
-                "-d",
-                "--name",
-                &o.container,
-                "--restart",
-                "unless-stopped",
-                "--user",
-                &user,
-                "-p",
-                &ports,
-                "-v",
-                &volume,
-                "-e",
-                &options,
-                REST_SERVER_IMAGE,
-            ])
+            .args(run_args)
             .output()
             .map_err(|e| format!("could not run docker: {e}"))?;
         if !out.status.success() {
@@ -238,6 +254,14 @@ pub fn adduser(
     if generated {
         ctx.say(&format!("generated password for '{peer}': {pw}"));
         ctx.say("send it over a channel you trust. It is not stored anywhere in plaintext.");
+    }
+
+    if ctx.would(&format!(
+        "docker exec -i {} htpasswd -B -i $PASSWORD_FILE {peer}",
+        o.container
+    )) {
+        ctx.would(&format!("docker restart {}", o.container));
+        return Ok(generated.then_some(pw));
     }
 
     let out = Command::new("docker")
@@ -637,12 +661,53 @@ mod tests {
         };
         assert!(PeerName::new("a b").is_err());
         assert!(PeerName::new("").is_err());
-        // A valid name still reaches the docker check and fails there, not on
-        // validation, which is what proves the name was accepted.
-        let e = quickstart(&ctx, &PeerName::new("alice").unwrap(), &o).unwrap_err();
+        // A valid name gets past validation. On a machine with docker the dry
+        // run then succeeds; on one without, the complaint is about docker and
+        // never about the name.
+        if let Err(e) = quickstart(&ctx, &PeerName::new("alice").unwrap(), &o) {
+            assert!(
+                e.contains("docker"),
+                "a legitimate name must not be refused as a name: {e}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_dry_run_of_quickstart_does_not_touch_anything() {
+        // `quickstart` and `adduser` built their docker calls with a raw
+        // `Command::new` instead of `ctx.run`, so `Ctx::dry_run` was never
+        // consulted anywhere in the server path -- and the contract on it says
+        // "print what would happen and touch nothing".
+        //
+        // A rehearsal with a stopped container really ran `docker rm -f`,
+        // taking its configuration with it, then really started a new one and
+        // really wrote an htpasswd entry. This test itself was the proof: it
+        // ran during `cargo test` on any machine with docker, deleted whatever
+        // was named `x`, and left a rest-server listening on 51515 with
+        // `--restart unless-stopped`.
+        let dir = std::env::temp_dir().join(format!("pb-dryrun-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let ctx = Ctx {
+            root: PathBuf::from("/tmp/pb-unused"),
+            units: PathBuf::from("/tmp/pb-unused"),
+            reserve_pct: 15,
+            host_margin_gb: 20,
+            dry_run: true,
+            quiet: true,
+            force: false,
+        };
+        let o = ServerOpts {
+            port: 51515,
+            data: dir.clone(),
+            container: "peerbackup-test-must-not-exist".into(),
+            max_size: 1,
+        };
+        let _ = quickstart(&ctx, &PeerName::new("alice").unwrap(), &o);
         assert!(
-            !e.contains("peer name"),
-            "a legitimate name must not be refused as a name: {e}"
+            !dir.exists(),
+            "a dry run created the storage directory at {}",
+            dir.display()
         );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
