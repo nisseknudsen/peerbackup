@@ -2,6 +2,7 @@ mod cli;
 mod config;
 mod engine;
 mod host;
+mod redact;
 mod state;
 
 use std::path::PathBuf;

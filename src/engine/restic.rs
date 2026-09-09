@@ -118,7 +118,11 @@ impl ResticEngine {
             Classified::NoVerdict(c) => c,
         };
         EngineError {
-            message: strip_go_trace(&combined),
+            // restic writes `Fatal: create repository at
+            // rest:http://me:pw@host/me/ failed: ...`, and this message is both
+            // printed and persisted. `redact` exists and was unit-tested twice;
+            // it was simply never applied to anything the engine produced.
+            message: crate::redact::message(&strip_go_trace(&combined)),
             exit_code: code,
             cause,
         }

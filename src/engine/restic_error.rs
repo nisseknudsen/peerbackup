@@ -177,12 +177,16 @@ fn http_status(lowercased: &str, code: u16) -> bool {
     lowercased.contains(&format!("({code})"))
 }
 
+/// The one line of restic's output worth carrying on a `Cause`.
+///
+/// Redacted and stripped of control characters on the way out, because this is
+/// the single place every `Cause` detail is built and those details are printed
+/// under the status table and appended to the evidence log. restic embeds the
+/// repository URL -- credentials and all -- in its own error prose, and prints a
+/// server's HTTP status line verbatim, so this string is partly written by the
+/// peer.
 fn first_line(s: &str) -> String {
-    s.lines()
-        .find(|l| !l.trim().is_empty())
-        .unwrap_or("")
-        .trim()
-        .to_owned()
+    crate::redact::detail(s.lines().find(|l| !l.trim().is_empty()).unwrap_or(""))
 }
 
 fn extract_pack_id(s: &str) -> Option<String> {

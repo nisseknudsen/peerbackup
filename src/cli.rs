@@ -7,6 +7,7 @@ use crate::config::{Config, Peer, PeerName, random_token, write_private};
 use crate::engine::outcome::VerifyOutcome;
 use crate::engine::restic::ResticEngine;
 use crate::engine::{BackupEngine, Cause, SnapshotId, SnapshotMeta, SnapshotOpts};
+use crate::redact;
 use crate::state::{
     Canary, Evidence, Kind, PeerState, PeerStatus, Record, Verdict, ago, canary_dir, now,
     sha256_bytes, state_dir, status,
@@ -129,7 +130,12 @@ impl Runtime {
             peer: peer.clone(),
             kind,
             verdict,
-            detail,
+            // Sanitised on the way in, so the log itself is clean rather than
+            // relying on every reader to be careful. `detail` is restic's text,
+            // which carries the repository URL with its credentials and, since
+            // restic prints a server's status line and its own warnings about
+            // source paths verbatim, bytes a peer chose.
+            detail: detail.as_deref().map(redact::detail),
             coverage_pct: cov,
             snapshot: None,
         };
@@ -367,7 +373,7 @@ pub fn peer_list() -> Res {
         return Ok(());
     }
     for p in &cfg.peers {
-        println!("{:<12} {}", p.name, redact(&p.url));
+        println!("{:<12} {}", p.name, redact::url(&p.url));
     }
     Ok(())
 }
@@ -401,48 +407,6 @@ pub fn peer_remove(name: &str) -> Res {
         println!("still hold. Delete it once they have released the space.");
     }
     Ok(())
-}
-
-/// Hide the password in a repository URL before printing it.
-///
-/// The separator is the *last* `@` in the authority segment, not the first.
-/// Using the first leaked any password containing an `@`: given
-/// `rest:https://me:p@ssw0rd@host/`, the first `@` sits inside the password, so
-/// everything from there on was treated as the host and printed verbatim,
-/// producing `me:***@ssw0rd@host/`. `peer list` is the command people paste
-/// into bug reports, which is the exact thing the config and secret split
-/// exists to make safe.
-///
-/// Bounded to the authority segment so an `@` later in the path cannot be
-/// mistaken for the credential separator.
-///
-/// The slicing is safe despite the lint: every index below comes from `find`
-/// or `rfind`, which only ever return character boundaries.
-#[allow(clippy::string_slice)]
-fn redact(url: &str) -> String {
-    let Some(scheme_end) = url.find("://") else {
-        return url.to_owned();
-    };
-    let authority_start = scheme_end + 3;
-    let authority_end = url[authority_start..]
-        .find('/')
-        .map_or(url.len(), |i| authority_start + i);
-
-    let authority = &url[authority_start..authority_end];
-    let Some(at) = authority.rfind('@') else {
-        return url.to_owned();
-    };
-    let credentials = &authority[..at];
-    let user = credentials.split(':').next().unwrap_or("");
-    if credentials.len() == user.len() {
-        // A userinfo with no colon carries no password to hide.
-        return url.to_owned();
-    }
-    format!(
-        "{}{user}:***{}",
-        &url[..authority_start],
-        &url[authority_start + at..]
-    )
 }
 
 // --------------------------------------------------------------------- backup
@@ -727,9 +691,15 @@ pub fn status_cmd() -> Res {
         );
     }
 
+    // Sanitised again on the way out: records written before this was fixed are
+    // still in the log, and they are the ones most likely to hold something odd.
     for r in rows.iter().filter(|r| r.problem.is_some()) {
         println!();
-        println!("{}: {}", r.name, r.problem.as_ref().unwrap());
+        println!(
+            "{}: {}",
+            r.name,
+            redact::detail(r.problem.as_ref().unwrap())
+        );
     }
 
     // Said out loud rather than silently absorbed. The records are excluded from
@@ -750,7 +720,7 @@ pub fn status_cmd() -> Res {
         if let Some(reason) = last_failure(records, &r.name) {
             println!();
             println!("{}: last attempt did not succeed", r.name);
-            println!("  {reason}");
+            println!("  {}", redact::detail(&reason));
         }
     }
 
@@ -1062,14 +1032,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn passwords_are_hidden_when_urls_are_printed() {
-        let out = redact("rest:https://me:hunter2@alice.example.org:8000/me/");
-        assert!(!out.contains("hunter2"), "password leaked: {out}");
-        assert!(out.contains("alice.example.org"));
-        assert!(out.contains("me"));
-    }
-
-    #[test]
     fn peer_names_come_from_the_url_host() {
         assert_eq!(
             peer_name_from_url("rest:https://me:pw@alice.example.org:8000/me/").as_deref(),
@@ -1111,46 +1073,6 @@ mod tests {
     fn one_bad_source_among_good_ones_still_refuses() {
         let sources = vec![std::env::temp_dir(), PathBuf::from("/nope/nope")];
         assert!(check_sources(&sources).is_err());
-    }
-
-    #[test]
-    fn redacting_leaves_urls_without_credentials_alone() {
-        for plain in [
-            "rest:https://alice.example.org:8000/me/",
-            "rest:https://alice.example.org/path/with@sign/",
-            "rest:https://user@alice.example.org/me/",
-        ] {
-            assert_eq!(redact(plain), plain);
-        }
-    }
-
-    #[test]
-    fn redacting_hides_the_whole_password_even_when_it_contains_an_at_sign() {
-        // The version this replaced used the FIRST '@' in the URL. With a
-        // password containing one, everything after it was treated as the host
-        // and printed as-is, so `peer list` published most of the password to
-        // whatever bug report it was pasted into.
-        for (url, want) in [
-            (
-                "rest:https://me:hunter2@alice.example.org:8000/me/",
-                "rest:https://me:***@alice.example.org:8000/me/",
-            ),
-            (
-                "rest:https://me:p@ssw0rd@alice.example.org:8000/me/",
-                "rest:https://me:***@alice.example.org:8000/me/",
-            ),
-            (
-                "rest:https://me:@@@@@alice.example.org/me/",
-                "rest:https://me:***@alice.example.org/me/",
-            ),
-        ] {
-            let got = redact(url);
-            assert_eq!(got, want, "redacting {url}");
-            assert!(
-                !got.contains("ssw0rd") && !got.contains("hunter2"),
-                "password survived redaction: {got}"
-            );
-        }
     }
 
     // ------------------------------------------------------- status exit code
