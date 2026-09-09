@@ -103,6 +103,11 @@ pub fn provision(ctx: &Ctx, peer: &PeerName, size: &str) -> Res {
         &[
             OsStr::new("-l"),
             OsStr::new(&bytes.to_string()),
+            // Every path is positional after this, whatever it starts with.
+            // Nothing here can currently begin with a dash -- `PeerName` refuses
+            // it and `PEERBACKUP_ROOT` is now required to be absolute -- so this
+            // is a guard rail, and it is one character.
+            OsStr::new("--"),
             img.as_os_str(),
         ],
     )
@@ -141,6 +146,7 @@ pub fn provision(ctx: &Ctx, peer: &PeerName, size: &str) -> Res {
             OsStr::new("-E"),
             OsStr::new("nodiscard"),
             OsStr::new("-F"),
+            OsStr::new("--"),
             img.as_os_str(),
         ],
     ) {
@@ -224,7 +230,11 @@ pub fn provision(ctx: &Ctx, peer: &PeerName, size: &str) -> Res {
             remove_quietly(ctx, &ctx.units.join(&unit));
         }
         let mut stranded = Vec::new();
-        if is_mountpoint(&dir) && ctx.run("umount", &[dir.as_os_str()]).is_err() {
+        if is_mountpoint(&dir)
+            && ctx
+                .run("umount", &[OsStr::new("--"), dir.as_os_str()])
+                .is_err()
+        {
             stranded.push(format!("{} is still mounted", dir.display()));
         }
         for loopdev in loop_devices_for(&img) {
@@ -261,7 +271,15 @@ pub fn provision(ctx: &Ctx, peer: &PeerName, size: &str) -> Res {
     ctx.info(&format!(
         "grant created for '{peer}'. Numbers that matter, all three of them:"
     ));
-    list(ctx, Some(peer.as_str()))?;
+    // Not `?`. The grant exists and is mounted by this point; a summary that
+    // could not be printed is not a reason to report the whole command as
+    // failed, and reporting it as failed invites someone to run `release` and
+    // start over on a grant that is perfectly good.
+    if let Err(e) = list(ctx, Some(peer.as_str())) {
+        warn(&format!(
+            "the grant was created, but its summary could not be shown: {e}"
+        ));
+    }
     ctx.info("");
     ctx.info("next: create their credential");
     ctx.info(&format!("  peerbackup host adduser {peer}"));
@@ -412,13 +430,16 @@ fn take_ownership(ctx: &Ctx, dir: &Path, unit: &str) -> Res {
         return Ok(());
     }
 
-    ctx.run("chown", &[OsStr::new(&own), mnt.as_os_str()])
-        .map_err(|e| {
-            format!(
-                "{e}\n       could not give {} to {own}; creating logins will fail",
-                mnt.display()
-            )
-        })?;
+    ctx.run(
+        "chown",
+        &[OsStr::new(&own), OsStr::new("--"), mnt.as_os_str()],
+    )
+    .map_err(|e| {
+        format!(
+            "{e}\n       could not give {} to {own}; creating logins will fail",
+            mnt.display()
+        )
+    })?;
 
     if !is_mountpoint(dir) {
         return Err(format!(
@@ -430,7 +451,12 @@ fn take_ownership(ctx: &Ctx, dir: &Path, unit: &str) -> Res {
 
     ctx.run(
         "chown",
-        &[OsStr::new("-R"), OsStr::new(&own), dir.as_os_str()],
+        &[
+            OsStr::new("-R"),
+            OsStr::new(&own),
+            OsStr::new("--"),
+            dir.as_os_str(),
+        ],
     )
     .map_err(|e| {
         format!(
@@ -475,13 +501,14 @@ pub fn release(ctx: &Ctx, peer: &PeerName) -> Res {
     // allocated to the open loop device and the mount keeps serving stale data.
     ctx.run_best_effort("systemctl", &["disable", "--now", &unit]);
     if is_mountpoint(&dir) {
-        ctx.run("umount", &[dir.as_os_str()]).map_err(|e| {
-            format!(
-                "{e}\n       something still has {} open (lsof +f -- {})",
-                dir.display(),
-                dir.display()
-            )
-        })?;
+        ctx.run("umount", &[OsStr::new("--"), dir.as_os_str()])
+            .map_err(|e| {
+                format!(
+                    "{e}\n       something still has {} open (lsof +f -- {})",
+                    dir.display(),
+                    dir.display()
+                )
+            })?;
     }
     // Not best-effort. With the container running, its bind mount holds the loop
     // device open and `losetup -d` fails with EBUSY -- and the image was then
@@ -594,25 +621,46 @@ pub fn list(ctx: &Ctx, only: Option<&str>) -> Res {
         }
         found = true;
         let img = ctx.image_of(&peer);
-        let imgsz = std::fs::metadata(&img).map(|m| m.size()).unwrap_or(0);
+        let meta = std::fs::metadata(&img).ok();
+        let imgsz = meta.as_ref().map_or(0, MetadataExt::size);
+        // Apparent size is what the image claims; allocated is what the host has
+        // actually given up. They diverge exactly when the grant stopped being a
+        // reservation -- a copy that dropped the preallocation, a filesystem that
+        // punched holes -- and IMAGE reported the reassuring one of the two.
+        let allocated = meta.as_ref().map_or(0, |m| m.blocks() * 512);
         let (mut usable, mut used, mut reserve) = (0u64, 0u64, 0u64);
+        let mut unknown = false;
         let state = if is_mountpoint(&dir) {
-            if let Ok((total, avail)) = statfs(&dir) {
-                usable = total;
-                used = total.saturating_sub(avail);
-                reserve = total * ctx.reserve_pct / 100;
+            match statfs(&dir) {
+                Ok((total, avail)) => {
+                    usable = total;
+                    used = total.saturating_sub(avail);
+                    reserve = total / 100 * ctx.reserve_pct;
+                }
+                // Zeroes read as "an empty grant", which is the opposite of "we
+                // could not measure it".
+                Err(_) => unknown = true,
             }
             "mounted"
         } else {
             "NOT MOUNTED"
         };
+        if allocated * 100 < imgsz * 95 {
+            warn(&format!(
+                "{peer}: the image claims {} but only {} is allocated on the host, \
+                 so it is no longer a hard reservation",
+                human(imgsz),
+                human(allocated)
+            ));
+        }
+        let show = |v: u64| if unknown { "?".to_owned() } else { human(v) };
         println!(
             "{:<14} {:>12} {:>12} {:>12} {:>12}  {}",
             peer,
             human(imgsz),
-            human(usable),
-            human(reserve),
-            human(used),
+            show(usable),
+            show(reserve),
+            show(used),
             state
         );
     }

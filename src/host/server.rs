@@ -442,6 +442,12 @@ pub fn adduser(
 
     ctx.say("restarting the server so it picks up the new credential (it only reads");
     ctx.say("the htpasswd file at startup)");
+    // One server serves every peer, so this interrupts anyone mid-upload. restic
+    // resumes -- the repository is append-only and a partial upload leaves no
+    // snapshot -- but a friend seventeen hours into a 300GB seed would rather
+    // know than wonder.
+    ctx.say("this drops any transfer in progress; peers retry, but a large first");
+    ctx.say("backup will lose its place");
     ctx.run("docker", &["restart", &o.container])?;
 
     if ctx.dry_run {

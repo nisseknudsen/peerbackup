@@ -71,6 +71,38 @@ pub struct Ctx {
     pub force: bool,
 }
 
+/// A directory path from the environment, refused if it could not be one.
+///
+/// `provision` writes a systemd mount unit as root, built by interpolating these
+/// paths into an INI file. A newline in one of them appends arbitrary directives
+/// to that unit -- `ExecStartPre=` among them. Reaching that needs the ability to
+/// set the environment of a root command, which is most of the way to root
+/// already, so this is a guard rail rather than a boundary; it costs four lines
+/// and removes the question.
+///
+/// Absolute, because everything downstream joins onto it and a relative root
+/// would resolve against whatever directory systemd happened to start in.
+fn dir_from_env(key: &str, default: &str) -> Result<PathBuf, String> {
+    let Some(v) = std::env::var_os(key) else {
+        return Ok(PathBuf::from(default));
+    };
+    let p = PathBuf::from(v);
+    let s = p.as_os_str().as_encoded_bytes();
+    if s.is_empty() {
+        return Err(format!("{key} is set but empty"));
+    }
+    if s.iter().any(|b| *b == b'\n' || *b == b'\r' || *b == 0) {
+        return Err(format!(
+            "{key} contains a newline or a null byte. It is interpolated into a \
+             systemd unit written as root."
+        ));
+    }
+    if !p.is_absolute() {
+        return Err(format!("{key}={} must be an absolute path", p.display()));
+    }
+    Ok(p)
+}
+
 /// Read a boolean environment variable, refusing anything ambiguous.
 ///
 /// This matched the literal string `"1"` and treated everything else as false,
@@ -108,21 +140,27 @@ pub struct Flags {
 
 impl Ctx {
     pub fn from_env(flags: Flags) -> Result<Self, String> {
-        let env_num = |k: &str, d: u64| {
-            std::env::var(k)
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(d)
+        // Bounded, not just parsed. `reserve_pct` is multiplied by a filesystem
+        // size and `host_margin_gb` by 1024^3, and release builds have
+        // overflow-checks on -- so an absurd value panicked rather than being
+        // refused. A percentage over 100 is also not a percentage.
+        let env_num = |k: &str, d: u64, max: u64| -> Result<u64, String> {
+            match std::env::var(k) {
+                Err(_) => Ok(d),
+                Ok(v) => match v.trim().parse::<u64>() {
+                    Ok(n) if n <= max => Ok(n),
+                    Ok(n) => Err(format!("{k}={n} is out of range (max {max})")),
+                    Err(_) => Err(format!("{k}='{v}' is not a whole number")),
+                },
+            }
         };
         Ok(Self {
-            root: std::env::var_os("PEERBACKUP_ROOT")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("/srv/peerbackup")),
-            units: std::env::var_os("SYSTEMD_UNIT_DIR")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("/etc/systemd/system")),
-            reserve_pct: env_num("MAINTENANCE_RESERVE_PCT", 15),
-            host_margin_gb: env_num("HOST_MARGIN_GB", 20),
+            root: dir_from_env("PEERBACKUP_ROOT", "/srv/peerbackup")?,
+            units: dir_from_env("SYSTEMD_UNIT_DIR", "/etc/systemd/system")?,
+            reserve_pct: env_num("MAINTENANCE_RESERVE_PCT", 15, 100)?,
+            // A yottabyte of headroom is past any real disk and leaves the
+            // multiplication by 1024^3 nowhere near u64.
+            host_margin_gb: env_num("HOST_MARGIN_GB", 20, 1 << 30)?,
             // `DRY_RUN` keeps working: it fails in the safe direction, so an
             // ambient one costs someone a command that did not happen.
             dry_run: flags.dry_run || env_flag("DRY_RUN")?,
@@ -251,10 +289,54 @@ pub fn is_mountpoint(path: &Path) -> bool {
     let Some(parent) = path.parent() else {
         return true; // "/" is always a mount point.
     };
-    match std::fs::metadata(parent) {
+    let differs = match std::fs::metadata(parent) {
         Ok(up) => here.dev() != up.dev(),
         Err(_) => false,
+    };
+    if !differs {
+        return false;
     }
+    // btrfs gives every subvolume its own st_dev, so the comparison above says
+    // "mounted" for an ordinary subvolume that is nothing of the kind. That
+    // matters here more than anywhere: `guard` runs as ExecStartPre precisely to
+    // refuse a boot where a grant is not really mounted, and btrfs is one of the
+    // three filesystems this tool's own error messages recommend.
+    //
+    // /proc/self/mountinfo is the authority. It is missing in some containers,
+    // so its absence falls back to the st_dev answer rather than failing open
+    // or closed on a technicality.
+    match std::fs::read_to_string("/proc/self/mountinfo") {
+        Ok(info) => info.lines().any(|l| {
+            // Field 5 is the mount point, space-escaped as \040 etc.
+            l.split_whitespace()
+                .nth(4)
+                .is_some_and(|m| unescape_mountinfo(m) == path.as_os_str())
+        }),
+        Err(_) => true,
+    }
+}
+
+/// mountinfo escapes space, tab, newline and backslash as octal.
+fn unescape_mountinfo(s: &str) -> std::ffi::OsString {
+    use std::os::unix::ffi::OsStringExt;
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'\\' && i + 3 < b.len() {
+            let oct = std::str::from_utf8(&b[i + 1..i + 4])
+                .ok()
+                .and_then(|d| u8::from_str_radix(d, 8).ok());
+            if let Some(byte) = oct {
+                out.push(byte);
+                i += 4;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    std::ffi::OsString::from_vec(out)
 }
 
 /// Capacity of the filesystem holding `path`: (total, available) in bytes.
@@ -311,9 +393,19 @@ pub fn unit_name(dir: &Path) -> Result<String, String> {
         })?;
     let name = String::from_utf8_lossy(&out.stdout).trim().to_owned();
     if !out.status.success() || name.is_empty() {
+        // systemd-escape's own complaint, which it writes to stderr and which
+        // this discarded -- leaving "produced an empty unit name" as the entire
+        // explanation for a failure it had already described.
+        let why = String::from_utf8_lossy(&out.stderr);
+        let why = why.trim();
         return Err(format!(
-            "systemd-escape produced an empty unit name for {}",
-            dir.display()
+            "systemd-escape produced no unit name for {}{}",
+            dir.display(),
+            if why.is_empty() {
+                String::new()
+            } else {
+                format!(": {why}")
+            }
         ));
     }
     Ok(name)
@@ -500,5 +592,68 @@ mod tests {
         // SAFETY: as above.
         unsafe { std::env::remove_var("FORCE") };
         assert!(!c.force, "the bare FORCE must not be honoured");
+    }
+
+    #[test]
+    fn a_path_from_the_environment_cannot_carry_a_newline_into_a_systemd_unit() {
+        // `provision` writes a mount unit as root by interpolating these paths
+        // into an INI file, so a newline appends arbitrary directives --
+        // `ExecStartPre=` among them. Reaching it needs the ability to set the
+        // environment of a root command, so this is a guard rail rather than a
+        // boundary, but it costs four lines.
+        let key = "PB_TEST_DIR_FROM_ENV";
+        let cases = [
+            ("/srv/peerbackup", true),
+            ("/srv/x\nExecStartPre=/bin/sh -c evil", false),
+            ("relative/path", false),
+            ("", false),
+        ];
+        for (v, ok) in cases {
+            // SAFETY: this key is used by no other test and by no other thread.
+            unsafe { std::env::set_var(key, v) };
+            assert_eq!(
+                dir_from_env(key, "/default").is_ok(),
+                ok,
+                "{v:?} should {} be accepted",
+                if ok { "" } else { "not" }
+            );
+        }
+        // SAFETY: as above.
+        unsafe { std::env::remove_var(key) };
+        assert_eq!(
+            dir_from_env(key, "/default").unwrap(),
+            std::path::PathBuf::from("/default")
+        );
+    }
+
+    #[test]
+    fn an_out_of_range_tuning_value_is_refused_rather_than_panicking() {
+        // `reserve_pct` is multiplied by a filesystem size and `host_margin_gb`
+        // by 1024^3, and release builds have overflow-checks on, so an absurd
+        // value panicked. A percentage over 100 is also not a percentage.
+        //
+        // SAFETY: these keys are read by nothing else in this binary.
+        unsafe { std::env::set_var("MAINTENANCE_RESERVE_PCT", "500") };
+        assert!(Ctx::from_env(Flags::default()).is_err());
+        unsafe { std::env::set_var("MAINTENANCE_RESERVE_PCT", "15") };
+        assert!(Ctx::from_env(Flags::default()).is_ok());
+        unsafe { std::env::set_var("HOST_MARGIN_GB", "99999999999999999999") };
+        assert!(Ctx::from_env(Flags::default()).is_err());
+        unsafe {
+            std::env::remove_var("MAINTENANCE_RESERVE_PCT");
+            std::env::remove_var("HOST_MARGIN_GB");
+        }
+    }
+
+    #[test]
+    fn mountinfo_escapes_are_decoded() {
+        assert_eq!(
+            unescape_mountinfo("/srv/a"),
+            std::ffi::OsString::from("/srv/a")
+        );
+        assert_eq!(
+            unescape_mountinfo(r"/srv/a\040b"),
+            std::ffi::OsString::from("/srv/a b")
+        );
     }
 }
