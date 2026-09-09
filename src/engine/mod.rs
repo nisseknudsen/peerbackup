@@ -16,7 +16,7 @@ pub mod restic_error;
 
 use std::path::{Path, PathBuf};
 
-pub use outcome::{Cause, VerifyOutcome};
+pub use outcome::{Cause, Corruption, VerifyOutcome};
 
 /// Identifies a snapshot in a peer's repository.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,8 +39,12 @@ impl SnapshotId {
 }
 
 impl std::fmt::Display for SnapshotId {
+    /// `f.pad`, for the same reason as [`crate::config::PeerName`]: an inner
+    /// `write!` discards the outer format spec, so a width would be ignored.
+    /// Nothing pads a snapshot id today; the next thing that tries should get
+    /// what it asked for.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.short())
+        f.pad(self.short())
     }
 }
 
@@ -87,6 +91,23 @@ pub struct EngineError {
     /// The same classification the verifier uses, so callers can distinguish a
     /// full peer from an unreachable one without re-parsing text.
     pub cause: Cause,
+    /// Damage restic reported while carrying out this operation, if it did.
+    ///
+    /// Kept alongside `cause` rather than folded into it because the two answer
+    /// different questions. `cause` says why the operation failed, and for the
+    /// callers that only need to retry or give up, "we could not classify this"
+    /// is a fine answer. `damage` says whether restic told us the bytes it read
+    /// were wrong, which is a verdict about the *data* and outranks everything
+    /// else the caller might do with the error.
+    ///
+    /// This used to be thrown away: `to_engine_error` relabelled
+    /// `Classified::Damage` as `Cause::Unclassified` on the reasoning that the
+    /// damage verdict belongs to verification. But `restore_path` is the canary
+    /// path, and the canary restore *is* half of verification -- the only place
+    /// peerbackup reads real bytes back and compares a digest. So corruption
+    /// found there was recorded as `Unknown`, `verify` exited 0, and the peer
+    /// read `unchecked` forever instead of turning red.
+    pub damage: Option<Corruption>,
 }
 
 impl std::fmt::Display for EngineError {

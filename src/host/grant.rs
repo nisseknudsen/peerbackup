@@ -103,6 +103,11 @@ pub fn provision(ctx: &Ctx, peer: &PeerName, size: &str) -> Res {
         &[
             OsStr::new("-l"),
             OsStr::new(&bytes.to_string()),
+            // Every path is positional after this, whatever it starts with.
+            // Nothing here can currently begin with a dash -- `PeerName` refuses
+            // it and `PEERBACKUP_ROOT` is now required to be absolute -- so this
+            // is a guard rail, and it is one character.
+            OsStr::new("--"),
             img.as_os_str(),
         ],
     )
@@ -126,7 +131,13 @@ pub fn provision(ctx: &Ctx, peer: &PeerName, size: &str) -> Res {
     //
     // Without it every grant is sparse, and the host can be overcommitted by
     // exactly the mechanism this design exists to prevent.
-    ctx.run(
+    // `?` here would return with the image already allocated. `mkfs` fails for
+    // ordinary reasons -- a size ext4 cannot format, an interrupted run -- and
+    // the only way out of a stranded image was `host release`, the
+    // type-the-name-to-confirm destructor whose own warning is that it
+    // permanently destroys the peer's backups. Up to the whole grant, e.g.
+    // 500GB, left behind by a failure that touched nothing else.
+    if let Err(e) = ctx.run(
         "mkfs.ext4",
         &[
             OsStr::new("-q"),
@@ -135,9 +146,16 @@ pub fn provision(ctx: &Ctx, peer: &PeerName, size: &str) -> Res {
             OsStr::new("-E"),
             OsStr::new("nodiscard"),
             OsStr::new("-F"),
+            OsStr::new("--"),
             img.as_os_str(),
         ],
-    )?;
+    ) {
+        remove_quietly(ctx, &img);
+        return Err(format!(
+            "{e}\n       The image was removed, so this can be run again once the \
+             cause is fixed."
+        ));
+    }
 
     verify_not_sparse(ctx, &img)?;
 
@@ -154,9 +172,11 @@ pub fn provision(ctx: &Ctx, peer: &PeerName, size: &str) -> Res {
     // and no way forward except the destructor. `verify_not_sparse` removes the
     // image on its own failure path, which is what makes this the right seam.
     let finish = |unit: &mut String| -> Res {
+        check_mount_target(&dir)?;
         if !ctx.would(&format!("mkdir -p {}", dir.display())) {
             std::fs::create_dir_all(&dir)
                 .map_err(|e| format!("could not create {}: {e}", dir.display()))?;
+            check_mount_target(&dir)?;
         }
 
         *unit = unit_name(&dir)?;
@@ -200,32 +220,131 @@ pub fn provision(ctx: &Ctx, peer: &PeerName, size: &str) -> Res {
     let mut unit = String::new();
     if let Err(e) = finish(&mut unit) {
         warn("provisioning failed part-way; undoing what was created");
+        // Same order as `release`, and for the reason written down there:
+        // unlinking a mounted image is not a teardown. The space stays allocated
+        // to the open loop device and the mount goes on serving, so the next
+        // `provision` allocates a second image beside a first one that nothing
+        // can see. This skipped straight to `rm`.
         if !unit.is_empty() {
             ctx.run_best_effort("systemctl", &["disable", "--now", &unit]);
             remove_quietly(ctx, &ctx.units.join(&unit));
         }
-        if !ctx.would(&format!("rmdir {}", dir.display())) {
-            let _ = std::fs::remove_dir(&dir);
+        let mut stranded = Vec::new();
+        if is_mountpoint(&dir)
+            && ctx
+                .run("umount", &[OsStr::new("--"), dir.as_os_str()])
+                .is_err()
+        {
+            stranded.push(format!("{} is still mounted", dir.display()));
         }
-        remove_quietly(ctx, &img);
+        for loopdev in loop_devices_for(&img) {
+            if ctx.run("losetup", &["-d", &loopdev]).is_err() {
+                stranded.push(format!("{loopdev} is still attached to the image"));
+            }
+        }
+        if stranded.is_empty() {
+            remove_quietly(ctx, &img);
+            if !ctx.would(&format!("rmdir {}", dir.display())) {
+                let _ = std::fs::remove_dir(&dir);
+            }
+        }
         ctx.run_best_effort("systemctl", &["daemon-reload"]);
-        return Err(format!(
-            "{e}\n       Nothing was left behind, so this can be run again once the \
-             cause is fixed."
-        ));
+        // Claimed unconditionally before, including on the paths where it was
+        // not true.
+        return Err(if stranded.is_empty() {
+            format!(
+                "{e}\n       Nothing was left behind, so this can be run again once \
+                 the cause is fixed."
+            )
+        } else {
+            format!(
+                "{e}\n       Could not fully undo it: {}.\n       \
+                 The image is still at {} and is still using its space. Clear that \
+                 first;\n       `peerbackup host release {peer}` will do it.",
+                stranded.join(", "),
+                img.display()
+            )
+        });
     }
 
     ctx.info("");
     ctx.info(&format!(
         "grant created for '{peer}'. Numbers that matter, all three of them:"
     ));
-    list(ctx, Some(peer.as_str()))?;
+    // Not `?`. The grant exists and is mounted by this point; a summary that
+    // could not be printed is not a reason to report the whole command as
+    // failed, and reporting it as failed invites someone to run `release` and
+    // start over on a grant that is perfectly good.
+    if let Err(e) = list(ctx, Some(peer.as_str())) {
+        warn(&format!(
+            "the grant was created, but its summary could not be shown: {e}"
+        ));
+    }
     ctx.info("");
     ctx.info("next: create their credential");
     ctx.info(&format!("  peerbackup host adduser {peer}"));
     ctx.info("(use that, not create_user directly: rest-server only reads the htpasswd");
     ctx.info(" file at startup, so a credential added without a restart returns 401)");
     Ok(())
+}
+
+/// Refuse to mount over anything that is not a real, empty, unmounted directory.
+///
+/// `take_ownership` hands the *parent* of every grant directory to an
+/// unprivileged uid, so `/srv/peerbackup/mnt` is writable by an account that is
+/// not root. `create_dir_all` then treats an existing symlink-to-a-directory as
+/// success, `systemd-escape` escapes the literal path, and `mount` canonicalises
+/// symlinks -- so someone with a foothold in that account could plant
+/// `ln -s /etc /srv/peerbackup/mnt/carol`, wait for the admin to run
+/// `sudo peerbackup host provision carol 500G`, and get a blank ext4 mounted
+/// over `/etc`.
+///
+/// `symlink_metadata` does not follow the link, which is the whole point.
+/// Checking again after `create_dir_all` closes the window between the two.
+///
+/// Emptiness matters for a different reason: mounting over a directory that
+/// already holds files hides them for as long as the mount lasts, and nothing
+/// in `host list` would say so.
+fn check_mount_target(dir: &Path) -> Res {
+    let Ok(meta) = std::fs::symlink_metadata(dir) else {
+        // Absent is fine; it is about to be created.
+        return Ok(());
+    };
+    if meta.file_type().is_symlink() {
+        return Err(format!(
+            "{} is a symbolic link, and mounting follows it.\n       \
+             Remove it and run this again. Nothing here should be a link: this \
+             directory's\n       parent is writable by a non-root account, which \
+             is how a link pointing\n       somewhere important gets planted.",
+            dir.display()
+        ));
+    }
+    if !meta.is_dir() {
+        return Err(format!(
+            "{} exists and is not a directory, so it cannot be a mount point",
+            dir.display()
+        ));
+    }
+    if is_mountpoint(dir) {
+        return Err(format!(
+            "{} is already a mount point. Run `peerbackup host list` to see what \
+             this\n       host thinks is there.",
+            dir.display()
+        ));
+    }
+    match std::fs::read_dir(dir) {
+        Ok(mut entries) => {
+            if entries.next().is_some() {
+                return Err(format!(
+                    "{} is not empty, and mounting over it would hide what is in \
+                     it.\n       Move that aside first.",
+                    dir.display()
+                ));
+            }
+            Ok(())
+        }
+        Err(e) => Err(format!("could not read {}: {e}", dir.display())),
+    }
 }
 
 /// Check what was actually shipped, not an intermediate state.
@@ -243,7 +362,13 @@ fn verify_not_sparse(ctx: &Ctx, img: &Path) -> Res {
     // st_blocks is in 512-byte units by POSIX, whatever the filesystem's own
     // block size happens to be.
     let allocated = m.blocks() * 512;
-    if allocated < apparent / 2 {
+    // 95%, not 50%. A grant is a hard reservation or it is nothing, and a
+    // filesystem that half-honours `fallocate` -- or an image whose allocation
+    // was partly discarded -- is exactly the overcommit this check exists to
+    // catch. At 50% a 500GB grant backed by 255GB passed and printed
+    // "preallocation verified". With `-E nodiscard` on a working filesystem the
+    // ratio is ~1.0, so the margin only has to cover filesystem metadata.
+    if allocated < apparent / 100 * 95 {
         let _ = std::fs::remove_file(img);
         return Err(format!(
             "refusing to create a sparse grant: only {} of {} is actually allocated.\n       \
@@ -285,19 +410,36 @@ fn take_ownership(ctx: &Ctx, dir: &Path, unit: &str) -> Res {
     let own = format!("{uid}:{gid}");
     let mnt = ctx.mnt();
 
+    // Which uid this is, out loud, because nothing else compares it against the
+    // uid the server will actually run as. Under `sudo peerbackup host
+    // provision`, sudo's env_reset drops any exported PB_UID and `SUDO_UID`
+    // wins -- so an admin at 1001 chowned the grant to 1001 while the service
+    // unit started rest-server as 1000. rest-server then got EACCES creating the
+    // peer's directory, backups failed with a 500, and `list`, `guard` and
+    // `doctor` all reported the host as healthy, because `doctor` checks
+    // readability by the *invoking* user rather than by PB_UID.
+    ctx.say(&format!(
+        "the grant will be owned by {own}. The server must run as that same uid:\n  \
+         compose.yml and deploy/systemd/peerbackup-rest.service both read PB_UID/PB_GID.\n  \
+         Under sudo, export it explicitly: sudo PB_UID={uid} PB_GID={gid} peerbackup host ..."
+    ));
+
     if ctx.dry_run {
         println!("  would run: chown {own} {}", mnt.display());
         println!("  would run: chown -R {own} {}", dir.display());
         return Ok(());
     }
 
-    ctx.run("chown", &[OsStr::new(&own), mnt.as_os_str()])
-        .map_err(|e| {
-            format!(
-                "{e}\n       could not give {} to {own}; creating logins will fail",
-                mnt.display()
-            )
-        })?;
+    ctx.run(
+        "chown",
+        &[OsStr::new(&own), OsStr::new("--"), mnt.as_os_str()],
+    )
+    .map_err(|e| {
+        format!(
+            "{e}\n       could not give {} to {own}; creating logins will fail",
+            mnt.display()
+        )
+    })?;
 
     if !is_mountpoint(dir) {
         return Err(format!(
@@ -309,7 +451,12 @@ fn take_ownership(ctx: &Ctx, dir: &Path, unit: &str) -> Res {
 
     ctx.run(
         "chown",
-        &[OsStr::new("-R"), OsStr::new(&own), dir.as_os_str()],
+        &[
+            OsStr::new("-R"),
+            OsStr::new(&own),
+            OsStr::new("--"),
+            dir.as_os_str(),
+        ],
     )
     .map_err(|e| {
         format!(
@@ -354,16 +501,35 @@ pub fn release(ctx: &Ctx, peer: &PeerName) -> Res {
     // allocated to the open loop device and the mount keeps serving stale data.
     ctx.run_best_effort("systemctl", &["disable", "--now", &unit]);
     if is_mountpoint(&dir) {
-        ctx.run("umount", &[dir.as_os_str()]).map_err(|e| {
-            format!(
-                "{e}\n       something still has {} open (lsof +f -- {})",
-                dir.display(),
-                dir.display()
-            )
-        })?;
+        ctx.run("umount", &[OsStr::new("--"), dir.as_os_str()])
+            .map_err(|e| {
+                format!(
+                    "{e}\n       something still has {} open (lsof +f -- {})",
+                    dir.display(),
+                    dir.display()
+                )
+            })?;
     }
-    if let Some(loopdev) = loop_device_for(&img) {
-        ctx.run_best_effort("losetup", &["-d", &loopdev]);
+    // Not best-effort. With the container running, its bind mount holds the loop
+    // device open and `losetup -d` fails with EBUSY -- and the image was then
+    // unlinked anyway, so the space stayed allocated to a device with no name.
+    // "capacity returned to the host" was printed regardless.
+    let mut still_attached = Vec::new();
+    for loopdev in loop_devices_for(&img) {
+        if let Err(e) = ctx.run("losetup", &["-d", &loopdev]) {
+            warn(&e);
+            still_attached.push(loopdev);
+        }
+    }
+    if !still_attached.is_empty() {
+        return Err(format!(
+            "the grant for '{peer}' was not released: {} still attached to {}.\n       \
+             Removing the image now would leak the space rather than return it.\n       \
+             Something has it open -- the server container is the usual answer.\n       \
+             Stop it and run this again.",
+            still_attached.join(", "),
+            img.display()
+        ));
     }
     // std::fs rather than shelling out: these are three syscalls, and going
     // through a process each time only adds a PATH lookup and an error string
@@ -392,16 +558,32 @@ fn remove_quietly(ctx: &Ctx, path: &Path) {
     }
 }
 
-fn loop_device_for(img: &Path) -> Option<String> {
-    let out = std::process::Command::new("losetup")
+/// Every loop device backed by this image, not just the first.
+///
+/// `losetup -j` prints one line per attachment and nothing stops there being
+/// more than one -- a stale attachment from an earlier run, or a second
+/// `losetup -f` by hand. Taking only the first line meant `release` detached one
+/// device, unlinked the image, and left the rest holding its space with no name
+/// left to find them by.
+///
+/// Also ignores `losetup`'s exit status on purpose: a non-zero exit with no
+/// output is "no devices", which is the normal case for a grant that was never
+/// mounted.
+fn loop_devices_for(img: &Path) -> Vec<String> {
+    let Ok(out) = std::process::Command::new("losetup")
         .arg("-j")
         .arg(img)
         .output()
-        .ok()?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    let first = text.lines().next()?;
-    let dev = first.split(':').next()?.trim().to_owned();
-    (!dev.is_empty()).then_some(dev)
+    else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| {
+            let dev = l.split(':').next()?.trim();
+            (!dev.is_empty()).then(|| dev.to_owned())
+        })
+        .collect()
 }
 
 pub fn list(ctx: &Ctx, only: Option<&str>) -> Res {
@@ -439,25 +621,46 @@ pub fn list(ctx: &Ctx, only: Option<&str>) -> Res {
         }
         found = true;
         let img = ctx.image_of(&peer);
-        let imgsz = std::fs::metadata(&img).map(|m| m.size()).unwrap_or(0);
+        let meta = std::fs::metadata(&img).ok();
+        let imgsz = meta.as_ref().map_or(0, MetadataExt::size);
+        // Apparent size is what the image claims; allocated is what the host has
+        // actually given up. They diverge exactly when the grant stopped being a
+        // reservation -- a copy that dropped the preallocation, a filesystem that
+        // punched holes -- and IMAGE reported the reassuring one of the two.
+        let allocated = meta.as_ref().map_or(0, |m| m.blocks() * 512);
         let (mut usable, mut used, mut reserve) = (0u64, 0u64, 0u64);
+        let mut unknown = false;
         let state = if is_mountpoint(&dir) {
-            if let Ok((total, avail)) = statfs(&dir) {
-                usable = total;
-                used = total.saturating_sub(avail);
-                reserve = total * ctx.reserve_pct / 100;
+            match statfs(&dir) {
+                Ok((total, avail)) => {
+                    usable = total;
+                    used = total.saturating_sub(avail);
+                    reserve = total / 100 * ctx.reserve_pct;
+                }
+                // Zeroes read as "an empty grant", which is the opposite of "we
+                // could not measure it".
+                Err(_) => unknown = true,
             }
             "mounted"
         } else {
             "NOT MOUNTED"
         };
+        if allocated * 100 < imgsz * 95 {
+            warn(&format!(
+                "{peer}: the image claims {} but only {} is allocated on the host, \
+                 so it is no longer a hard reservation",
+                human(imgsz),
+                human(allocated)
+            ));
+        }
+        let show = |v: u64| if unknown { "?".to_owned() } else { human(v) };
         println!(
             "{:<14} {:>12} {:>12} {:>12} {:>12}  {}",
             peer,
             human(imgsz),
-            human(usable),
-            human(reserve),
-            human(used),
+            show(usable),
+            show(reserve),
+            show(used),
             state
         );
     }
@@ -609,6 +812,41 @@ pub fn doctor(ctx: &Ctx) -> Res {
         }
     }
 
+    // The uid the grants are owned by against the uid the server will run as.
+    // Nothing compared these, and the check above cannot: it tests readability
+    // by whoever ran `doctor`, which under sudo is root and can read anything.
+    // An admin at 1001 chowning grants to 1001 while the service unit starts
+    // rest-server as PB_UID=1000 gets EACCES on every write, 500s on the peer's
+    // side, and a clean bill of health from every host command.
+    if let Ok(entries) = std::fs::read_dir(ctx.mnt()) {
+        let want = numeric_env(&["PB_UID"])?;
+        for grant in entries.filter_map(Result::ok).map(|e| e.path()) {
+            if !grant.is_dir() {
+                continue;
+            }
+            let Ok(meta) = std::fs::metadata(&grant) else {
+                continue;
+            };
+            let owner = meta.uid();
+            if let Some(w) = want
+                && owner != w
+            {
+                warn(&format!(
+                    "{} is owned by uid {owner}, but PB_UID says the server runs as \
+                     {w}.\n       The server will not be able to write to it.",
+                    grant.display()
+                ));
+                problems += 1;
+            } else if want.is_none() {
+                ctx.say(&format!(
+                    "{} is owned by uid {owner}; the server must run as that uid \
+                     (PB_UID)",
+                    grant.display()
+                ));
+            }
+        }
+    }
+
     if problems == 0 {
         ctx.info("host looks healthy");
         return Ok(());
@@ -653,6 +891,59 @@ fn first_numeric<'a>(
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_planted_symlink_cannot_become_a_mount_point() {
+        // `take_ownership` chowns the parent of every grant directory to an
+        // unprivileged uid, and `create_dir_all` treats a symlink to a
+        // directory as success. `ln -s /etc /srv/peerbackup/mnt/carol` followed
+        // by `sudo peerbackup host provision carol 500G` mounted a blank ext4
+        // over /etc.
+        let dir = std::env::temp_dir().join(format!("pb-symlink-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("real")).unwrap();
+        let link = dir.join("carol");
+        std::os::unix::fs::symlink(dir.join("real"), &link).unwrap();
+
+        let e = check_mount_target(&link).unwrap_err();
+        assert!(e.contains("symbolic link"), "got: {e}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_absent_or_empty_directory_is_a_fine_mount_point() {
+        let dir = std::env::temp_dir().join(format!("pb-mnttarget-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        check_mount_target(&dir.join("not-there")).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        check_mount_target(&dir).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mounting_over_something_that_already_has_files_in_it_is_refused() {
+        // The mount hides them for as long as it lasts, and nothing in
+        // `host list` would say so.
+        let dir = std::env::temp_dir().join(format!("pb-mntfull-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("someones-backup"), b"x").unwrap();
+        let e = check_mount_target(&dir).unwrap_err();
+        assert!(e.contains("not empty"), "got: {e}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_file_where_a_mount_point_should_be_is_refused() {
+        let dir = std::env::temp_dir().join(format!("pb-mntfile-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("carol");
+        std::fs::write(&f, b"x").unwrap();
+        let e = check_mount_target(&f).unwrap_err();
+        assert!(e.contains("not a directory"), "got: {e}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn ctx_in(dir: &Path) -> Ctx {
         Ctx {
             root: dir.to_path_buf(),
@@ -673,6 +964,33 @@ mod tests {
         let d = std::env::temp_dir().join(format!("pb-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         d
+    }
+
+    #[test]
+    fn doctor_notices_a_grant_the_server_will_not_be_able_to_write_to() {
+        // `sudo peerbackup host provision` chowns to SUDO_UID, because sudo's
+        // env_reset drops any exported PB_UID. An admin at 1001 therefore got a
+        // grant owned by 1001 while the service unit starts rest-server as
+        // PB_UID=1000 -- EACCES on every write, 500s on the peer's side, and a
+        // clean bill of health from every host command, because the existing
+        // check tests readability by whoever ran `doctor` and under sudo that
+        // is root.
+        let dir = tmp("doctoruid");
+        std::fs::create_dir_all(dir.join("mnt").join("alice")).unwrap();
+        let ctx = ctx_in(&dir);
+
+        // A uid this grant certainly is not owned by.
+        let me = std::fs::metadata(dir.join("mnt").join("alice"))
+            .unwrap()
+            .uid();
+        // SAFETY: this key is used by no other test and by no other thread.
+        unsafe { std::env::set_var("PB_UID", (me + 1).to_string()) };
+        let e = doctor(&ctx).unwrap_err();
+        // SAFETY: as above.
+        unsafe { std::env::remove_var("PB_UID") };
+
+        assert!(e.contains("problem"), "got: {e}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

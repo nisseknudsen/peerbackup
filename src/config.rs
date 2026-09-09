@@ -13,14 +13,41 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(default)]
     pub settings: Settings,
-    #[serde(default, rename = "peer")]
+    /// `skip_serializing_if` so a fresh config does not open with `peer = []`.
+    ///
+    /// That is what `toml::to_string_pretty` emits for an empty vector, and it
+    /// landed on the *first line* of the file `peerbackup init` writes. The
+    /// README then shows a `[[peer]]` block as the way to add a peer by hand,
+    /// and doing that on a freshly initialised config produces
+    /// `invalid table header / duplicate key `peer` in document root`. The
+    /// documented workflow could not be followed on a new install.
+    #[serde(default, rename = "peer", skip_serializing_if = "Vec::is_empty")]
     pub peers: Vec<Peer>,
 }
 
+/// Every field has a default, and an unknown one is an error.
+///
+/// Both halves are deliberate, and neither was true before.
+///
+/// **Defaults**, because a config that names only what it changes is the normal
+/// way to write one, and this refused it. A file containing just
+/// `[settings]` and `sources = [...]` -- which is most of what the README's own
+/// example is about -- was rejected with
+/// `config.toml is not valid TOML: TOML parse error at line 1, column 1 ...
+/// missing field `upload_limit_kib``. The TOML was perfectly valid, the message
+/// said otherwise, and it pointed at the section header rather than at anything
+/// the user had done.
+///
+/// **`deny_unknown_fields`**, because the alternative to a required field is a
+/// silently ignored one. With defaults and without this, `verify_subset_pc = 50`
+/// would be accepted, ignored, and then erased from the file by the next command
+/// that writes the config -- so the typo would be gone before it could be found.
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct Settings {
     /// Directories to back up. The canary is added automatically.
     pub sources: Vec<PathBuf>,
@@ -140,8 +167,15 @@ impl PeerName {
 }
 
 impl std::fmt::Display for PeerName {
+    /// `f.pad`, not `f.write_str`.
+    ///
+    /// `write_str` writes straight to the underlying buffer and ignores
+    /// everything in the format spec, so `{:<12}` on a `PeerName` did nothing at
+    /// all -- while the header row beside it is a `&str`, which pads. Every
+    /// table in the program printed with its columns one space wide and its
+    /// header somewhere else entirely.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
+        f.pad(&self.0)
     }
 }
 
@@ -186,6 +220,9 @@ impl std::str::FromStr for PeerName {
 pub enum ConfigError {
     NotFound(PathBuf),
     Io(PathBuf, io::Error),
+    /// Valid or not, the file did not parse into a config. Covers a real syntax
+    /// error and a key that is not one of ours; the message from `toml` says
+    /// which, and points at the line.
     Parse(PathBuf, String),
     /// Valid TOML, but a setting that cannot mean what it says.
     Invalid(PathBuf, String),
@@ -202,7 +239,11 @@ impl std::fmt::Display for ConfigError {
                 )
             }
             Self::Io(p, e) => write!(f, "could not read {}: {e}", p.display()),
-            Self::Parse(p, e) => write!(f, "{} is not valid TOML: {e}", p.display()),
+            // Not "is not valid TOML". An unknown or misspelled key produces a
+            // parse failure too, and the file it is complaining about is
+            // usually perfectly good TOML -- so the old wording sent people
+            // hunting for a syntax error that was not there.
+            Self::Parse(p, e) => write!(f, "{} could not be read as a config: {e}", p.display()),
             Self::Invalid(p, e) => write!(f, "{}: {e}", p.display()),
         }
     }
@@ -248,7 +289,7 @@ impl Config {
 
     pub fn save(&self) -> io::Result<()> {
         let dir = Self::dir();
-        fs::create_dir_all(&dir)?;
+        create_dir_private(&dir)?;
         let text = toml::to_string_pretty(self).map_err(io::Error::other)?;
         write_private(&Self::path(), text.as_bytes())
     }
@@ -271,6 +312,26 @@ pub fn home() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/root"))
 }
 
+/// Create a directory tree only the owner can enter.
+///
+/// `create_dir_all` applies the process umask, which is usually 0022, so the
+/// directory holding the repository passwords was world-traversable and the peer
+/// names in it were readable by any local account. The files inside are 0600, so
+/// this is about what the directory listing gives away rather than the contents
+/// -- but the mode is passed to `mkdir` rather than chmodded afterwards for the
+/// same reason [`write_private`] passes it to `open`: there must be no window.
+///
+/// Only newly created components get the mode. An existing directory is left
+/// alone, because tightening a directory someone deliberately opened up is not
+/// this function's call to make.
+pub fn create_dir_private(dir: &Path) -> io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+}
+
 /// Write a file only the owner can read, atomically.
 ///
 /// Two properties, both load-bearing, because this writes repository passwords
@@ -290,7 +351,7 @@ pub fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
     use std::io::Write;
 
     let parent = path.parent().unwrap_or(Path::new("."));
-    fs::create_dir_all(parent)?;
+    create_dir_private(parent)?;
 
     // Append to the file name rather than replacing its extension.
     // `with_extension` would turn both `al.ice` and `al.bob` into `al.tmp.PID`,
@@ -383,6 +444,17 @@ mod tests {
         let p = Config::secret_path(&name);
         assert_eq!(p.file_name().unwrap(), "alice");
         assert!(p.parent().unwrap().ends_with("secrets"));
+    }
+
+    #[test]
+    fn a_peer_name_obeys_the_format_width_it_is_printed_with() {
+        // `write_str` ignores the format spec, so `{:<12}` was a no-op and every
+        // table printed its name column one space wide with the header, a plain
+        // `&str`, padded correctly somewhere to the right of it.
+        let n = PeerName::new("alice").unwrap();
+        assert_eq!(format!("{n:<12}|"), "alice       |");
+        assert_eq!(format!("{n:>12}|"), "       alice|");
+        assert_eq!(format!("{n}"), "alice", "unpadded stays unpadded");
     }
 
     #[test]
@@ -488,6 +560,63 @@ url = "rest:http://x/"
                 .and_then(|v| v.checked_mul(2))
                 .is_some()
         );
+    }
+
+    #[test]
+    fn a_config_may_name_only_the_settings_it_changes() {
+        // Every field was mandatory, so this was refused with
+        // "config.toml is not valid TOML: ... missing field `upload_limit_kib`"
+        // -- pointing at the section header, about a file that is valid TOML.
+        let cfg: Config = toml::from_str(
+            r#"
+[settings]
+sources = ["/srv/data"]
+"#,
+        )
+        .expect("a partial [settings] must be accepted");
+        assert_eq!(cfg.settings.sources, vec![PathBuf::from("/srv/data")]);
+        assert_eq!(
+            cfg.settings.canary_days,
+            Settings::default().canary_days,
+            "the rest must come from the defaults"
+        );
+        cfg.settings.validate().unwrap();
+    }
+
+    #[test]
+    fn a_misspelled_setting_is_refused_and_named() {
+        // The other half of making fields optional: without this, a typo is
+        // silently ignored *and* then erased by the next command that writes
+        // the config, so it is gone before it can be found.
+        let e = toml::from_str::<Config>(
+            r#"
+[settings]
+verify_subset_pc = 50
+"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("verify_subset_pc"), "must name the key: {e}");
+        assert!(
+            e.contains("verify_subset_pct"),
+            "must suggest the real one: {e}"
+        );
+    }
+
+    #[test]
+    fn a_fresh_config_can_have_a_peer_block_appended_by_hand() {
+        // `toml::to_string_pretty` writes `peer = []` for an empty vector, on
+        // the first line of the file `init` creates. Appending the `[[peer]]`
+        // block the README shows then failed with
+        // "invalid table header / duplicate key `peer` in document root".
+        let fresh = toml::to_string_pretty(&Config::default()).unwrap();
+        assert!(
+            !fresh.contains("peer = []"),
+            "a fresh config must not declare an empty peer array:\n{fresh}"
+        );
+        let edited = format!("{fresh}\n[[peer]]\nname = \"alice\"\nurl = \"rest:http://x/\"\n");
+        let back: Config = toml::from_str(&edited).expect("the documented hand-edit must parse");
+        assert_eq!(back.peers.len(), 1);
     }
 
     #[test]

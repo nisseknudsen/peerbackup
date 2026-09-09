@@ -7,6 +7,8 @@
 
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
+# shellcheck source=tests/lib/scratch.sh
+. "$HERE/tests/lib/scratch.sh"
 RESTIC="${RESTIC_BIN:-restic}"
 BIN="${PEERBACKUP_BIN:-$HERE/target/debug/peerbackup}"
 WORK="${WORK:-/tmp/pb-e2e-client}"
@@ -36,7 +38,9 @@ export PEERBACKUP_VERIFY_TIMEOUT=120
 
 hdr "setup"
 cleanup
-rm -rf "$WORK"; mkdir -p "$WORK"/{cfg,state,srv,data}
+scratch_claim "$WORK" || exit 1
+rm -rf "${WORK:?}"; mkdir -p "$WORK"/{cfg,state,srv,data}
+scratch_mark "$WORK"
 echo "the file that matters" > "$WORK/data/notes.txt"
 head -c 3000000 /dev/urandom > "$WORK/data/photo.bin"
 ORIGINAL_SHA=$(sha256sum "$WORK/data/photo.bin" | awk '{print $1}')
@@ -217,7 +221,14 @@ hdr "DISASTER: everything peerbackup ever wrote is gone"
 REPO=$(grep -oP "(?<=^Repository: ).*" "$WORK/recovery.txt" | head -1)
 PW=$(grep -oP "(?<=^Password:   ).*" "$WORK/recovery.txt" | head -1)
 rm -rf "$WORK/cfg" "$WORK/state" "$WORK/data"
-[ ! -d "$WORK/cfg" ] && ok "config, state and source data deleted"
+# The whole disaster-recovery premise is that these are gone. Without the else
+# branch, a delete that silently failed left the rest of the section restoring
+# against files that were still there.
+if [ ! -d "$WORK/cfg" ] && [ ! -d "$WORK/state" ] && [ ! -d "$WORK/data" ]; then
+  ok "config, state and source data deleted"
+else
+  bad "the disaster setup did not delete everything, so what follows proves nothing"
+fi
 
 # Only restic, only what is written on the recovery page.
 export RESTIC_PASSWORD="$PW"

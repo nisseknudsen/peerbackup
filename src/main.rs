@@ -2,6 +2,7 @@ mod cli;
 mod config;
 mod engine;
 mod host;
+mod redact;
 mod state;
 
 use std::path::PathBuf;
@@ -28,7 +29,12 @@ struct Cli {
 enum Command {
     /// Set up everything and connect to a peer, in one step
     Connect {
-        /// Repository URL your peer gave you
+        /// Repository URL your peer gave you, or `-` to read it from stdin
+        ///
+        /// The URL carries the password. On a command line it goes into shell
+        /// history, into `ps` for the life of the call, and -- if you run this
+        /// in a container, as the README describes -- permanently into
+        /// `docker inspect`. `-` avoids all three.
         url: String,
         /// A directory to back up. Repeat for more than one.
         #[arg(long = "source", required = true)]
@@ -87,8 +93,19 @@ enum Command {
     Recovery(RecoveryCmd),
 
     /// Host backups for a friend: grants, the server, and its logins
-    #[command(subcommand)]
-    Host(HostCmd),
+    Host {
+        /// Print what would happen and touch nothing
+        ///
+        /// A flag and not only an environment variable because every command
+        /// that needs it also needs root, and `sudo` resets the environment.
+        #[arg(long, global = true)]
+        dry_run: bool,
+        /// Skip the confirmation on `release`, which destroys backups
+        #[arg(long, global = true)]
+        force: bool,
+        #[command(subcommand)]
+        cmd: HostCmd,
+    },
 }
 
 #[derive(Subcommand)]
@@ -97,7 +114,10 @@ enum PeerCmd {
     Add {
         /// Short name, e.g. alice
         name: String,
-        /// Repository URL, e.g. rest:https://me:pw@alice.example.org:8000/me/
+        /// Repository URL, e.g. rest:https://me:pw@alice.example.org:51515/me/
+        ///
+        /// `-` reads it from stdin instead, keeping the password out of shell
+        /// history, out of `ps`, and out of `docker inspect`.
         url: String,
         /// Certificate file, if they use a self-signed one
         #[arg(long)]
@@ -165,8 +185,8 @@ enum HostCmd {
     Down,
 }
 
-fn run_host(cmd: HostCmd) -> Res {
-    let ctx = host::Ctx::from_env();
+fn run_host(cmd: HostCmd, flags: host::Flags) -> Res {
+    let ctx = host::Ctx::from_env(flags)?;
     // Server settings are read only by the two commands that talk to the
     // server. Reading them up front meant a typo in PB_PORT failed `host guard`
     // -- which runs as ExecStartPre -- for a reason that had nothing to do with
@@ -212,7 +232,18 @@ fn main() {
         Command::Peer(PeerCmd::List) => cli::peer_list(),
         Command::Peer(PeerCmd::Remove { name }) => cli::peer_remove(&name),
         Command::Backup { peer } => cli::backup(peer.as_deref()),
-        Command::Verify { peer } => cli::verify(peer.as_deref()),
+        // Handled below rather than here: `verify` is the one command whose
+        // failure has more than one meaning, and the exit code has to say which.
+        Command::Verify { peer } => match cli::verify(peer.as_deref()) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                eprintln!("error: {e}");
+                if nag_after {
+                    cli::warn_if_recovery_stale();
+                }
+                std::process::exit(e.code());
+            }
+        },
         Command::Status => cli::status_cmd(),
         Command::Snapshots { peer } => cli::snapshots(&peer),
         Command::Restore {
@@ -222,7 +253,11 @@ fn main() {
         } => cli::restore(&peer, &target, snapshot.as_deref()),
         Command::Recovery(RecoveryCmd::Export { out }) => cli::recovery_export(out),
         Command::Recovery(RecoveryCmd::Check) => cli::recovery_check(),
-        Command::Host(h) => run_host(h),
+        Command::Host {
+            cmd,
+            dry_run,
+            force,
+        } => run_host(cmd, host::Flags { dry_run, force }),
     };
 
     if let Err(e) = result {

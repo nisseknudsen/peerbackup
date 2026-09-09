@@ -41,7 +41,12 @@ pub fn parse_size(input: &str) -> Result<u64, String> {
     if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
         return Err(bad());
     }
-    let n: u64 = digits.parse().map_err(|_| bad())?;
+    // A bare byte count that will not fit reports the same thing as a suffixed
+    // one. It used to fall into the generic "bad size ... use e.g. 500G", which
+    // sends someone to check their syntax when the syntax was fine.
+    let n: u64 = digits
+        .parse()
+        .map_err(|_| format!("size '{input}' is too large to represent in bytes"))?;
 
     let scale: u64 = match unit {
         "" => 1,
@@ -65,7 +70,10 @@ pub fn parse_size(input: &str) -> Result<u64, String> {
 /// decimal below 10 and none at or above it, rounding away from zero, and
 /// carrying into the next unit when rounding reaches 1024.
 pub fn human(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    // PB included, so a value at or above 1024TB promotes instead of printing
+    // `1024TB`. u64 tops out inside EB, so this list cannot be exhausted by a
+    // real number, and the `idx + 1 < len` guards stay as the backstop.
+    const UNITS: [&str; 7] = ["B", "KB", "MB", "GB", "TB", "PB", "EB"];
 
     let mut idx = 0usize;
     let mut div: u64 = 1;
@@ -97,6 +105,28 @@ pub fn human(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_byte_count_that_will_not_fit_says_so() {
+        // It fell into the generic "bad size ... use e.g. 500G", which sends
+        // someone to check syntax that was never wrong.
+        let e = parse_size("99999999999999999999").unwrap_err();
+        assert!(e.contains("too large"), "got: {e}");
+        // The suffixed form already said it, and still does.
+        assert!(parse_size("99999999T").unwrap_err().contains("too large"));
+    }
+
+    #[test]
+    fn very_large_sizes_promote_instead_of_printing_1024tb() {
+        // The unit list stopped at TB, and the promotion branch is guarded by
+        // `idx + 1 < UNITS.len()`, so anything at or above 1024TB printed as
+        // `1024TB` where numfmt says `1.0PB`.
+        assert_eq!(human(1024 * 1024 * 1024 * 1024), "1.0TB");
+        assert_eq!(human(1024u64.pow(5)), "1.0PB");
+        assert_eq!(human(3 * 1024u64.pow(5)), "3.0PB");
+        // At or above ten units the existing rule drops the decimal.
+        assert_eq!(human(u64::MAX), "16EB");
+    }
 
     #[test]
     fn parses_the_sizes_people_actually_type() {

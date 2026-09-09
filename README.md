@@ -50,7 +50,7 @@ a VPN, plain HTTP is fine.
 ### Send: back up to that URL
 
 ```sh
-peerbackup connect 'rest://...' --source /srv/data
+peerbackup connect 'rest:http://...' --source /srv/data
 ```
 
 Creates the repository, uploads a test file, downloads it again and compares it,
@@ -60,6 +60,16 @@ so a wrong URL or password fails immediately. Then:
 peerbackup backup      # send a backup
 peerbackup status      # is everything still fine?
 ```
+
+That URL contains the password. On a command line it goes into your shell
+history and into `ps` for the life of the call, and in a container it stays in
+`docker inspect` forever. Pass `-` to read it from stdin instead:
+
+```sh
+peerbackup connect - --source /srv/data < invite.txt
+```
+
+`peer add` takes `-` the same way.
 
 ### The same two, in Docker
 
@@ -84,8 +94,12 @@ docker run --rm \
   -v ~/.config/peerbackup:/config \
   -v ~/.local/share/peerbackup:/state \
   -v /srv/data:/srv/data:ro \
-  peerbackup connect 'rest://...' --source /srv/data
+  -i peerbackup connect - --source /srv/data < invite.txt
 ```
+
+`-` and `-i` rather than the URL as an argument: anything in `docker run`'s
+command line is kept in the container's metadata and comes back out of
+`docker inspect` for as long as the container exists.
 
 Source directories must be mounted at the same paths they have on the host. See
 [Docker](#docker-sending-backups) below for why.
@@ -126,12 +140,14 @@ docker build -t peerbackup .
 
 ```sh
 peerbackup connect <url> --source <dir>   # set up and connect to a peer
-peerbackup backup                         # send a backup to every peer
-peerbackup verify                         # read data back and check it
+peerbackup init                           # config and test files, nothing else
+peerbackup backup [--peer <name>]         # send a backup
+peerbackup verify [--peer <name>]         # read data back and check it
 peerbackup status                         # summary per peer
 peerbackup snapshots <peer>               # list backups stored on a peer
-peerbackup restore <peer> <target>        # restore the most recent backup
-peerbackup recovery export                # save what you need to restore later
+peerbackup restore <peer> <target> [--snapshot <id>]
+peerbackup recovery export [--out <file>] # save what you need to restore later
+peerbackup recovery check                 # is that file still current?
 peerbackup peer add|list|remove           # manage peers individually
 ```
 
@@ -140,10 +156,17 @@ Hosting:
 ```sh
 peerbackup host quickstart <peer>    # start a server and add a peer
 peerbackup host adduser <peer>       # add another peer later
-peerbackup host list                 # allowances and usage
+peerbackup host list [<peer>]        # allowances and usage
 peerbackup host provision <peer> <size>   # per-peer size limit (needs root)
-peerbackup host release <peer>       # give the space back
+peerbackup host release <peer>       # give the space back (needs root)
+peerbackup host doctor               # is this machine set up to host?
+peerbackup host guard                # refuse to start unless grants are mounted
+peerbackup host up|down              # docker compose, against the shipped file
 ```
+
+`host guard` is the one that looks optional and is not: it is the `ExecStartPre`
+in the service unit, and it is what stops a boot where Docker won the race
+writing to your root filesystem with no size limit.
 
 `status` reads locally recorded results and does not contact peers, so it
 returns immediately and works offline:
@@ -190,27 +213,33 @@ canary_days = 35
 
 [[peer]]
 name = "alice"
-url = "rest:https://me:PASSWORD@alice.example.org:8000/me/"
+url = "rest:https://me:PASSWORD@alice.example.org:51515/me/"
 ```
 
 Passwords are stored separately in `~/.config/peerbackup/secrets/`, mode 0600.
 
+Every setting has a default, so a config only needs the ones you are changing.
+The values above are the defaults.
+
 Settings are checked when the file is read, so a value that cannot mean what it
 says is refused by name rather than quietly turned into something else. The
-windows must be non-zero, and `verify_subset_pct` must be between 1 and 100.
+windows must be non-zero, and `verify_subset_pct` must be between 1 and 100. A
+key that is not one of these is refused too, rather than ignored: a typo you
+cannot see is worse than one that stops the command.
 
 ### Timeouts
 
 restic retries transport failures with exponential backoff and no overall
-deadline, so every operation except the backup itself runs under one. A backup
-has none on purpose: a 300GB first seed at 40Mbit legitimately takes seventeen
-hours. Override any of them, in seconds, if your link needs it:
+deadline, so most operations run under one. Two do not, for the same reason: a
+300GB first seed at 40Mbit legitimately takes seventeen hours, and so does
+getting it back. `backup` and `restore` have no deadline on purpose. Override the
+rest, in seconds, if your link needs it:
 
 | Variable | Default | Bounds |
 |---|---|---|
 | `PEERBACKUP_PROBE_TIMEOUT` | 20 | Deciding whether a peer answers at all |
 | `PEERBACKUP_LIST_TIMEOUT` | 120 | `snapshots`, and creating a repository |
-| `PEERBACKUP_RESTORE_TIMEOUT` | 1800 | `restore`, and the test-file check |
+| `PEERBACKUP_RESTORE_TIMEOUT` | 1800 | The test-file check during `verify` |
 | `PEERBACKUP_VERIFY_TIMEOUT` | 3600 | Reading data back during `verify` |
 
 ### Scheduling
@@ -226,6 +255,18 @@ Type=oneshot
 ExecStart=-/usr/local/bin/peerbackup backup
 ExecStart=/usr/local/bin/peerbackup verify
 ```
+
+`verify` distinguishes its two kinds of failure in the exit code, because they
+want different responses at three in the morning:
+
+| Exit | Meaning |
+|---|---|
+| 0 | Something was read back and it was correct |
+| 1 | Something was read back and it was wrong |
+| 2 | Nothing could be read back at all |
+
+A peer that is unreachable every night is exit 2 every night, which is worth an
+alert even though nothing is known to be damaged.
 
 ```ini
 # /etc/systemd/system/peerbackup.timer
@@ -346,7 +387,16 @@ sudo peerbackup host release alice
 ```
 
 This destroys their backups and cannot be undone, so it asks you to type the
-peer name first.
+peer name first. `--force` skips the prompt, for scripts. Every `host` command
+also takes `--dry-run`, which prints what it would do and touches nothing:
+
+```sh
+sudo peerbackup host provision alice 500G --dry-run
+```
+
+Pass it as a flag rather than as `DRY_RUN=1`. These commands need root, and
+`sudo` clears the environment, so `DRY_RUN=1 sudo peerbackup host provision ...`
+does a real provision.
 
 ### Running it as a service
 
@@ -412,6 +462,8 @@ Protection is off for every peer during the window, so keep it short.
 | `PB_CERTS` | `./certs` | Directory holding `fullchain.pem` and `privkey.pem` |
 | `PB_HEALTHCHECK_SCHEME` | `http` | Set to `https` when `PB_EXTRA_OPTIONS` turns on TLS |
 | `PB_BIND` | `0.0.0.0` | Address the published port listens on |
+| `PB_CONTAINER` | `peerbackup-rest` | Container name `quickstart` and `adduser` act on |
+| `PB_COMPOSE_FILE` | shipped `compose.yml` | Compose file `host up`/`down` use |
 
 ## Docker (sending backups)
 
@@ -489,6 +541,12 @@ A directory in `sources` is gone, unreadable, or in Docker was not mounted.
 peerbackup refuses rather than backing up less than you asked for, because
 restic on its own would save a snapshot anyway and report success.
 
+**`peer add` refuses because restic is too old.**
+peerbackup reads the summary of `backup --json` to tell a complete backup from
+one that could not read everything, and versions before 0.17 do not report it the
+same way. On an older distribution, install restic from its own release rather
+than the package manager.
+
 **restic output ends with what looks like a crash.**
 restic appends its own error-location trace to ordinary failures. The real
 message is the line above it.
@@ -503,10 +561,19 @@ Storage on the host sits behind a size limit, and deletion is refused by default
 so a compromised client cannot erase its own backup history. Removing old backups
 requires the host to open a short maintenance window.
 
-Verification restores a small test file included in every backup and compares it
-against a digest recorded when it was created, then reads back a percentage of
-stored data and checks it. Results go to an append-only log, which is what
-`status` reads.
+Verification does three things. It restores a small test file included in every
+backup and compares it against a digest recorded when it was created; it reads
+back a percentage of stored data and checks it; and it asks the peer whether it
+still lists the snapshot your last backup produced.
+
+That last one is about the host rather than the data. Storage is append-only so a
+compromised client cannot erase its own history, and nothing else here would
+notice the host not holding up their end: an old repository is internally
+consistent, so `restic check` passes, and the test file is unchanged, so it still
+restores. The local record of what was sent is the one thing the host cannot
+rewrite.
+
+Results go to an append-only log, which is what `status` reads.
 
 ## Why not implement this as a restic backend?
 
@@ -534,15 +601,24 @@ cargo clippy --all-targets -- -D warnings
 Lints are declared in `Cargo.toml` rather than passed on the command line, so a
 local `cargo clippy` enforces exactly what CI does.
 
-Integration tests use a real rest-server and a real restic. None require root:
+Integration tests use a real rest-server and a real restic. The first four need
+neither root nor a privileged container:
 
 ```sh
 ./tests/end_to_end.sh                             # full client lifecycle
 ./tests/docker.sh                                 # container image, both sides
 ./deploy/test-host-tooling.sh                     # host tooling
 ./deploy/test-compose-e2e.sh                      # container and isolation
-./deploy/test-provision-root.sh --in-container    # storage provisioning
 ./spike/lifecycle-spike.sh                        # slow, ~2GB
+```
+
+Provisioning needs real loop devices, so it needs real privilege. `--in-container`
+is `docker run --privileged` with the repository mounted, which is not a smaller
+ask than sudo:
+
+```sh
+sudo ./deploy/test-provision-root.sh
+./deploy/test-provision-root.sh --in-container
 ```
 
 ## License

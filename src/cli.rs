@@ -7,9 +7,10 @@ use crate::config::{Config, Peer, PeerName, random_token, write_private};
 use crate::engine::outcome::VerifyOutcome;
 use crate::engine::restic::ResticEngine;
 use crate::engine::{BackupEngine, Cause, SnapshotId, SnapshotMeta, SnapshotOpts};
+use crate::redact;
 use crate::state::{
     Canary, Evidence, Kind, PeerState, PeerStatus, Record, Verdict, ago, canary_dir, now,
-    sha256_bytes, state_dir, status,
+    sha256_bytes, state_dir, status, utc_date,
 };
 
 use crate::Res;
@@ -56,15 +57,26 @@ impl Drop for Scratch {
 fn engine_for(peer: &Peer) -> ResticEngine {
     let mut e = ResticEngine::new(peer.url.clone(), Config::secret_path(&peer.name));
     e.ca_cert = peer.ca_cert.clone();
+    // A test hook wired into the real command path. `PEERBACKUP_RESTIC=/bin/true
+    // peerbackup verify` printed `checking 1% of the stored data... ok` and
+    // recorded `Subset/Good` for every peer without touching the network. It is
+    // the same trust boundary as the user, so this is not an escalation -- but
+    // an environment variable that manufactures green should say so out loud
+    // rather than looking like an ordinary run.
     if let Some(bin) = std::env::var_os("PEERBACKUP_RESTIC") {
+        eprintln!(
+            "warning: PEERBACKUP_RESTIC is set, so results come from {} and not \
+             from restic.",
+            PathBuf::from(&bin).display()
+        );
         e.binary = PathBuf::from(bin);
     }
-    // All four, not two. `restore_timeout` and `list_timeout` existed as fields
-    // with no way to set them, so the pair that were honoured looked arbitrary.
-    // These are escape hatches for a slow link, documented in the README.
+    // Escape hatches for a slow link, documented in the README. `restore` has
+    // no deadline to override: it is the disaster operation, and the budget that
+    // used to bound it belonged to the canary restore all along.
     set_from_env("PEERBACKUP_PROBE_TIMEOUT", &mut e.probe_timeout);
     set_from_env("PEERBACKUP_VERIFY_TIMEOUT", &mut e.verify_timeout);
-    set_from_env("PEERBACKUP_RESTORE_TIMEOUT", &mut e.restore_timeout);
+    set_from_env("PEERBACKUP_RESTORE_TIMEOUT", &mut e.canary_restore_timeout);
     set_from_env("PEERBACKUP_LIST_TIMEOUT", &mut e.list_timeout);
     e
 }
@@ -118,27 +130,49 @@ impl Runtime {
     /// failing a backup that actually succeeded would be its own lie.
     fn record(
         &self,
-        peer: &PeerName,
+        peer: &Peer,
         kind: Kind,
         verdict: Verdict,
         detail: Option<String>,
         cov: Option<u8>,
     ) -> Res {
+        self.record_snapshot(peer, kind, verdict, detail, cov, None)
+    }
+
+    /// The same, naming the snapshot the record is about.
+    fn record_snapshot(
+        &self,
+        peer: &Peer,
+        kind: Kind,
+        verdict: Verdict,
+        detail: Option<String>,
+        cov: Option<u8>,
+        snapshot: Option<String>,
+    ) -> Res {
         let r = Record {
             at: now(),
-            peer: peer.clone(),
+            peer: peer.name.clone(),
+            // Which repository this was about, so re-using a name for a
+            // different friend's server cannot inherit its history.
+            repo: Some(crate::state::repo_id(&peer.url)),
             kind,
             verdict,
-            detail,
+            // Sanitised on the way in, so the log itself is clean rather than
+            // relying on every reader to be careful. `detail` is restic's text,
+            // which carries the repository URL with its credentials and, since
+            // restic prints a server's status line and its own warnings about
+            // source paths verbatim, bytes a peer chose.
+            detail: detail.as_deref().map(redact::detail),
             coverage_pct: cov,
-            snapshot: None,
+            snapshot,
         };
         match Evidence::append_to(&self.evidence(), &r) {
             Ok(()) => Ok(()),
             Err(e) if verdict == Verdict::Bad => Err(format!(
-                "{peer} reported damage and it could not be recorded to {}: {e}\n  \
+                "{} reported damage and it could not be recorded to {}: {e}\n  \
                  The next `status` would call this peer healthy. Fix the state \
                  directory and re-run `peerbackup verify`.",
+                peer.name,
                 self.evidence().display()
             )),
             Err(e) => {
@@ -202,6 +236,7 @@ pub fn connect(
     }
     cfg.save().map_err(err("could not save config"))?;
 
+    let url = &url_arg(url)?;
     let name = match name {
         Some(n) => n.to_owned(),
         None => peer_name_from_url(url).ok_or(
@@ -259,6 +294,29 @@ fn peer_name_from_url(url: &str) -> Option<String> {
 
 // ----------------------------------------------------------------------- peer
 
+/// The repository URL, read from stdin when the argument is `-`.
+///
+/// The URL carries the peer's password. Passed on a command line it lands in
+/// shell history, in `ps` for the life of the call, and -- when peerbackup runs
+/// in a container, which is how the README documents it -- permanently in
+/// `docker inspect .Config.Cmd`. The host side of this same codebase already
+/// refuses argv for this secret and pipes it to `htpasswd` on stdin; the client
+/// side did the opposite and the README taught it.
+fn url_arg(url: &str) -> Result<String, String> {
+    if url != "-" {
+        return Ok(url.to_owned());
+    }
+    let mut s = String::new();
+    io::stdin()
+        .read_line(&mut s)
+        .map_err(err("could not read the URL from stdin"))?;
+    let s = s.trim();
+    if s.is_empty() {
+        return Err("nothing arrived on stdin. Pipe the URL in, or pass it as an argument".into());
+    }
+    Ok(s.to_owned())
+}
+
 /// Add a peer and prove the whole path works before trusting it.
 ///
 /// The first backup is the canary, which is small. If the URL, credentials,
@@ -268,6 +326,7 @@ pub fn peer_add(name: &str, url: &str, ca_cert: Option<PathBuf>) -> Res {
     // Validate before the name reaches a path. Everything downstream takes a
     // PeerName, so this is the only place the raw argument exists.
     let name = PeerName::new(name)?;
+    let url = &url_arg(url)?;
     let mut cfg = Config::load().map_err(err("could not read config"))?;
     if cfg.peer(&name).is_some() {
         return Err(format!("peer '{name}' already exists"));
@@ -285,6 +344,28 @@ pub fn peer_add(name: &str, url: &str, ca_cert: Option<PathBuf>) -> Res {
         ca_cert,
     };
     let engine = engine_for(&peer);
+    // Checked here, once, at the point where the engine is first used for real.
+    // `peer add` is the command that runs before any data is sent, so it is the
+    // cheapest place to find out that restic is too old to tell a complete
+    // backup from a partial one.
+    match engine.version_problem() {
+        Ok(Some(why)) => return Err(why),
+        Ok(None) => {}
+        Err(e) => {
+            // restic exits non-zero with nothing on stderr for some failures, so
+            // the message can be empty. "could not run restic: " and then
+            // nothing is worse than saying only the part we are sure of.
+            let detail = e.to_string();
+            return Err(if detail.trim().is_empty() {
+                format!(
+                    "could not run `{} version`. Is restic installed and on PATH?",
+                    engine.binary.display()
+                )
+            } else {
+                format!("could not run restic: {detail}")
+            });
+        }
+    }
     let canary = Canary::load_or_create().map_err(err("could not read the canary"))?;
 
     println!("Setting up repository...");
@@ -345,14 +426,14 @@ pub fn peer_add(name: &str, url: &str, ca_cert: Option<PathBuf>) -> Res {
     }
     println!("  matches");
 
-    cfg.peers.push(peer);
+    cfg.peers.push(peer.clone());
     cfg.save().map_err(err("could not save config"))?;
     // Only the canary. This round trip proves the peer is reachable, writable
     // and readable back byte-for-byte -- it does not prove any of your data is
     // there, because none of it was sent. Recording a Backup here made `status`
     // report a brand new peer as "backed up just now", which is the most
     // reassuring possible lie for this program to tell.
-    Runtime::from_env().record(&name, Kind::Canary, Verdict::Good, None, None)?;
+    Runtime::from_env().record(&peer, Kind::Canary, Verdict::Good, None, None)?;
 
     println!();
     println!("Peer '{name}' added and working.");
@@ -366,8 +447,9 @@ pub fn peer_list() -> Res {
         println!("No peers yet. Add one with `peerbackup peer add <name> <url>`.");
         return Ok(());
     }
+    let w = name_width(cfg.peers.iter().map(|p| &p.name));
     for p in &cfg.peers {
-        println!("{:<12} {}", p.name, redact(&p.url));
+        println!("{:<w$} {}", p.name, redact::url(&p.url), w = w);
     }
     Ok(())
 }
@@ -403,46 +485,20 @@ pub fn peer_remove(name: &str) -> Res {
     Ok(())
 }
 
-/// Hide the password in a repository URL before printing it.
+/// Width for the peer-name column: the longest name, never narrower than the
+/// header.
 ///
-/// The separator is the *last* `@` in the authority segment, not the first.
-/// Using the first leaked any password containing an `@`: given
-/// `rest:https://me:p@ssw0rd@host/`, the first `@` sits inside the password, so
-/// everything from there on was treated as the host and printed verbatim,
-/// producing `me:***@ssw0rd@host/`. `peer list` is the command people paste
-/// into bug reports, which is the exact thing the config and secret split
-/// exists to make safe.
-///
-/// Bounded to the authority segment so an `@` later in the path cannot be
-/// mistaken for the credential separator.
-///
-/// The slicing is safe despite the lint: every index below comes from `find`
-/// or `rfind`, which only ever return character boundaries.
-#[allow(clippy::string_slice)]
-fn redact(url: &str) -> String {
-    let Some(scheme_end) = url.find("://") else {
-        return url.to_owned();
-    };
-    let authority_start = scheme_end + 3;
-    let authority_end = url[authority_start..]
-        .find('/')
-        .map_or(url.len(), |i| authority_start + i);
-
-    let authority = &url[authority_start..authority_end];
-    let Some(at) = authority.rfind('@') else {
-        return url.to_owned();
-    };
-    let credentials = &authority[..at];
-    let user = credentials.split(':').next().unwrap_or("");
-    if credentials.len() == user.len() {
-        // A userinfo with no colon carries no password to hide.
-        return url.to_owned();
-    }
-    format!(
-        "{}{user}:***{}",
-        &url[..authority_start],
-        &url[authority_start + at..]
-    )
+/// Rust's padding never truncates, so a fixed `{:<12}` and a peer name longer
+/// than twelve characters -- `PeerName` allows sixty-four -- pushed every
+/// following column right on that row alone. Sizing the column to the content
+/// keeps the table square whatever the names are, and costs one pass over a list
+/// that is single digits long.
+fn name_width<'a>(names: impl Iterator<Item = &'a PeerName>) -> usize {
+    names
+        .map(|n| n.as_str().chars().count())
+        .max()
+        .unwrap_or(0)
+        .max(12)
 }
 
 // --------------------------------------------------------------------- backup
@@ -496,7 +552,7 @@ fn backup_in<E: BackupEngine>(
                 println!("  restic could not read everything it was asked to back up.");
                 println!("  Check the paths in `sources` and their permissions.");
                 rt.record(
-                    &peer.name,
+                    peer,
                     Kind::Backup,
                     Verdict::Unknown,
                     Some("restic could not read all sources".into()),
@@ -506,13 +562,24 @@ fn backup_in<E: BackupEngine>(
             }
             Ok(snap) => {
                 println!("done ({})", snap.id);
-                rt.record(&peer.name, Kind::Backup, Verdict::Good, None, None)?;
+                // The id is kept so `verify` can ask the peer whether it still
+                // has it. Storage is append-only so that a compromised client
+                // cannot erase its own history; nothing checked that the *host*
+                // was holding up their end.
+                rt.record_snapshot(
+                    peer,
+                    Kind::Backup,
+                    Verdict::Good,
+                    None,
+                    None,
+                    Some(snap.id.0.clone()),
+                )?;
             }
             Err(e) => {
                 println!("FAILED");
                 println!("  {e}");
                 rt.record(
-                    &peer.name,
+                    peer,
                     Kind::Backup,
                     Verdict::Unknown,
                     Some(e.to_string()),
@@ -557,7 +624,7 @@ fn check_sources(sources: &[PathBuf]) -> Res {
 
 // --------------------------------------------------------------------- verify
 
-pub fn verify(only: Option<&str>) -> Res {
+pub fn verify(only: Option<&str>) -> Result<(), VerifyFailure> {
     let cfg = Config::load().map_err(err("could not read config"))?;
     verify_in(&Runtime::from_env(), &cfg, only, engine_for)
 }
@@ -567,12 +634,21 @@ fn verify_in<E: BackupEngine>(
     cfg: &Config,
     only: Option<&str>,
     make: impl Fn(&Peer) -> E,
-) -> Res {
+) -> Result<(), VerifyFailure> {
     let peers = select(cfg, only)?;
     let canary =
         Canary::load_at(&rt.canary_manifest()).map_err(err("could not read the canary"))?;
     let pct = cfg.settings.verify_subset_pct;
+    // Read once, before anything is written this run, so the "last backup" it
+    // reports is the last one from a previous run.
+    let history = Evidence::read(&rt.evidence(), 0, &[]).records;
     let mut bad = 0;
+    // Something was actually read back and found correct. Without this, a run in
+    // which every peer was unreachable returned `Ok` -- and the README says
+    // there is no built-in scheduler, so people wire this into cron and alert on
+    // a non-zero exit. A peer unreachable every night for a month produced
+    // `unknown` records and exit 0 every night, and no alert ever fired.
+    let mut verified = 0;
 
     for peer in &peers {
         let engine = make(peer);
@@ -583,7 +659,7 @@ fn verify_in<E: BackupEngine>(
         if let Some(cause) = engine.probe() {
             println!("  not reachable: {cause}");
             rt.record(
-                &peer.name,
+                peer,
                 Kind::Subset,
                 Verdict::Unknown,
                 Some(cause.to_string()),
@@ -592,36 +668,91 @@ fn verify_in<E: BackupEngine>(
             continue;
         }
 
+        // An empty repository passes `restic check`, which exits 0 with nothing
+        // to read. That was recorded as `Subset/Good` with the full requested
+        // coverage, so `status` showed a read-back percentage for a peer holding
+        // none of the user's data. Checking nothing is not a successful check.
+        let listed = match engine.list_snapshots() {
+            Ok(s) if s.is_empty() => {
+                println!("  holds no backups yet, so there is nothing to check");
+                rt.record(
+                    peer,
+                    Kind::Subset,
+                    Verdict::Unknown,
+                    Some("the peer holds no snapshots".into()),
+                    None,
+                )?;
+                continue;
+            }
+            Ok(s) => s,
+            Err(e) => {
+                println!("  could not list what is stored: {e}");
+                rt.record(
+                    peer,
+                    Kind::Subset,
+                    Verdict::Unknown,
+                    Some(e.to_string()),
+                    None,
+                )?;
+                continue;
+            }
+        };
+
+        // Does the peer still hold the last backup it accepted?
+        //
+        // Storage is append-only precisely so a compromised *client* cannot
+        // erase its own history. Nothing checked that the host was holding up
+        // their end: a host who restored their disk from an old image, or who
+        // reverted the repository deliberately, passed every check this program
+        // makes. `restic check` finds an old repository internally consistent,
+        // the canary is unchanged so it still restores, and `status` reads only
+        // local records -- which still say a backup succeeded this morning.
+        //
+        // The local record of what was sent is the one thing the host cannot
+        // rewrite.
+        // Compared in short form. `backup` records the full 64-character id from
+        // restic's summary line, and `snapshots --json` reports `short_id` --
+        // so a direct comparison never matched and every verify reported the
+        // last backup as missing. The end-to-end suite caught it; the unit test
+        // did not, because the fake engine uses one id for both.
+        if let Some(expected) = last_backup_snapshot(&history, peer)
+            && !listed
+                .iter()
+                .any(|s| s.id.short() == SnapshotId(expected.clone()).short())
+        {
+            println!("  MISSING: the backup recorded as {expected} is no longer there");
+            rt.record(
+                peer,
+                Kind::Backup,
+                Verdict::Bad,
+                Some(format!(
+                    "the peer no longer lists snapshot {expected}, which it accepted \
+                     from us. Storage is append-only, so it should still be there."
+                )),
+                None,
+            )?;
+            bad += 1;
+        }
+
         print!("  checking {pct}% of the stored data... ");
         io::stdout().flush().ok();
         match engine.verify_subset(pct) {
             VerifyOutcome::Good { coverage_pct } => {
                 println!("ok");
-                rt.record(
-                    &peer.name,
-                    Kind::Subset,
-                    Verdict::Good,
-                    None,
-                    Some(coverage_pct),
-                )?;
+                verified += 1;
+                rt.record(peer, Kind::Subset, Verdict::Good, None, Some(coverage_pct))?;
             }
             VerifyOutcome::Bad(c) => {
                 println!("FAILED");
                 println!("    {c}");
-                rt.record(
-                    &peer.name,
-                    Kind::Subset,
-                    Verdict::Bad,
-                    Some(c.to_string()),
-                    None,
-                )?;
+                rt.record(peer, Kind::Subset, Verdict::Bad, Some(c.to_string()), None)?;
                 bad += 1;
             }
             VerifyOutcome::Indeterminate(c) => {
                 println!("could not check");
                 println!("    {c}");
                 rt.record(
-                    &peer.name,
+                    peer,
                     Kind::Subset,
                     Verdict::Unknown,
                     Some(c.to_string()),
@@ -633,14 +764,15 @@ fn verify_in<E: BackupEngine>(
         print!("  restoring a test file... ");
         io::stdout().flush().ok();
         match restore_canary(&engine, &canary) {
-            Ok(true) => {
+            CanaryCheck::Matches => {
                 println!("matches");
-                rt.record(&peer.name, Kind::Canary, Verdict::Good, None, None)?;
+                verified += 1;
+                rt.record(peer, Kind::Canary, Verdict::Good, None, None)?;
             }
-            Ok(false) => {
+            CanaryCheck::DoesNotMatch => {
                 println!("DOES NOT MATCH");
                 rt.record(
-                    &peer.name,
+                    peer,
                     Kind::Canary,
                     Verdict::Bad,
                     Some("restored test file did not match what was sent".into()),
@@ -648,35 +780,158 @@ fn verify_in<E: BackupEngine>(
                 )?;
                 bad += 1;
             }
-            Err(e) => {
+            CanaryCheck::Damaged(d) => {
+                println!("DAMAGED");
+                println!("    {d}");
+                rt.record(peer, Kind::Canary, Verdict::Bad, Some(d), None)?;
+                bad += 1;
+            }
+            CanaryCheck::CouldNotCheck(e) => {
                 println!("could not restore");
                 println!("    {e}");
-                rt.record(&peer.name, Kind::Canary, Verdict::Unknown, Some(e), None)?;
+                rt.record(peer, Kind::Canary, Verdict::Unknown, Some(e), None)?;
             }
         }
     }
 
     if bad > 0 {
-        return Err(format!(
+        return Err(VerifyFailure::Damage(format!(
             "{bad} check(s) failed. Run `peerbackup status` for details."
-        ));
+        )));
+    }
+    if verified == 0 {
+        return Err(VerifyFailure::NothingVerified(format!(
+            "nothing could be checked on {}. \
+             Run `peerbackup status` for what each peer last reported.",
+            if peers.len() == 1 {
+                "this peer".to_owned()
+            } else {
+                format!("any of {} peers", peers.len())
+            }
+        )));
     }
     Ok(())
 }
 
-fn restore_canary(engine: &impl BackupEngine, canary: &Canary) -> Result<bool, String> {
-    let file = canary.first().ok_or("the canary is empty")?;
-    let latest = engine
-        .list_snapshots()
-        .map_err(|e| e.to_string())?
-        .into_iter()
-        .next()
-        .ok_or("no snapshots on this peer yet")?;
-    let tmp = Scratch::new("verify")?;
-    let got = engine
-        .restore_path(&latest.id, &file.path, tmp.path())
-        .map_err(|e| e.to_string())?;
-    Ok(got.sha256 == file.sha256)
+/// Why `verify` did not succeed, kept apart so the exit code can say which.
+///
+/// A cron job alerts on a non-zero exit, and "your backup is damaged" and "we
+/// could not look at it" want different responses at three in the morning. The
+/// three-state model runs all the way through the program except at the process
+/// boundary, where it used to collapse into two -- and it collapsed in the
+/// reassuring direction, because `Indeterminate` did not affect the exit status
+/// at all.
+pub enum VerifyFailure {
+    /// Something was read back and was wrong. Exit 1.
+    Damage(String),
+    /// Nothing could be read back at all. Exit 2.
+    NothingVerified(String),
+}
+
+impl VerifyFailure {
+    #[must_use]
+    pub fn code(&self) -> i32 {
+        match self {
+            Self::Damage(_) => 1,
+            Self::NothingVerified(_) => 2,
+        }
+    }
+}
+
+impl std::fmt::Debug for VerifyFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "exit {}: {self}", self.code())
+    }
+}
+
+impl std::fmt::Display for VerifyFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Damage(m) | Self::NothingVerified(m) => f.write_str(m),
+        }
+    }
+}
+
+impl From<String> for VerifyFailure {
+    /// Everything that is not a verdict about data -- a missing config, an
+    /// unreadable canary, an unknown peer name -- is an ordinary failure.
+    fn from(s: String) -> Self {
+        Self::Damage(s)
+    }
+}
+
+/// The snapshot id of the most recent successful backup to this peer, if the
+/// evidence log records one.
+///
+/// Matched on the repository id as well as the name, so a peer whose URL now
+/// points somewhere else is not asked for a snapshot a different server made.
+fn last_backup_snapshot(records: &[Record], peer: &Peer) -> Option<String> {
+    let id = crate::state::repo_id(&peer.url);
+    records
+        .iter()
+        .rev()
+        .find(|r| {
+            r.peer == peer.name
+                && r.kind == Kind::Backup
+                && r.verdict == Verdict::Good
+                && r.repo.as_deref() == Some(id.as_str())
+                && r.snapshot.is_some()
+        })
+        .and_then(|r| r.snapshot.clone())
+}
+
+/// What restoring the test file told us. Three states, like every other check
+/// here, because "could not restore it" and "restored it and it was wrong" are
+/// different facts about the peer's data.
+enum CanaryCheck {
+    Matches,
+    DoesNotMatch,
+    /// restic reported damage while fetching it: a pack that did not hash to its
+    /// id, a blob that failed authentication, data the repository references and
+    /// does not have. Evidence about the bytes, not about the connection.
+    Damaged(String),
+    CouldNotCheck(String),
+}
+
+/// Restore the test file and compare it against the digest recorded when it was
+/// created.
+///
+/// This is the only place peerbackup reads real bytes back out of a peer and
+/// checks them, which makes it half of verification -- and it is why an
+/// `EngineError` arriving here with `damage` set has to become a `Bad` verdict
+/// rather than an "we could not check". Reported as `Unknown`, a repository with
+/// a corrupt pack holding the canary produced `could not restore`, exit 0, and a
+/// peer that read `unchecked` forever while restic had already said the data was
+/// wrong.
+fn restore_canary(engine: &impl BackupEngine, canary: &Canary) -> CanaryCheck {
+    let Some(file) = canary.first() else {
+        return CanaryCheck::CouldNotCheck("the canary is empty".into());
+    };
+    let latest = match engine.list_snapshots() {
+        Ok(s) => match s.into_iter().next() {
+            Some(s) => s,
+            None => {
+                return CanaryCheck::CouldNotCheck("no snapshots on this peer yet".into());
+            }
+        },
+        Err(e) => return from_engine_error(&e),
+    };
+    let tmp = match Scratch::new("verify") {
+        Ok(t) => t,
+        Err(e) => return CanaryCheck::CouldNotCheck(e),
+    };
+    match engine.restore_path(&latest.id, &file.path, tmp.path()) {
+        Ok(got) if got.sha256 == file.sha256 => CanaryCheck::Matches,
+        Ok(_) => CanaryCheck::DoesNotMatch,
+        Err(e) => from_engine_error(&e),
+    }
+}
+
+fn from_engine_error(e: &crate::engine::EngineError) -> CanaryCheck {
+    match &e.damage {
+        Some(d) => CanaryCheck::Damaged(d.to_string()),
+        None => CanaryCheck::CouldNotCheck(e.to_string()),
+    }
 }
 
 // --------------------------------------------------------------------- status
@@ -689,21 +944,39 @@ pub fn status_cmd() -> Res {
         return Ok(());
     }
     let t = now();
-    // Only as far back as the widest window `status` actually consults. The
-    // evidence log is append-only and never rotated, so reading all of it meant
-    // re-parsing every record ever written on the command people run most.
+    // As far back as the widest window `status` actually consults -- all three
+    // of them. `liveness_hours` was left out of this max while `status` went on
+    // judging `last_backup` against it, so a schedule with a long backup
+    // interval and short check windows dropped a perfectly good backup out of
+    // the read and then reported "no backup has reached this peer".
+    //
     // Doubled so a boundary record is never the reason a peer looks unchecked.
-    let window = cfg.settings.canary_days.max(cfg.settings.subset_days) * 86400 * 2;
-    let records = Evidence::read_since(&rt.evidence(), t.saturating_sub(window));
-    let rows = status(&cfg, &records, t);
+    // The evidence log is append-only and never rotated, so reading all of it
+    // meant re-parsing every record ever written, on the command people run
+    // most. `Evidence::read` extends the walk past this cutoff only as far as it
+    // takes to find where each peer currently stands.
+    let window = (cfg.settings.liveness_hours * 3600)
+        .max(cfg.settings.subset_days * 86400)
+        .max(cfg.settings.canary_days * 86400)
+        * 2;
+    let names: Vec<_> = cfg.peers.iter().map(|p| p.name.clone()).collect();
+    let history = Evidence::read(&rt.evidence(), t.saturating_sub(window), &names);
+    let records = &history.records;
+    let rows = status(&cfg, records, t);
 
+    let w = name_width(rows.iter().map(|r| &r.name));
     println!(
-        "{:<12} {:<11} {:<12} {:<12} {:<12} READ BACK",
-        "PEER", "STATE", "BACKED UP", "CHECKED", "TEST FILE"
+        "{:<w$} {:<11} {:<12} {:<12} {:<12} READ BACK",
+        "PEER",
+        "STATE",
+        "BACKED UP",
+        "CHECKED",
+        "TEST FILE",
+        w = w
     );
     for r in &rows {
         println!(
-            "{:<12} {:<11} {:<12} {:<12} {:<12} {}",
+            "{:<w$} {:<11} {:<12} {:<12} {:<12} {}",
             r.name,
             r.state.label(),
             ago(r.last_backup, t),
@@ -712,22 +985,50 @@ pub fn status_cmd() -> Res {
             r.coverage_pct
                 .map(|p| format!("{p}%"))
                 .unwrap_or_else(|| "-".into()),
+            w = w
         );
     }
 
+    // Sanitised again on the way out: records written before this was fixed are
+    // still in the log, and they are the ones most likely to hold something odd.
     for r in rows.iter().filter(|r| r.problem.is_some()) {
         println!();
-        println!("{}: {}", r.name, r.problem.as_ref().unwrap());
+        println!(
+            "{}: {}",
+            r.name,
+            redact::detail(r.problem.as_ref().unwrap())
+        );
+    }
+
+    // Said out loud rather than silently absorbed. The records are excluded from
+    // freshness, so the peer reads `unchecked` instead of green -- but a peer
+    // that reads `unchecked` for a reason that has nothing to do with the peer
+    // is exactly the sort of thing that gets ignored for a month.
+    for r in rows.iter().filter(|r| r.unrecognised) {
+        println!();
+        println!(
+            "{}: some results were written by a newer peerbackup",
+            r.name
+        );
+        println!("  This version cannot interpret them, so they do not count as");
+        println!("  checks. Upgrade, or ignore this if you meant to downgrade.");
+    }
+
+    for r in rows.iter().filter(|r| r.clock_skew) {
+        println!();
+        println!("{}: some results are dated in the future", r.name);
+        println!("  This machine's clock has been wrong. Those results are ignored,");
+        println!("  so run `peerbackup verify` once the clock is right.");
     }
 
     // An unchecked peer usually just needs `verify`. But if its last attempt
     // failed, say so: "unchecked" alone reads as "nothing happened yet" when
     // the truth may be that every backup is being rejected.
     for r in rows.iter().filter(|r| r.state == PeerState::Unknown) {
-        if let Some(reason) = last_failure(&records, &r.name) {
+        if let Some(reason) = last_failure(records, &r.name) {
             println!();
             println!("{}: last attempt did not succeed", r.name);
-            println!("  {reason}");
+            println!("  {}", redact::detail(&reason));
         }
     }
 
@@ -752,7 +1053,14 @@ pub fn status_cmd() -> Res {
         );
     }
 
-    verdict(&rows)
+    if let Some(why) = &history.incomplete {
+        println!();
+        println!("Some of the history could not be read:");
+        println!("  {why}");
+        println!("  What is shown may be missing results, including failures.");
+    }
+
+    verdict(&rows, history.incomplete.is_some())
 }
 
 /// Split the `unknown` peers into "never received a backup" and "checks have
@@ -778,9 +1086,19 @@ fn partition_unknown(rows: &[PeerStatus]) -> (Vec<&PeerStatus>, Vec<&PeerStatus>
 /// were partitioned out for printing and then left out of the exit code, so a
 /// peer holding none of your data exited 0 as long as some other peer was fine.
 /// That is the most alarming state of the three, and it was the only silent one.
-fn verdict(rows: &[PeerStatus]) -> Res {
+fn verdict(rows: &[PeerStatus], history_incomplete: bool) -> Res {
     if rows.iter().any(|r| r.state == PeerState::Bad) {
         return Err("one or more peers reported a problem".into());
+    }
+    // A read error on the evidence log is itself evidence that something is
+    // wrong. The old signature returned a bare `Vec`, so a bad sector partway
+    // through the file produced a shorter history that looked exactly like a
+    // shorter history, and the newest block's fresh `Good` records reported `ok`
+    // over an unrefuted `Bad` that was never reached.
+    if history_incomplete {
+        return Err(
+            "the evidence log could not be read in full, so nothing here can be trusted".into(),
+        );
     }
     if !rows.is_empty() && rows.iter().all(|r| r.state == PeerState::Unknown) {
         return Err(
@@ -905,7 +1223,31 @@ pub fn recovery_export(out: Option<PathBuf>) -> Res {
     if cfg.peers.is_empty() {
         return Err("no peers to export".into());
     }
-    let path = out.unwrap_or_else(|| state_dir().join("recovery.txt"));
+    // An explicit --out must land where the user said, not somewhere near it.
+    // `write_private` creates parent directories, so
+    // `recovery export --out /mnt/usb/recovery.txt` with the stick not mounted
+    // created /mnt/usb on the root filesystem, wrote the passwords that decrypt
+    // every backup into it, recorded the fingerprint as current, and printed
+    // "Written to /mnt/usb/recovery.txt". The user then believes the only copy
+    // is on removable media. It is on the disk they are backing up.
+    let path = match out {
+        Some(p) => {
+            let parent = p.parent().filter(|d| !d.as_os_str().is_empty());
+            if let Some(dir) = parent
+                && !dir.is_dir()
+            {
+                return Err(format!(
+                    "{} does not exist.\n  \
+                     Create it first, or check the drive is mounted. This file holds the \
+                     passwords\n  that decrypt every backup, so it is not written \
+                     somewhere approximate.",
+                    dir.display()
+                ));
+            }
+            p
+        }
+        None => state_dir().join("recovery.txt"),
+    };
 
     let mut s = String::new();
     s.push_str("PEERBACKUP RECOVERY DETAILS\n");
@@ -923,28 +1265,47 @@ pub fn recovery_export(out: Option<PathBuf>) -> Res {
         s.push_str(&format!("--- {} ---\n\n", peer.name));
         s.push_str(&format!("Repository: {}\n", peer.url));
         s.push_str(&format!("Password:   {}\n", pw.trim()));
-        if let Some(ca) = &peer.ca_cert {
-            s.push_str(&format!(
-                "Certificate: {} (copy this file too)\n",
-                ca.display()
-            ));
-        }
+        // The flag has to appear in the commands, not just the certificate in a
+        // note above them. Someone recovering onto a fresh machine from a host
+        // with a self-signed certificate would otherwise paste a command that
+        // fails on TLS, with nothing here telling them what to add -- and this
+        // file exists precisely to work without peerbackup, on a machine that
+        // may have just been installed.
+        let cacert = match &peer.ca_cert {
+            Some(ca) => {
+                s.push_str(&format!(
+                    "Certificate: {}\n            Copy this file too. Without it the \
+                     commands below fail on TLS.\n",
+                    ca.display()
+                ));
+                format!(" --cacert '{}'", ca.display())
+            }
+            None => String::new(),
+        };
         s.push_str("\nTo see what is stored:\n");
-        s.push_str(&format!("  restic -r '{}' snapshots\n", peer.url));
+        s.push_str(&format!("  restic -r '{}'{cacert} snapshots\n", peer.url));
         s.push_str("\n(The --tag below matters: it skips the small connection test\n");
         s.push_str(" that peerbackup uploads when a peer is first set up.)\n");
         s.push_str("\nTo get everything back:\n");
         s.push_str(&format!(
-            "  restic -r '{}' restore latest --tag {BACKUP_TAG} --target /where/to/put/it\n\n",
+            "  restic -r '{}'{cacert} restore latest --tag {BACKUP_TAG} \
+             --target /where/to/put/it\n\n",
             peer.url
         ));
     }
 
-    s.push_str(&format!("Exported: {}\n", now()));
-    s.push_str(&format!("Fingerprint: {}\n", fingerprint(&cfg)));
+    // A date, not a Unix timestamp. This document is meant to be printed and
+    // read years later, by someone who has just lost a machine.
+    let stamp = now();
+    s.push_str(&format!("Exported: {} ({stamp})\n", utc_date(stamp)));
+    let fp = fingerprint(&cfg);
+    s.push_str(&format!("Fingerprint: {fp}\n"));
 
     write_private(&path, s.as_bytes()).map_err(err("could not write the recovery file"))?;
-    std::fs::write(state_dir().join("recovery.fingerprint"), fingerprint(&cfg))
+    // The fingerprint is a digest over the peer names, URLs and passwords, so it
+    // is derived from secrets and gets the same handling as the file beside it
+    // rather than the process umask.
+    write_private(&state_dir().join("recovery.fingerprint"), fp.as_bytes())
         .map_err(err("could not record the fingerprint"))?;
 
     println!("Written to {}", path.display());
@@ -1022,14 +1383,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn passwords_are_hidden_when_urls_are_printed() {
-        let out = redact("rest:https://me:hunter2@alice.example.org:8000/me/");
-        assert!(!out.contains("hunter2"), "password leaked: {out}");
-        assert!(out.contains("alice.example.org"));
-        assert!(out.contains("me"));
-    }
-
-    #[test]
     fn peer_names_come_from_the_url_host() {
         assert_eq!(
             peer_name_from_url("rest:https://me:pw@alice.example.org:8000/me/").as_deref(),
@@ -1073,46 +1426,6 @@ mod tests {
         assert!(check_sources(&sources).is_err());
     }
 
-    #[test]
-    fn redacting_leaves_urls_without_credentials_alone() {
-        for plain in [
-            "rest:https://alice.example.org:8000/me/",
-            "rest:https://alice.example.org/path/with@sign/",
-            "rest:https://user@alice.example.org/me/",
-        ] {
-            assert_eq!(redact(plain), plain);
-        }
-    }
-
-    #[test]
-    fn redacting_hides_the_whole_password_even_when_it_contains_an_at_sign() {
-        // The version this replaced used the FIRST '@' in the URL. With a
-        // password containing one, everything after it was treated as the host
-        // and printed as-is, so `peer list` published most of the password to
-        // whatever bug report it was pasted into.
-        for (url, want) in [
-            (
-                "rest:https://me:hunter2@alice.example.org:8000/me/",
-                "rest:https://me:***@alice.example.org:8000/me/",
-            ),
-            (
-                "rest:https://me:p@ssw0rd@alice.example.org:8000/me/",
-                "rest:https://me:***@alice.example.org:8000/me/",
-            ),
-            (
-                "rest:https://me:@@@@@alice.example.org/me/",
-                "rest:https://me:***@alice.example.org/me/",
-            ),
-        ] {
-            let got = redact(url);
-            assert_eq!(got, want, "redacting {url}");
-            assert!(
-                !got.contains("ssw0rd") && !got.contains("hunter2"),
-                "password survived redaction: {got}"
-            );
-        }
-    }
-
     // ------------------------------------------------------- status exit code
 
     fn row(name: &str, state: PeerState, last_backup: Option<u64>) -> PeerStatus {
@@ -1124,6 +1437,8 @@ mod tests {
             last_canary: None,
             coverage_pct: None,
             problem: None,
+            clock_skew: false,
+            unrecognised: false,
         }
     }
 
@@ -1137,7 +1452,7 @@ mod tests {
             row("alice", PeerState::Good, Some(100)),
             row("bob", PeerState::Unknown, None),
         ];
-        let e = verdict(&rows).unwrap_err();
+        let e = verdict(&rows, false).unwrap_err();
         assert!(e.contains("no backup at all"), "got: {e}");
         assert!(e.contains("bob"), "must name the peer: {e}");
         assert!(!e.contains("alice"), "must not blame the healthy peer: {e}");
@@ -1149,7 +1464,7 @@ mod tests {
             row("alice", PeerState::Bad, Some(100)),
             row("bob", PeerState::Unknown, None),
         ];
-        let e = verdict(&rows).unwrap_err();
+        let e = verdict(&rows, false).unwrap_err();
         assert!(e.contains("reported a problem"), "got: {e}");
     }
 
@@ -1159,7 +1474,7 @@ mod tests {
             row("alice", PeerState::Good, Some(100)),
             row("bob", PeerState::Unknown, Some(50)),
         ];
-        let e = verdict(&rows).unwrap_err();
+        let e = verdict(&rows, false).unwrap_err();
         assert!(e.contains("not been checked"), "got: {e}");
         assert!(e.contains("bob"), "got: {e}");
     }
@@ -1171,7 +1486,7 @@ mod tests {
             row("bob", PeerState::Unknown, None),
             row("carol", PeerState::Unknown, Some(50)),
         ];
-        let e = verdict(&rows).unwrap_err();
+        let e = verdict(&rows, false).unwrap_err();
         assert!(e.contains("bob"), "the never-backed-up peer: {e}");
         assert!(e.contains("carol"), "the stale peer: {e}");
     }
@@ -1182,13 +1497,13 @@ mod tests {
             row("alice", PeerState::Good, Some(100)),
             row("bob", PeerState::Good, Some(100)),
         ];
-        assert!(verdict(&rows).is_ok());
+        assert!(verdict(&rows, false).is_ok());
     }
 
     #[test]
     fn no_peers_at_all_is_not_a_failure_here() {
         // `status_cmd` returns early with its own message before reaching this.
-        assert!(verdict(&[]).is_ok());
+        assert!(verdict(&[], false).is_ok());
     }
 
     // ------------------------------------------------- backup and verify
@@ -1285,6 +1600,7 @@ mod tests {
             message: "server out of space".into(),
             exit_code: Some(1),
             cause: Cause::OutOfSpace,
+            damage: None,
         };
         assert!(
             backup_in(&h.rt, &h.cfg, None, |_| FakeEngine::failing_snapshot(
@@ -1322,11 +1638,12 @@ mod tests {
         Canary::create_at(&h.rt.canary_dir(), &h.rt.canary_manifest()).unwrap();
         let log = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         let handle = log.clone();
-        verify_in(&h.rt, &h.cfg, None, move |_| FakeEngine {
+        let e = verify_in(&h.rt, &h.cfg, None, move |_| FakeEngine {
             calls: handle.clone(),
             ..FakeEngine::unreachable("connection refused")
         })
-        .unwrap();
+        .unwrap_err();
+        assert_eq!(e.code(), 2, "a run that checked nothing is not a success");
 
         assert_eq!(
             &*log.borrow(),
@@ -1356,9 +1673,13 @@ mod tests {
 
         let calls = log.borrow();
         assert_eq!(calls[0], "probe()");
-        assert_eq!(calls[1], "verify_subset(1)");
-        assert_eq!(calls[2], "list_snapshots()");
-        assert!(calls[3].starts_with("restore_path("), "got {}", calls[3]);
+        // Listing comes before the subset check now: an empty repository passes
+        // `restic check` with nothing to read, and calling that a successful
+        // read-back is a green light for a peer holding none of your data.
+        assert_eq!(calls[1], "list_snapshots()");
+        assert_eq!(calls[2], "verify_subset(1)");
+        assert_eq!(calls[3], "list_snapshots()");
+        assert!(calls[4].starts_with("restore_path("), "got {}", calls[4]);
     }
 
     #[test]
@@ -1371,7 +1692,7 @@ mod tests {
             }))
         })
         .unwrap_err();
-        assert!(err.contains("failed"), "{err}");
+        assert!(err.to_string().contains("failed"), "{err}");
 
         let subset = records(&h)
             .into_iter()
@@ -1412,12 +1733,266 @@ mod tests {
             }
         })
         .unwrap_err();
-        assert!(err.contains("failed"), "{err}");
+        assert!(err.to_string().contains("failed"), "{err}");
         let canary = records(&h)
             .into_iter()
             .find(|r| r.kind == Kind::Canary)
             .unwrap();
         assert_eq!(canary.verdict, Verdict::Bad);
+    }
+
+    #[test]
+    fn corruption_found_while_restoring_the_test_file_is_damage_not_a_missed_check() {
+        // The canary restore is the only place peerbackup reads real bytes back
+        // and compares them, so it is half of verification -- but damage found
+        // there was relabelled `Unclassified` at the engine seam, recorded as
+        // `Unknown`, and `verify` exited 0. A repository with a corrupt pack
+        // holding the canary read `unchecked` forever while restic had already
+        // said the data was wrong.
+        let h = harness("canarydamage");
+        Canary::create_at(&h.rt.canary_dir(), &h.rt.canary_manifest()).unwrap();
+        let err = verify_in(&h.rt, &h.cfg, None, |_| FakeEngine {
+            restore_damage: Some(Corruption::PackHashMismatch {
+                pack: "4f2a1b3c".into(),
+            }),
+            ..FakeEngine::always(VerifyOutcome::Good { coverage_pct: 1 })
+        })
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("failed"),
+            "verify must not exit 0: {err}"
+        );
+
+        let canary = records(&h)
+            .into_iter()
+            .find(|r| r.kind == Kind::Canary)
+            .unwrap();
+        assert_eq!(canary.verdict, Verdict::Bad, "observed damage is Bad");
+        assert!(
+            canary.detail.unwrap().contains("4f2a1b3c"),
+            "must name what restic found"
+        );
+    }
+
+    #[test]
+    fn a_peer_that_merely_will_not_answer_is_still_not_damage() {
+        // The other direction, and the one that matters most: a failure to
+        // reach the peer must never age into "your backup is corrupt".
+        let h = harness("canaryunreach");
+        Canary::create_at(&h.rt.canary_dir(), &h.rt.canary_manifest()).unwrap();
+        let e = verify_in(&h.rt, &h.cfg, None, |_| {
+            FakeEngine::unreachable("connection refused")
+        })
+        .unwrap_err();
+        assert_eq!(e.code(), 2, "could-not-check is exit 2, not exit 1");
+        assert!(
+            records(&h).iter().all(|r| r.verdict != Verdict::Bad),
+            "nothing here is evidence about the data"
+        );
+    }
+
+    #[test]
+    fn an_empty_repository_is_not_a_successful_read_back() {
+        // `restic check --read-data-subset` exits 0 on a repository with nothing
+        // in it, so a peer whose disk was reimaged and handed back a fresh empty
+        // repo printed `ok` and recorded Subset/Good with the full requested
+        // coverage. `status` then showed a read-back percentage for a peer
+        // holding none of the user's data.
+        let h = harness("emptyrepo");
+        Canary::create_at(&h.rt.canary_dir(), &h.rt.canary_manifest()).unwrap();
+        let e = verify_in(&h.rt, &h.cfg, None, |_| FakeEngine {
+            snapshots: Vec::new(),
+            ..FakeEngine::always(VerifyOutcome::Good { coverage_pct: 5 })
+        })
+        .unwrap_err();
+        assert_eq!(e.code(), 2);
+
+        let r = records(&h);
+        assert!(
+            r.iter().all(|r| r.verdict != Verdict::Good),
+            "checking nothing is not a successful check: {r:?}"
+        );
+        assert!(
+            r.iter().all(|r| r.coverage_pct.is_none()),
+            "no coverage may be claimed for a repository with nothing in it"
+        );
+    }
+
+    #[test]
+    fn damage_exits_one_and_could_not_check_exits_two() {
+        // A cron job alerts on a non-zero exit, and "your backup is damaged" and
+        // "we could not look at it" want different responses at three in the
+        // morning. `Indeterminate` used not to affect the exit status at all.
+        let h = harness("codes");
+        Canary::create_at(&h.rt.canary_dir(), &h.rt.canary_manifest()).unwrap();
+
+        let damaged = verify_in(&h.rt, &h.cfg, None, |_| {
+            FakeEngine::always(VerifyOutcome::Bad(Corruption::PackHashMismatch {
+                pack: "4f2a".into(),
+            }))
+        })
+        .unwrap_err();
+        assert_eq!(damaged.code(), 1);
+
+        let h2 = harness("codes2");
+        Canary::create_at(&h2.rt.canary_dir(), &h2.rt.canary_manifest()).unwrap();
+        let unchecked = verify_in(&h2.rt, &h2.cfg, None, |_| FakeEngine {
+            restore_error: Some(Cause::TimedOut { after_secs: 1800 }),
+            ..FakeEngine::always(VerifyOutcome::Indeterminate(Cause::TimedOut {
+                after_secs: 3600,
+            }))
+        })
+        .unwrap_err();
+        assert_eq!(unchecked.code(), 2);
+    }
+
+    #[test]
+    fn a_run_that_verified_something_still_exits_zero() {
+        // The direction that has to keep working, or every scheduled verify
+        // starts alerting.
+        let h = harness("codesok");
+        Canary::create_at(&h.rt.canary_dir(), &h.rt.canary_manifest()).unwrap();
+        verify_in(&h.rt, &h.cfg, None, |_| {
+            FakeEngine::always(VerifyOutcome::Good { coverage_pct: 1 })
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn a_scripted_failure_applies_to_every_peer_not_just_the_first() {
+        // `snapshot_result` was consumed with `.take()`, so a scripted failure
+        // hit the first peer and every peer after it silently succeeded. A
+        // multi-peer regression test would have passed while asserting nothing.
+        let mut h = harness("multipeer");
+        std::fs::create_dir_all(h.rt.canary_dir()).unwrap();
+        h.cfg.peers.push(Peer {
+            name: pn("bob"),
+            url: "rest:http://example.invalid/bob/".into(),
+            ca_cert: None,
+        });
+        let e = EngineError {
+            message: "server out of space".into(),
+            exit_code: Some(1),
+            cause: Cause::OutOfSpace,
+            damage: None,
+        };
+        let err = backup_in(&h.rt, &h.cfg, None, |_| {
+            FakeEngine::failing_snapshot(e.clone())
+        })
+        .unwrap_err();
+        assert!(err.contains("2 of 2"), "both peers must fail: {err}");
+        assert_eq!(records(&h).len(), 2);
+        assert!(records(&h).iter().all(|r| r.verdict == Verdict::Unknown));
+    }
+
+    #[test]
+    fn a_full_id_recorded_by_backup_matches_the_short_id_a_peer_lists() {
+        // restic's backup summary carries the full 64-character id; `snapshots
+        // --json` reports `short_id`, the first eight. Comparing them directly
+        // never matched, so every verify reported the last backup as missing --
+        // a false FAILED on a healthy peer, which the end-to-end suite caught
+        // and the unit tests did not, because the fake engine uses one id for
+        // both.
+        let full = "80aec4e00642cb0da6162c2d7bb17c6744bfa11caa0d393f7ebe7bdaf8e9bf58";
+        let short = SnapshotId("80aec4e0".into());
+        assert_eq!(short.short(), SnapshotId(full.to_owned()).short());
+    }
+
+    #[test]
+    fn a_peer_that_dropped_a_backup_it_accepted_is_reported() {
+        // Storage is append-only precisely so a compromised *client* cannot
+        // erase its own history. Nothing checked that the host was holding up
+        // their end: a host who restored their disk from an old image, or who
+        // reverted the repository deliberately, passed every check this program
+        // makes. `restic check` finds an old repository internally consistent,
+        // the canary never changes so it still restores, and `status` reads only
+        // local records -- which still say a backup succeeded this morning.
+        let h = harness("dropped");
+        Canary::create_at(&h.rt.canary_dir(), &h.rt.canary_manifest()).unwrap();
+
+        // A backup that succeeded, recorded with its id.
+        backup_in(&h.rt, &h.cfg, None, |_| {
+            FakeEngine::always(VerifyOutcome::Good { coverage_pct: 1 })
+        })
+        .unwrap();
+        let sent = records(&h)
+            .into_iter()
+            .find(|r| r.kind == Kind::Backup)
+            .and_then(|r| r.snapshot)
+            .expect("backup must record which snapshot it made");
+
+        // The peer now lists something else entirely.
+        let err = verify_in(&h.rt, &h.cfg, None, |_| FakeEngine {
+            snapshots: vec![SnapshotMeta {
+                id: SnapshotId("dead0000".into()),
+                time: "2026-01-01T00:00:00Z".into(),
+                paths: vec![PathBuf::from("/srv/data")],
+                tags: vec![BACKUP_TAG.into()],
+            }],
+            ..FakeEngine::always(VerifyOutcome::Good { coverage_pct: 1 })
+        })
+        .unwrap_err();
+        assert_eq!(err.code(), 1, "this is observed loss, not an unknown");
+
+        let dropped = records(&h)
+            .into_iter()
+            .rfind(|r| r.kind == Kind::Backup && r.verdict == Verdict::Bad)
+            .expect("the loss must be recorded");
+        assert!(
+            dropped.detail.unwrap().contains(&sent),
+            "must name the snapshot that went missing"
+        );
+    }
+
+    #[test]
+    fn a_peer_that_still_holds_it_is_not_reported() {
+        // The direction that has to keep working. `FakeEngine`'s default
+        // snapshot id is what `backup` recorded, so nothing is missing.
+        let h = harness("stillthere");
+        Canary::create_at(&h.rt.canary_dir(), &h.rt.canary_manifest()).unwrap();
+        backup_in(&h.rt, &h.cfg, None, |_| {
+            FakeEngine::always(VerifyOutcome::Good { coverage_pct: 1 })
+        })
+        .unwrap();
+        verify_in(&h.rt, &h.cfg, None, |_| {
+            FakeEngine::always(VerifyOutcome::Good { coverage_pct: 1 })
+        })
+        .unwrap();
+        assert!(
+            records(&h).iter().all(|r| r.verdict != Verdict::Bad),
+            "a peer holding what it was sent is not a problem"
+        );
+    }
+
+    #[test]
+    fn a_snapshot_sent_to_a_different_repository_is_not_demanded() {
+        // The id is matched on the repository as well as the name, so a peer
+        // whose URL now points elsewhere is not asked for a snapshot a different
+        // server made.
+        let h = harness("otherrepo");
+        let mut moved = Peer {
+            name: pn("alice"),
+            url: "rest:http://somewhere-else/alice/".into(),
+            ca_cert: None,
+        };
+        let recs = vec![Record {
+            at: now(),
+            peer: pn("alice"),
+            repo: Some(crate::state::repo_id("rest:http://the-old-one/alice/")),
+            kind: Kind::Backup,
+            verdict: Verdict::Good,
+            detail: None,
+            coverage_pct: None,
+            snapshot: Some("longgone".into()),
+        }];
+        assert_eq!(last_backup_snapshot(&recs, &moved), None);
+
+        moved.url = "rest:http://the-old-one/alice/".into();
+        assert_eq!(
+            last_backup_snapshot(&recs, &moved).as_deref(),
+            Some("longgone")
+        );
+        drop(h);
     }
 
     // ---------------------------------------------------------- restore choice

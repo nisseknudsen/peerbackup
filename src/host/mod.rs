@@ -71,28 +71,109 @@ pub struct Ctx {
     pub force: bool,
 }
 
+/// A directory path from the environment, refused if it could not be one.
+///
+/// `provision` writes a systemd mount unit as root, built by interpolating these
+/// paths into an INI file. A newline in one of them appends arbitrary directives
+/// to that unit -- `ExecStartPre=` among them. Reaching that needs the ability to
+/// set the environment of a root command, which is most of the way to root
+/// already, so this is a guard rail rather than a boundary; it costs four lines
+/// and removes the question.
+///
+/// Absolute, because everything downstream joins onto it and a relative root
+/// would resolve against whatever directory systemd happened to start in.
+fn dir_from_env(key: &str, default: &str) -> Result<PathBuf, String> {
+    let Some(v) = std::env::var_os(key) else {
+        return Ok(PathBuf::from(default));
+    };
+    let p = PathBuf::from(v);
+    let s = p.as_os_str().as_encoded_bytes();
+    if s.is_empty() {
+        return Err(format!("{key} is set but empty"));
+    }
+    if s.iter().any(|b| *b == b'\n' || *b == b'\r' || *b == 0) {
+        return Err(format!(
+            "{key} contains a newline or a null byte. It is interpolated into a \
+             systemd unit written as root."
+        ));
+    }
+    if !p.is_absolute() {
+        return Err(format!("{key}={} must be an absolute path", p.display()));
+    }
+    Ok(p)
+}
+
+/// Read a boolean environment variable, refusing anything ambiguous.
+///
+/// This matched the literal string `"1"` and treated everything else as false,
+/// so `DRY_RUN=true peerbackup host provision alice 500G` allocated 500GB,
+/// formatted it and mounted it. For a switch whose entire job is to prevent
+/// that, silently reading an unrecognised value as "no" is the wrong default;
+/// saying so is cheap.
+fn env_flag(key: &str) -> Result<bool, String> {
+    let Some(v) = std::env::var_os(key) else {
+        return Ok(false);
+    };
+    match v.to_string_lossy().trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "" | "0" | "false" | "no" | "off" => Ok(false),
+        other => Err(format!(
+            "{key}={other} is not a yes or a no. Use 1/true/yes/on or 0/false/no/off."
+        )),
+    }
+}
+
+/// The two switches that change whether a `host` command is safe, passed on the
+/// command line.
+///
+/// They are flags rather than only environment variables because every command
+/// that needs them also needs root, and `sudo` resets the environment by
+/// default. `DRY_RUN=1 sudo peerbackup host provision alice 500G` -- the ordering
+/// almost everyone types -- dropped the variable and performed a real 500GB
+/// provision. Nothing in the code or the docs said the safe form was
+/// `sudo DRY_RUN=1 peerbackup ...`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Flags {
+    pub dry_run: bool,
+    pub force: bool,
+}
+
 impl Ctx {
-    pub fn from_env() -> Self {
-        let env_num = |k: &str, d: u64| {
-            std::env::var(k)
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(d)
+    pub fn from_env(flags: Flags) -> Result<Self, String> {
+        // Bounded, not just parsed. `reserve_pct` is multiplied by a filesystem
+        // size and `host_margin_gb` by 1024^3, and release builds have
+        // overflow-checks on -- so an absurd value panicked rather than being
+        // refused. A percentage over 100 is also not a percentage.
+        let env_num = |k: &str, d: u64, max: u64| -> Result<u64, String> {
+            match std::env::var(k) {
+                Err(_) => Ok(d),
+                Ok(v) => match v.trim().parse::<u64>() {
+                    Ok(n) if n <= max => Ok(n),
+                    Ok(n) => Err(format!("{k}={n} is out of range (max {max})")),
+                    Err(_) => Err(format!("{k}='{v}' is not a whole number")),
+                },
+            }
         };
-        let flag = |k: &str| std::env::var(k).is_ok_and(|v| v == "1");
-        Self {
-            root: std::env::var_os("PEERBACKUP_ROOT")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("/srv/peerbackup")),
-            units: std::env::var_os("SYSTEMD_UNIT_DIR")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("/etc/systemd/system")),
-            reserve_pct: env_num("MAINTENANCE_RESERVE_PCT", 15),
-            host_margin_gb: env_num("HOST_MARGIN_GB", 20),
-            dry_run: flag("DRY_RUN"),
-            quiet: flag("QUIET"),
-            force: flag("FORCE"),
-        }
+        Ok(Self {
+            root: dir_from_env("PEERBACKUP_ROOT", "/srv/peerbackup")?,
+            units: dir_from_env("SYSTEMD_UNIT_DIR", "/etc/systemd/system")?,
+            reserve_pct: env_num("MAINTENANCE_RESERVE_PCT", 15, 100)?,
+            // A yottabyte of headroom is past any real disk and leaves the
+            // multiplication by 1024^3 nowhere near u64.
+            host_margin_gb: env_num("HOST_MARGIN_GB", 20, 1 << 30)?,
+            // `DRY_RUN` keeps working: it fails in the safe direction, so an
+            // ambient one costs someone a command that did not happen.
+            dry_run: flags.dry_run || env_flag("DRY_RUN")?,
+            quiet: env_flag("QUIET")?,
+            // The bare `FORCE` is deliberately *not* read any more. It was the
+            // only way to skip the confirmation on the command that permanently
+            // destroys a friend's backups, it is undocumented, and it is a
+            // common shell habit exported by plenty of build and deploy scripts
+            // -- so `sudo -E peerbackup host release alice` from the wrong shell
+            // destroyed 500GB with no prompt. A switch that fails in the unsafe
+            // direction has to be asked for by name.
+            force: flags.force || env_flag("PB_FORCE")?,
+        })
     }
 
     pub fn images(&self) -> PathBuf {
@@ -208,10 +289,54 @@ pub fn is_mountpoint(path: &Path) -> bool {
     let Some(parent) = path.parent() else {
         return true; // "/" is always a mount point.
     };
-    match std::fs::metadata(parent) {
+    let differs = match std::fs::metadata(parent) {
         Ok(up) => here.dev() != up.dev(),
         Err(_) => false,
+    };
+    if !differs {
+        return false;
     }
+    // btrfs gives every subvolume its own st_dev, so the comparison above says
+    // "mounted" for an ordinary subvolume that is nothing of the kind. That
+    // matters here more than anywhere: `guard` runs as ExecStartPre precisely to
+    // refuse a boot where a grant is not really mounted, and btrfs is one of the
+    // three filesystems this tool's own error messages recommend.
+    //
+    // /proc/self/mountinfo is the authority. It is missing in some containers,
+    // so its absence falls back to the st_dev answer rather than failing open
+    // or closed on a technicality.
+    match std::fs::read_to_string("/proc/self/mountinfo") {
+        Ok(info) => info.lines().any(|l| {
+            // Field 5 is the mount point, space-escaped as \040 etc.
+            l.split_whitespace()
+                .nth(4)
+                .is_some_and(|m| unescape_mountinfo(m) == path.as_os_str())
+        }),
+        Err(_) => true,
+    }
+}
+
+/// mountinfo escapes space, tab, newline and backslash as octal.
+fn unescape_mountinfo(s: &str) -> std::ffi::OsString {
+    use std::os::unix::ffi::OsStringExt;
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'\\' && i + 3 < b.len() {
+            let oct = std::str::from_utf8(&b[i + 1..i + 4])
+                .ok()
+                .and_then(|d| u8::from_str_radix(d, 8).ok());
+            if let Some(byte) = oct {
+                out.push(byte);
+                i += 4;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    std::ffi::OsString::from_vec(out)
 }
 
 /// Capacity of the filesystem holding `path`: (total, available) in bytes.
@@ -268,9 +393,19 @@ pub fn unit_name(dir: &Path) -> Result<String, String> {
         })?;
     let name = String::from_utf8_lossy(&out.stdout).trim().to_owned();
     if !out.status.success() || name.is_empty() {
+        // systemd-escape's own complaint, which it writes to stderr and which
+        // this discarded -- leaving "produced an empty unit name" as the entire
+        // explanation for a failure it had already described.
+        let why = String::from_utf8_lossy(&out.stderr);
+        let why = why.trim();
         return Err(format!(
-            "systemd-escape produced an empty unit name for {}",
-            dir.display()
+            "systemd-escape produced no unit name for {}{}",
+            dir.display(),
+            if why.is_empty() {
+                String::new()
+            } else {
+                format!(": {why}")
+            }
         ));
     }
     Ok(name)
@@ -393,5 +528,132 @@ mod tests {
         // `release` calls this for `systemctl disable` and `losetup -d`, and a
         // grant that was never enabled must still be releasable.
         ctx(false).run_best_effort("sh", &["-c", "exit 1"]);
+    }
+
+    #[test]
+    fn a_boolean_env_var_that_is_not_a_yes_or_a_no_is_refused() {
+        // This matched the literal string "1", so `DRY_RUN=true peerbackup host
+        // provision alice 500G` really allocated, formatted and mounted 500GB.
+        // For a switch whose entire job is to prevent that, reading an
+        // unrecognised value as "no" is the wrong default.
+        //
+        // Uses a variable name no other test touches: `std::env::set_var` is
+        // unsafe in edition 2024 because it races every concurrent reader in
+        // this binary.
+        let key = "PB_TEST_FLAG_PARSE";
+        for (v, want) in [
+            ("1", Some(true)),
+            ("true", Some(true)),
+            ("TRUE", Some(true)),
+            ("yes", Some(true)),
+            ("on", Some(true)),
+            ("0", Some(false)),
+            ("false", Some(false)),
+            ("no", Some(false)),
+            ("", Some(false)),
+            ("maybe", None),
+            ("2", None),
+        ] {
+            // SAFETY: this key is used by no other test and by no other thread.
+            unsafe { std::env::set_var(key, v) };
+            match want {
+                Some(b) => assert_eq!(env_flag(key).unwrap(), b, "{v:?}"),
+                None => assert!(env_flag(key).is_err(), "{v:?} must be refused"),
+            }
+        }
+        // SAFETY: as above.
+        unsafe { std::env::remove_var(key) };
+        assert!(!env_flag(key).unwrap(), "unset is a no");
+    }
+
+    #[test]
+    fn the_command_line_can_ask_for_a_dry_run_and_for_force() {
+        // Every command that needs these also needs root, and sudo resets the
+        // environment, so `DRY_RUN=1 sudo peerbackup host provision alice 500G`
+        // -- the ordering people type -- did a real provision.
+        let c = Ctx::from_env(Flags {
+            dry_run: true,
+            force: true,
+        })
+        .unwrap();
+        assert!(c.dry_run);
+        assert!(c.force);
+    }
+
+    #[test]
+    fn a_bare_force_in_the_environment_no_longer_skips_the_confirmation() {
+        // `FORCE=1` is undocumented, unnamespaced and exported by plenty of
+        // build scripts, and it was the only way to skip the prompt on the
+        // command that permanently destroys a friend's backups.
+        //
+        // SAFETY: `FORCE` is read by nothing else in this binary.
+        unsafe { std::env::set_var("FORCE", "1") };
+        let c = Ctx::from_env(Flags::default()).unwrap();
+        // SAFETY: as above.
+        unsafe { std::env::remove_var("FORCE") };
+        assert!(!c.force, "the bare FORCE must not be honoured");
+    }
+
+    #[test]
+    fn a_path_from_the_environment_cannot_carry_a_newline_into_a_systemd_unit() {
+        // `provision` writes a mount unit as root by interpolating these paths
+        // into an INI file, so a newline appends arbitrary directives --
+        // `ExecStartPre=` among them. Reaching it needs the ability to set the
+        // environment of a root command, so this is a guard rail rather than a
+        // boundary, but it costs four lines.
+        let key = "PB_TEST_DIR_FROM_ENV";
+        let cases = [
+            ("/srv/peerbackup", true),
+            ("/srv/x\nExecStartPre=/bin/sh -c evil", false),
+            ("relative/path", false),
+            ("", false),
+        ];
+        for (v, ok) in cases {
+            // SAFETY: this key is used by no other test and by no other thread.
+            unsafe { std::env::set_var(key, v) };
+            assert_eq!(
+                dir_from_env(key, "/default").is_ok(),
+                ok,
+                "{v:?} should {} be accepted",
+                if ok { "" } else { "not" }
+            );
+        }
+        // SAFETY: as above.
+        unsafe { std::env::remove_var(key) };
+        assert_eq!(
+            dir_from_env(key, "/default").unwrap(),
+            std::path::PathBuf::from("/default")
+        );
+    }
+
+    #[test]
+    fn an_out_of_range_tuning_value_is_refused_rather_than_panicking() {
+        // `reserve_pct` is multiplied by a filesystem size and `host_margin_gb`
+        // by 1024^3, and release builds have overflow-checks on, so an absurd
+        // value panicked. A percentage over 100 is also not a percentage.
+        //
+        // SAFETY: these keys are read by nothing else in this binary.
+        unsafe { std::env::set_var("MAINTENANCE_RESERVE_PCT", "500") };
+        assert!(Ctx::from_env(Flags::default()).is_err());
+        unsafe { std::env::set_var("MAINTENANCE_RESERVE_PCT", "15") };
+        assert!(Ctx::from_env(Flags::default()).is_ok());
+        unsafe { std::env::set_var("HOST_MARGIN_GB", "99999999999999999999") };
+        assert!(Ctx::from_env(Flags::default()).is_err());
+        unsafe {
+            std::env::remove_var("MAINTENANCE_RESERVE_PCT");
+            std::env::remove_var("HOST_MARGIN_GB");
+        }
+    }
+
+    #[test]
+    fn mountinfo_escapes_are_decoded() {
+        assert_eq!(
+            unescape_mountinfo("/srv/a"),
+            std::ffi::OsString::from("/srv/a")
+        );
+        assert_eq!(
+            unescape_mountinfo(r"/srv/a\040b"),
+            std::ffi::OsString::from("/srv/a b")
+        );
     }
 }

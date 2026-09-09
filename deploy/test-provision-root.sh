@@ -76,6 +76,8 @@ hdr() { printf '\n\033[1m=== %s ===\033[0m\n' "$*"; }
 # PB_TEST_ROOT lets the caller put the work tree on a filesystem that really
 # preallocates. Without it we land on whatever /tmp is, which in a container is
 # overlayfs and cannot back a real quota.
+# shellcheck source=tests/lib/scratch.sh
+. "$(cd "$(dirname "$0")/.." && pwd)/tests/lib/scratch.sh"
 WORK=$(mktemp -d "${PB_TEST_ROOT:-/tmp}/pb-root-test-XXXXXX")
 # mktemp gives 0700; the server user has to be able to traverse to its grant.
 chmod 755 "$WORK"
@@ -181,6 +183,45 @@ fi
 rmdir "$PEERBACKUP_ROOT/mnt/rollbackpeer" 2>/dev/null || true
 rm -f "$WORK/not-a-dir"
 
+hdr "a mkfs failure rolls back too, not just a later one"
+# `mkfs.ext4` sat outside the rollback boundary behind a bare `?`, so a size ext4
+# cannot format -- or an interrupted mkfs on a 500G image -- returned with the
+# whole allocation on disk and `host release` as the only way out.
+MKFS_OUT=$($HOST provision toosmall 8K 2>&1)
+MKFS_IMG="$PEERBACKUP_ROOT/images/toosmall.img"
+if [ -f "$MKFS_IMG" ]; then
+  bad "a failed mkfs stranded the allocated image at $MKFS_IMG"
+  echo "$MKFS_OUT" | sed 's/^/        /' | tail -3
+else
+  ok "a failed mkfs removes the image it allocated"
+fi
+
+hdr "release detaches every loop device, not just the first"
+# `losetup -j` prints one line per attachment, and taking only the first meant
+# release detached one device, unlinked the image, and left the rest holding its
+# space with no name left to find them by.
+$HOST provision loopy 64M >/dev/null 2>&1
+LOOPY_IMG="$PEERBACKUP_ROOT/images/loopy.img"
+if [ -f "$LOOPY_IMG" ]; then
+  EXTRA=$(losetup -f --show "$LOOPY_IMG" 2>/dev/null || true)
+  if [ -n "$EXTRA" ] && [ "$(losetup -j "$LOOPY_IMG" | wc -l)" -ge 2 ]; then
+    $HOST release --force loopy >/dev/null 2>&1
+    if losetup -j "$LOOPY_IMG" 2>/dev/null | grep -q loop; then
+      bad "release left a loop device attached, so the space is still allocated"
+      losetup -j "$LOOPY_IMG" | sed 's/^/        /'
+      losetup -d "$EXTRA" 2>/dev/null || true
+    else
+      ok "every loop device backed by the image was detached"
+    fi
+  else
+    [ -n "$EXTRA" ] && losetup -d "$EXTRA" 2>/dev/null
+    $HOST release --force loopy >/dev/null 2>&1 || true
+    printf '  \033[33mSKIP\033[0m  could not attach a second loop device\n'
+  fi
+else
+  printf '  \033[33mSKIP\033[0m  could not provision the fixture grant\n'
+fi
+
 hdr "the mount unit is written correctly"
 UNIT=""
 for _u in "$SYSTEMD_UNIT_DIR"/*testpeer*.mount; do
@@ -252,9 +293,14 @@ if command -v setpriv >/dev/null 2>&1; then
     bad "the server user cannot write to the grant: $PROBE_ERR"
     ls -ld "$DIR" | sed 's/^/        /'
   fi
+else
+  # Silence here meant the section's one real assertion vanished on any runner
+  # without util-linux, and nothing said so.
+  skip "setpriv is not installed, so the server user's write access was not checked"
 fi
 
 hdr "the quota is real, not advisory"
+HOSTFREE_BEFORE=$(df -Pk "$WORK" | awk 'NR==2{print $4}')
 LIST=$($HOST list 2>&1)
 echo "$LIST" | sed 's/^/        /' | head -4
 # ext4 with -m 0 on 64M leaves roughly 50M usable after metadata.
@@ -273,15 +319,28 @@ if [ "$DDRC" -ne 0 ] && grep -qi 'no space' "$WORK/dd.out"; then
 else
   bad "writing 200M into a 64M grant did not fail with ENOSPC (rc=$DDRC)"
 fi
+# The real question is whether 200M of writes landed inside the grant or on the
+# host filesystem. Asserting only that `df` printed a number could not fail.
 HOSTFREE_AFTER=$(df -Pk "$WORK" | awk 'NR==2{print $4}')
-[ -n "$HOSTFREE_AFTER" ] && ok "host filesystem still reports free space (grant was contained)"
+if [ -z "$HOSTFREE_AFTER" ] || [ -z "${HOSTFREE_BEFORE:-}" ]; then
+  bad "could not read free space before and after, so containment was not checked"
+else
+  # The grant is 64M. Anything approaching the 200M we tried to write means the
+  # writes escaped it.
+  LOST=$(( HOSTFREE_BEFORE - HOSTFREE_AFTER ))
+  if [ "$LOST" -lt 102400 ]; then
+    ok "the host filesystem lost ${LOST}KiB, so the writes stayed inside the grant"
+  else
+    bad "the host filesystem lost ${LOST}KiB; the writes escaped the grant"
+  fi
+fi
 rm -f "$DIR/filler"
 
 hdr "release tears down in the right order"
 LOOPDEV=$(losetup -j "$IMG" | cut -d: -f1)
 [ -n "$LOOPDEV" ] && ok "a loop device is attached ($LOOPDEV)" || bad "no loop device attached"
 
-FORCE=1 $HOST release testpeer >"$WORK/release.out" 2>&1; RRC=$?
+$HOST release --force testpeer >"$WORK/release.out" 2>&1; RRC=$?
 [ "$RRC" -eq 0 ] && ok "release exited 0" || { bad "release exited $RRC"; sed 's/^/        /' "$WORK/release.out" | tail -5; }
 
 mountpoint -q "$DIR" 2>/dev/null && bad "grant is STILL MOUNTED after release" || ok "grant unmounted"
@@ -302,7 +361,7 @@ DIR2="$PEERBACKUP_ROOT/mnt/testpeer2"
 mount -o loop "$IMG2" "$DIR2" 2>/dev/null
 if mountpoint -q "$DIR2"; then
   exec 9<"$DIR2"          # hold a descriptor so umount fails
-  FORCE=1 $HOST release testpeer2 >"$WORK/release2.out" 2>&1
+  $HOST release --force testpeer2 >"$WORK/release2.out" 2>&1
   exec 9<&-
   if [ -f "$IMG2" ]; then
     ok "release stopped rather than deleting a still-mounted image"
@@ -318,9 +377,9 @@ if mountpoint -q "$DIR2"; then
   umount "$DIR2" 2>/dev/null || true
   losetup -D 2>/dev/null || true
 else
-  ok "skipped: could not mount second image"
+  skip "could not mount the second image, so the ordering check did not run"
 fi
 
 hdr "Summary"
-printf '  passed: %d   failed: %d\n' "$PASS" "$FAIL"
+printf '  passed: %d   failed: %d   skipped: %d\n' "$PASS" "$FAIL" "$SKIP"
 [ "$FAIL" -eq 0 ] || exit 1

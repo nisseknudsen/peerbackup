@@ -2,9 +2,22 @@ name: CI
 
 on:
   push:
-    branches: ["**"]
+    branches: [main]
   pull_request:
   workflow_dispatch:
+
+# A branch push and its pull request used to fire the same seven jobs twice, and
+# a second push while the first was still running left both racing. `push` is
+# now main only; branches are covered by their pull request.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Nothing here writes to the repository. The default token is read-write on
+# repositories where that has not been changed, and every third-party action in
+# this file can see it.
+permissions:
+  contents: read
 
 # Everything here runs against a REAL restic and a REAL rest-server. There are no
 # mocks in this pipeline on purpose: the product's central claim is that a printed
@@ -17,31 +30,88 @@ env:
   RESTIC_SHA256: "f415415624dcc452f2a02b8c33641791a8c6d6d3b65bbb3543fcf9a25151585c"
 
 jobs:
+  pins:
+    name: pinned versions agree
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      # The restic version and its checksum live in this file, in the Dockerfile
+      # and in spike.yml. Bump one and forget another and the container ships a
+      # restic that nothing in CI ever ran -- which is the one thing pinning was
+      # supposed to rule out.
+      - name: restic pin matches everywhere it appears
+        run: |
+          set -euo pipefail
+          fail=0
+          check() {
+            if ! grep -qF "$2" "$1"; then
+              echo "::error file=$1::expected to find '$2'"
+              fail=1
+            fi
+          }
+          check Dockerfile "RESTIC_VERSION=${RESTIC_VERSION}"
+          check Dockerfile "RESTIC_SHA256_amd64=${RESTIC_SHA256}"
+          check .github/workflows/spike.yml "${RESTIC_VERSION}"
+          check .github/workflows/spike.yml "${RESTIC_SHA256}"
+          exit "$fail"
+      # Same argument for the toolchain: the README promises 1.88 and only the
+      # Dockerfile ever compiles with it.
+      - name: the MSRV in Cargo.toml is the one the image builds with
+        run: |
+          set -euo pipefail
+          msrv=$(grep -oP 'rust-version = "\K[^"]+' Cargo.toml)
+          grep -qF "FROM rust:${msrv}-alpine" Dockerfile \
+            || { echo "::error::Cargo.toml says rust-version ${msrv}, Dockerfile disagrees"; exit 1; }
+          grep -qF "Rust ${msrv}+" README.md \
+            || { echo "::error::README does not state Rust ${msrv}+"; exit 1; }
+
+  msrv:
+    name: builds on the stated minimum Rust
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      # `rust-version` was only ever exercised as a side effect of the container
+      # test, so bumping the Dockerfile's tag would have silently retired the
+      # README's "Rust 1.88+" claim.
+      - name: read the MSRV from Cargo.toml
+        id: msrv
+        run: echo "v=$(grep -oP 'rust-version = \"\K[^\"]+' Cargo.toml)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable, resolved 2026-09-09
+        with:
+          toolchain: ${{ steps.msrv.outputs.v }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - run: cargo build --locked
+
   lint:
     name: shellcheck
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      # Digest, not `:stable`. A retag upstream reddened this job with no change
+      # in the repository, which is the failure mode that teaches people to
+      # ignore a red pipeline.
       - name: shellcheck (warnings and above)
         run: |
-          docker run --rm -v "$PWD:/mnt" koalaman/shellcheck:stable \
+          docker run --rm -v "$PWD:/mnt" \
+            koalaman/shellcheck@sha256:bb596a0d169b85ddd81d8b6d3a2ff6d5baf5fca10b97f575ebc647c3dff62b3d \
             -S warning -f gcc \
             deploy/test-host-tooling.sh \
             deploy/test-compose-e2e.sh \
             deploy/test-provision-root.sh \
             spike/lifecycle-spike.sh \
             tests/end_to_end.sh \
-            tests/docker.sh
+            tests/docker.sh \
+            tests/lib/scratch.sh
 
   rust:
     name: rust (fmt, clippy, tests)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable, resolved 2026-09-09
         with:
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
 
       - name: install restic (the engine drives it; some tests spawn it)
         run: |
@@ -65,9 +135,9 @@ jobs:
     name: dependency advisories
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable, resolved 2026-09-09
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       # Built from source rather than pulled from a third-party action. The
       # dependency set here is seven direct crates and pinned by Cargo.lock, and
       # the point of this job is supply chain, so it should not be the one place
@@ -81,9 +151,9 @@ jobs:
     name: client lifecycle + disaster recovery
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable, resolved 2026-09-09
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
 
       - name: install restic
         run: |
@@ -106,7 +176,7 @@ jobs:
     name: client container image
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       # Builds the image and checks the failure Docker makes easy: a source
       # directory that was never mounted.
       - run: ./tests/docker.sh
@@ -116,9 +186,9 @@ jobs:
     name: host tooling (no docker, no root)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable, resolved 2026-09-09
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - run: cargo build
       - run: ./deploy/test-host-tooling.sh
 
@@ -126,9 +196,9 @@ jobs:
     name: compose + real restic + real rest-server
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable, resolved 2026-09-09
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - run: cargo build
 
       - name: install restic (pinned, checksum verified)
@@ -151,9 +221,9 @@ jobs:
     name: provisioning lifecycle (real loop devices)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable, resolved 2026-09-09
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - run: cargo build
 
       # Runs as root on the runner rather than in a nested privileged container:

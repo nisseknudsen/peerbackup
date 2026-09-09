@@ -60,6 +60,69 @@ fn default_data_dir() -> PathBuf {
 /// Uses a plain directory rather than a preallocated image, so the size limit
 /// is rest-server's and is shared across all peers. `provision` is the version
 /// with a per-peer limit the kernel enforces.
+/// Does this container already hold a login for this peer?
+///
+/// `htpasswd -i` overwrites silently, and the credential it replaces is the one
+/// the peer is actively using. Answering `false` when docker cannot be asked is
+/// deliberate: the check exists to stop an accidental rotation, and refusing to
+/// create a login because the *check* failed would be worse than the thing it
+/// guards against.
+fn has_login(container: &str, peer: &PeerName) -> bool {
+    Command::new("docker")
+        .args([
+            "exec",
+            container,
+            "sh",
+            "-c",
+            r#"grep -q "^$1:" "$PASSWORD_FILE""#,
+            "sh",
+            peer.as_str(),
+        ])
+        .output()
+        .is_ok_and(|o| o.status.success())
+}
+
+/// Where a running container's `/data` actually comes from on the host.
+///
+/// Returns `None` when docker cannot be asked or the container has no such
+/// mount, because a missing answer is not evidence of a mismatch.
+fn container_data_source(container: &str) -> Option<std::path::PathBuf> {
+    let out = Command::new("docker")
+        .args([
+            "inspect",
+            "-f",
+            r#"{{range .Mounts}}{{if eq .Destination "/data"}}{{.Source}}{{end}}{{end}}"#,
+            container,
+        ])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    (!s.is_empty()).then(|| std::path::PathBuf::from(s))
+}
+
+/// The uid and gid the server container should run as.
+///
+/// `getuid` is 0 under sudo, and `quickstart` does not need root -- so a habitual
+/// `sudo peerbackup host quickstart alice` produced a server writing root-owned
+/// files, which is the README's own troubleshooting entry. `SUDO_UID` is the
+/// account that actually invoked it, and `PB_UID` overrides both so this can be
+/// made to match the service unit.
+fn server_ids() -> (u32, u32) {
+    let from_env = |keys: [&str; 2]| {
+        keys.iter()
+            .find_map(|k| std::env::var(k).ok()?.trim().parse::<u32>().ok())
+    };
+    // SAFETY: getuid/getgid read process properties and cannot fail.
+    let (u, g) = unsafe { (libc::getuid(), libc::getgid()) };
+    (
+        from_env(["PB_UID", "SUDO_UID"]).unwrap_or(u),
+        from_env(["PB_GID", "SUDO_GID"]).unwrap_or(g),
+    )
+}
+
 pub fn quickstart(ctx: &Ctx, peer: &PeerName, o: &ServerOpts) -> Res {
     if !have("docker") {
         return Err("docker is required".into());
@@ -70,14 +133,16 @@ pub fn quickstart(ctx: &Ctx, peer: &PeerName, o: &ServerOpts) -> Res {
         );
     }
 
-    std::fs::create_dir_all(&o.data).map_err(|e| {
-        format!(
-            "cannot create {} ({e})\n       Pick somewhere you can write: \
-             PB_DATA=/path peerbackup host quickstart {peer}",
-            o.data.display()
-        )
-    })?;
-    if !writable(&o.data) {
+    if !ctx.would(&format!("mkdir -p {}", o.data.display())) {
+        std::fs::create_dir_all(&o.data).map_err(|e| {
+            format!(
+                "cannot create {} ({e})\n       Pick somewhere you can write: \
+                 PB_DATA=/path peerbackup host quickstart {peer}",
+                o.data.display()
+            )
+        })?;
+    }
+    if !ctx.dry_run && !writable(&o.data) {
         return Err(format!(
             "{} exists but is not writable by this user\n       \
              Either: sudo chown -R $(id -un) '{}'\n       \
@@ -107,10 +172,33 @@ pub fn quickstart(ctx: &Ctx, peer: &PeerName, o: &ServerOpts) -> Res {
             "server already running on port {}, adding a peer to it",
             o.port
         ));
+        // What it is actually serving, rather than what this invocation would
+        // have told it to serve. The `Storage:` line printed at the end comes
+        // from `o.data`, so adopting a container started against a different
+        // directory reported a path with none of the peer's data in it -- and
+        // on a host using per-peer grants, the wrong filesystem entirely.
+        if let Some(actual) = container_data_source(&o.container)
+            && actual != o.data
+        {
+            warn(&format!(
+                "that container stores data in {}, not {}.\n       \
+                 Everything below refers to the container's directory. If that is \
+                 not what\n       you meant: docker rm -f {} and run this again.",
+                actual.display(),
+                o.data.display(),
+                o.container
+            ));
+        }
     } else {
-        let _ = Command::new("docker")
-            .args(["rm", "-f", &o.container])
-            .output();
+        // A dry run reached this and really deleted the container. `quickstart`
+        // is the command someone rehearses precisely because they are not sure
+        // what it will do, and `rm -f` on a stopped container takes its
+        // configuration with it.
+        if !ctx.would(&format!("docker rm -f {}", o.container)) {
+            let _ = Command::new("docker")
+                .args(["rm", "-f", &o.container])
+                .output();
+        }
         if !port_free(o.port) {
             return Err(format!(
                 "port {} is already in use on this machine\n       \
@@ -120,31 +208,51 @@ pub fn quickstart(ctx: &Ctx, peer: &PeerName, o: &ServerOpts) -> Res {
         }
 
         ctx.info(&format!("starting the server on port {}", o.port));
-        let user = format!("{}:{}", uid(), gid());
+        // Under sudo this is 0:0, and every file the server writes ends up
+        // root-owned -- which is the README's own troubleshooting entry, "you
+        // cannot read your own stored backups without sudo". `quickstart` does
+        // not need root, so the fix is to use the account that invoked it.
+        let (uid, gid) = server_ids();
+        let user = format!("{uid}:{gid}");
+        if uid == 0 {
+            warn(
+                "running the server as root. Everything it stores will be root-owned \
+                 and you\n       will need sudo to read your own data. Set PB_UID and \
+                 PB_GID, or run\n       this without sudo -- quickstart does not need it.",
+            );
+        }
         let ports = format!("{}:8000", o.port);
         let volume = format!("{}:/data", o.data.display());
         let options = format!(
             "OPTIONS=--private-repos --append-only --max-size {}",
             o.max_size
         );
+        let run_args = [
+            "run",
+            "-d",
+            "--name",
+            &o.container,
+            "--restart",
+            "unless-stopped",
+            "--user",
+            &user,
+            "-p",
+            &ports,
+            "-v",
+            &volume,
+            "-e",
+            &options,
+            REST_SERVER_IMAGE,
+        ];
+        if ctx.would(&format!("docker {}", run_args.join(" "))) {
+            ctx.info("");
+            ctx.info(&format!(
+                "would then create the login for '{peer}' and print an invite URL."
+            ));
+            return Ok(());
+        }
         let out = Command::new("docker")
-            .args([
-                "run",
-                "-d",
-                "--name",
-                &o.container,
-                "--restart",
-                "unless-stopped",
-                "--user",
-                &user,
-                "-p",
-                &ports,
-                "-v",
-                &volume,
-                "-e",
-                &options,
-                REST_SERVER_IMAGE,
-            ])
+            .args(run_args)
             .output()
             .map_err(|e| format!("could not run docker: {e}"))?;
         if !out.status.success() {
@@ -184,6 +292,25 @@ pub fn quickstart(ctx: &Ctx, peer: &PeerName, o: &ServerOpts) -> Res {
                 .output();
             return Err(format!("could not start the server on port {}", o.port));
         }
+    }
+
+    // Checked here as well as in `adduser`, so the message fits what the person
+    // was actually doing. Re-running `quickstart` to see whether the server is
+    // up is a reasonable thing to do, and it used to rotate the peer's password
+    // as a side effect.
+    if !ctx.force && has_login(&o.container, peer) {
+        ctx.info("");
+        ctx.info(&format!(
+            "The server is running and '{peer}' already has a login on it."
+        ));
+        ctx.info("Nothing changed. peerbackup does not keep their password, so it");
+        ctx.info("cannot print the invite again.");
+        ctx.info("");
+        ctx.info(&format!(
+            "To issue a new password (their old one stops working):\n  \
+             peerbackup host adduser {peer} --force"
+        ));
+        return Ok(());
     }
 
     let pw = adduser(ctx, peer, None, o).map_err(|e| {
@@ -235,9 +362,34 @@ pub fn adduser(
             (p, true)
         }
     };
+
+    // `htpasswd` overwrites an existing entry without a word. `quickstart` calls
+    // this, so running `host quickstart alice` a second time -- to check on it,
+    // or after a failure elsewhere -- silently replaced alice's password with a
+    // new one. Her backups then fail with 401 until someone works out that the
+    // credential she was given is no longer the credential the server holds.
+    if !ctx.force && has_login(&o.container, peer) {
+        return Err(format!(
+            "'{peer}' already has a login on '{}'.\n       \
+             Creating one again replaces their password, and everything they run \
+             with the\n       old one starts failing with 401.\n\n       \
+             If that is what you want: peerbackup host adduser {peer} --force\n       \
+             If you only wanted to check the server is up: peerbackup host list",
+            o.container
+        ));
+    }
+
     if generated {
         ctx.say(&format!("generated password for '{peer}': {pw}"));
         ctx.say("send it over a channel you trust. It is not stored anywhere in plaintext.");
+    }
+
+    if ctx.would(&format!(
+        "docker exec -i {} htpasswd -B -i $PASSWORD_FILE {peer}",
+        o.container
+    )) {
+        ctx.would(&format!("docker restart {}", o.container));
+        return Ok(generated.then_some(pw));
     }
 
     let out = Command::new("docker")
@@ -290,6 +442,12 @@ pub fn adduser(
 
     ctx.say("restarting the server so it picks up the new credential (it only reads");
     ctx.say("the htpasswd file at startup)");
+    // One server serves every peer, so this interrupts anyone mid-upload. restic
+    // resumes -- the repository is append-only and a partial upload leaves no
+    // snapshot -- but a friend seventeen hours into a 300GB seed would rather
+    // know than wonder.
+    ctx.say("this drops any transfer in progress; peers retry, but a large first");
+    ctx.say("backup will lose its place");
     ctx.run("docker", &["restart", &o.container])?;
 
     if ctx.dry_run {
@@ -398,15 +556,6 @@ pub fn compose(ctx: &Ctx, up: bool) -> Res {
 }
 
 // ------------------------------------------------------------------- plumbing
-
-fn uid() -> u32 {
-    // SAFETY: getuid reads a process property and cannot fail.
-    unsafe { libc::getuid() }
-}
-fn gid() -> u32 {
-    // SAFETY: getgid reads a process property and cannot fail.
-    unsafe { libc::getgid() }
-}
 
 fn writable(path: &std::path::Path) -> bool {
     let probe = path.join(format!(".peerbackup-write-test-{}", std::process::id()));
@@ -637,12 +786,53 @@ mod tests {
         };
         assert!(PeerName::new("a b").is_err());
         assert!(PeerName::new("").is_err());
-        // A valid name still reaches the docker check and fails there, not on
-        // validation, which is what proves the name was accepted.
-        let e = quickstart(&ctx, &PeerName::new("alice").unwrap(), &o).unwrap_err();
+        // A valid name gets past validation. On a machine with docker the dry
+        // run then succeeds; on one without, the complaint is about docker and
+        // never about the name.
+        if let Err(e) = quickstart(&ctx, &PeerName::new("alice").unwrap(), &o) {
+            assert!(
+                e.contains("docker"),
+                "a legitimate name must not be refused as a name: {e}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_dry_run_of_quickstart_does_not_touch_anything() {
+        // `quickstart` and `adduser` built their docker calls with a raw
+        // `Command::new` instead of `ctx.run`, so `Ctx::dry_run` was never
+        // consulted anywhere in the server path -- and the contract on it says
+        // "print what would happen and touch nothing".
+        //
+        // A rehearsal with a stopped container really ran `docker rm -f`,
+        // taking its configuration with it, then really started a new one and
+        // really wrote an htpasswd entry. This test itself was the proof: it
+        // ran during `cargo test` on any machine with docker, deleted whatever
+        // was named `x`, and left a rest-server listening on 51515 with
+        // `--restart unless-stopped`.
+        let dir = std::env::temp_dir().join(format!("pb-dryrun-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let ctx = Ctx {
+            root: PathBuf::from("/tmp/pb-unused"),
+            units: PathBuf::from("/tmp/pb-unused"),
+            reserve_pct: 15,
+            host_margin_gb: 20,
+            dry_run: true,
+            quiet: true,
+            force: false,
+        };
+        let o = ServerOpts {
+            port: 51515,
+            data: dir.clone(),
+            container: "peerbackup-test-must-not-exist".into(),
+            max_size: 1,
+        };
+        let _ = quickstart(&ctx, &PeerName::new("alice").unwrap(), &o);
         assert!(
-            !e.contains("peer name"),
-            "a legitimate name must not be refused as a name: {e}"
+            !dir.exists(),
+            "a dry run created the storage directory at {}",
+            dir.display()
         );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
