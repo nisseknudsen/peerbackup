@@ -48,7 +48,7 @@ hdr "setup"
 scratch_claim "$WORK" || exit 1
 cleanup
 rm -rf "${WORK:?}"; mkdir -p "$WORK"/{cfg,state,srv,data,other}
-scratch_claim "$WORK" || exit 1
+scratch_mark "$WORK"
 echo "in the mounted directory" > "$WORK/data/kept.txt"
 echo "in the unmounted one"     > "$WORK/other/missed.txt"
 

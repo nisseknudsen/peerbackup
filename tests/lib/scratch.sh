@@ -20,6 +20,10 @@
 #      directory this suite did not create is never deleted, whatever its name.
 #      A fresh path is claimed and marked; a stale one from a previous run is
 #      recognised and reused.
+#
+# The wipe removes the marker along with everything else, so call `scratch_mark`
+# after it rather than `scratch_claim` again -- re-claiming a directory the
+# script has just recreated would see it unmarked and refuse.
 
 scratch_marker=.peerbackup-scratch
 
@@ -60,6 +64,11 @@ scratch_claim() {
     echo "  Refusing to delete it. Remove it yourself, or point WORK somewhere else." >&2
     return 1
   fi
-  mkdir -p "$dir" || return 1
-  : > "$dir/$scratch_marker" || return 1
+  scratch_mark "$dir"
+}
+
+# Re-mark a directory this suite has already claimed and then wiped.
+scratch_mark() {
+  mkdir -p "$1" || return 1
+  : > "$1/$scratch_marker" || return 1
 }
