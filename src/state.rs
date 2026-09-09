@@ -217,10 +217,35 @@ pub enum Verdict {
     Unknown,
 }
 
+/// Identify the repository a record is about, from its URL.
+///
+/// Truncated SHA-256, not the URL itself: the URL carries the peer's HTTP
+/// credentials and this value is written to a file and printed in diagnostics.
+/// Sixteen hex characters is 64 bits, which is far more than enough to tell one
+/// friend's server from another's.
+#[must_use]
+pub fn repo_id(url: &str) -> String {
+    sha256_bytes(url.as_bytes()).chars().take(16).collect()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Record {
     pub at: u64,
     pub peer: PeerName,
+    /// Which repository this is about; see [`repo_id`].
+    ///
+    /// Records were keyed on the peer name alone, and a name is not an identity.
+    /// `peer remove alice` deliberately keeps the evidence, so `peer add alice
+    /// <a-different-friend>` adopted it: a brand-new empty server reported
+    /// `alice ok / 60m ago / 58m ago / 56m ago / 1%` and exited 0, one command
+    /// after `peer add` had printed "No data has been sent yet".
+    ///
+    /// `None` on records written before this existed. Those are still honoured
+    /// for damage -- an unrefuted `Bad` does not stop being true -- but not for
+    /// freshness, because "we cannot tell which repository this was about" must
+    /// not read as "recently confirmed good".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
     pub kind: Kind,
     pub verdict: Verdict,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -553,7 +578,19 @@ pub fn status(cfg: &Config, records: &[Record], now_ts: u64) -> Vec<PeerStatus> 
     cfg.peers
         .iter()
         .map(|peer| {
-            let mine: Vec<&Record> = records.iter().filter(|r| r.peer == peer.name).collect();
+            let id = repo_id(&peer.url);
+            let mine: Vec<&Record> = records
+                .iter()
+                .filter(|r| r.peer == peer.name && r.repo.as_ref().is_none_or(|r| *r == id))
+                .collect();
+            // Freshness needs to know the record was about *this* repository.
+            // Damage does not: an unrefuted `Bad` under this name is worth
+            // reporting even if we cannot prove which server it came from.
+            let confirmed: Vec<&Record> = mine
+                .iter()
+                .copied()
+                .filter(|r| r.repo.as_deref() == Some(id.as_str()))
+                .collect();
 
             // Damage of a given kind that nothing has since refuted, folded in
             // log order: `Bad` raises it, `Good` clears it, and `Unknown` leaves
@@ -577,7 +614,8 @@ pub fn status(cfg: &Config, records: &[Record], now_ts: u64) -> Vec<PeerStatus> 
             // means a peer that is full, unreachable or misconfigured keeps
             // reporting "backed up just now" while receiving nothing.
             let last = |k: Kind| {
-                mine.iter()
+                confirmed
+                    .iter()
                     .filter(|r| r.kind == k && r.verdict == Verdict::Good && r.at <= horizon)
                     .map(|r| r.at)
                     .max()
@@ -605,7 +643,7 @@ pub fn status(cfg: &Config, records: &[Record], now_ts: u64) -> Vec<PeerStatus> 
                 .collect();
             let problem = (!problems.is_empty()).then(|| problems.join("; "));
 
-            let clock_skew = mine.iter().any(|r| r.at > horizon);
+            let clock_skew = confirmed.iter().any(|r| r.at > horizon);
 
             let last_backup = last(Kind::Backup);
             let last_subset = last(Kind::Subset);
@@ -630,7 +668,8 @@ pub fn status(cfg: &Config, records: &[Record], now_ts: u64) -> Vec<PeerStatus> 
             // and we are unsure about something else".
             let coverage_pct = subset_fresh
                 .then(|| {
-                    mine.iter()
+                    confirmed
+                        .iter()
                         .rev()
                         .find(|r| r.kind == Kind::Subset && r.verdict == Verdict::Good)
                         .and_then(|r| r.coverage_pct)
@@ -711,10 +750,15 @@ mod tests {
         c
     }
 
+    // The URL every test peer uses, so `rec` and `cfg_with_peer` agree on which
+    // repository the records are about.
+    const TEST_URL: &str = "rest:http://x/";
+
     fn rec(kind: Kind, verdict: Verdict, at: u64) -> Record {
         Record {
             at,
             peer: PeerName::new("alice").unwrap(),
+            repo: Some(repo_id(TEST_URL)),
             kind,
             verdict,
             detail: None,
@@ -731,6 +775,76 @@ mod tests {
             detail: Some(detail.to_owned()),
             ..rec(kind, verdict, at)
         }
+    }
+
+    #[test]
+    fn history_under_a_reused_name_does_not_transfer_to_a_different_repository() {
+        // Records were keyed on the peer name alone, and a name is not an
+        // identity. `peer remove alice` deliberately keeps the evidence, so
+        // `peer add alice <a-different-friend>` adopted it: a brand-new empty
+        // server reported `alice ok ... 1%` and exited 0, one command after
+        // `peer add` printed "No data has been sent yet".
+        let recs = vec![
+            rec(Kind::Backup, Verdict::Good, NOW - 3600),
+            rec(Kind::Subset, Verdict::Good, NOW - 3500),
+            rec(Kind::Canary, Verdict::Good, NOW - 3400),
+        ];
+        // Same records, same name, pointed at somewhere else.
+        let mut moved = Config::default();
+        moved.peers.push(Peer {
+            name: PeerName::new("alice").unwrap(),
+            url: "rest:http://a-different-friend/me/".into(),
+            ca_cert: None,
+        });
+        let r = &status(&moved, &recs, NOW)[0];
+        assert_eq!(r.state, PeerState::Unknown, "{:?}", r.problem);
+        assert_eq!(r.last_backup, None, "this server holds nothing");
+
+        // And the original peer is unaffected.
+        assert_eq!(
+            status(&cfg_with_peer(), &recs, NOW)[0].state,
+            PeerState::Good
+        );
+    }
+
+    #[test]
+    fn damage_recorded_before_repository_ids_existed_is_still_reported() {
+        // Legacy records carry no id. Ignoring them for freshness is the safe
+        // direction -- "we cannot tell which repository this was" must not read
+        // as "recently confirmed good" -- but an unrefuted Bad does not stop
+        // being true because the record predates the field.
+        let legacy = Record {
+            repo: None,
+            detail: Some("pack 4f2a hash mismatch".into()),
+            ..rec(Kind::Subset, Verdict::Bad, NOW - 3600)
+        };
+        let r = &status(&cfg_with_peer(), &[legacy], NOW)[0];
+        assert_eq!(r.state, PeerState::Bad);
+        assert!(r.problem.as_deref().unwrap_or_default().contains("4f2a"));
+    }
+
+    #[test]
+    fn a_legacy_good_record_does_not_count_as_a_recent_check() {
+        let legacy = Record {
+            repo: None,
+            ..rec(Kind::Backup, Verdict::Good, NOW - 60)
+        };
+        let r = &status(&cfg_with_peer(), &[legacy], NOW)[0];
+        assert_eq!(r.last_backup, None);
+        assert_eq!(r.state, PeerState::Unknown);
+    }
+
+    #[test]
+    fn a_repository_id_is_stable_and_carries_no_credential() {
+        let url = "rest:https://me:hunter2@alice.example.org:8000/me/";
+        let id = repo_id(url);
+        assert_eq!(id, repo_id(url), "stable");
+        assert_ne!(
+            id,
+            repo_id("rest:https://me:hunter2@bob.example.org:8000/me/")
+        );
+        assert!(!id.contains("hunter2"));
+        assert_eq!(id.len(), 16);
     }
 
     #[test]
@@ -1405,6 +1519,8 @@ mod scenario_tests {
     use super::*;
     use crate::config::Peer;
 
+    const TEST_URL: &str = "rest:http://x/";
+
     #[test]
     fn a_peer_that_is_full_must_not_look_ok() {
         // A peer with no room fails every backup. Those failures are recorded
@@ -1421,6 +1537,7 @@ mod scenario_tests {
         let r = |kind, verdict, at| Record {
             at,
             peer: PeerName::new("full").unwrap(),
+            repo: Some(repo_id(TEST_URL)),
             kind,
             verdict,
             detail: None,
