@@ -1,0 +1,16 @@
+# The build context is uploaded to the daemon in full on every build. `target/`
+# alone is over a gigabyte here, and the rest of this list is things that should
+# not travel to a daemon at all: a local recovery file holds the passwords that
+# decrypt every backup, and `certs/` is where the README's TLS section puts a
+# private key.
+target/
+.git/
+.github/
+certs/
+*.pem
+.env
+recovery*.txt
+peerbackup-data/
+review/
+*.md
+!README.md

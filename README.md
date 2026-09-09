@@ -482,4 +482,4 @@ Integration tests use a real rest-server and a real restic. None require root:
 
 ## License
 
-Not yet chosen.
+MIT. See [LICENSE](LICENSE).
