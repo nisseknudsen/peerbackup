@@ -950,6 +950,16 @@ pub fn status_cmd() -> Res {
     // freshness, so the peer reads `unchecked` instead of green -- but a peer
     // that reads `unchecked` for a reason that has nothing to do with the peer
     // is exactly the sort of thing that gets ignored for a month.
+    for r in rows.iter().filter(|r| r.unrecognised) {
+        println!();
+        println!(
+            "{}: some results were written by a newer peerbackup",
+            r.name
+        );
+        println!("  This version cannot interpret them, so they do not count as");
+        println!("  checks. Upgrade, or ignore this if you meant to downgrade.");
+    }
+
     for r in rows.iter().filter(|r| r.clock_skew) {
         println!();
         println!("{}: some results are dated in the future", r.name);
@@ -1374,6 +1384,7 @@ mod tests {
             coverage_pct: None,
             problem: None,
             clock_skew: false,
+            unrecognised: false,
         }
     }
 

@@ -74,7 +74,19 @@ impl Canary {
         for i in 0..3 {
             let path = dir.join(format!("canary-{i}.bin"));
             let mut buf = vec![0u8; 64 * 1024];
-            fs::File::open("/dev/urandom")?.read_exact(&mut buf)?;
+            // A bare "No such file or directory" for a path the user never
+            // named is a poor first experience, and a minimal container or a
+            // chroot without /dev produces exactly that.
+            let mut src = fs::File::open("/dev/urandom").map_err(|e| {
+                io::Error::new(
+                    e.kind(),
+                    format!(
+                        "could not open /dev/urandom to create the test files: {e}. \
+                         In a container, check that /dev is mounted."
+                    ),
+                )
+            })?;
+            src.read_exact(&mut buf)?;
             fs::write(&path, &buf)?;
             files.push(CanaryFile {
                 path: path.clone(),
@@ -185,6 +197,14 @@ pub fn sha256_bytes(b: &[u8]) -> String {
 
 // ------------------------------------------------------------------- evidence
 
+/// What a record is about.
+///
+/// `Unrecognised` catches a kind written by a future version. Without it, serde
+/// rejects the whole record and the backwards walk drops it -- which is fine for
+/// a new *kind* of check and not fine at all if a future version ever adds one
+/// that can carry a `Bad` verdict, because an older binary would silently
+/// un-see it. Unrecognised kinds take no part in freshness, so the worst they
+/// cost is a peer reading `unchecked`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Kind {
@@ -194,6 +214,9 @@ pub enum Kind {
     Subset,
     /// The canary was restored and compared against its recorded digest.
     Canary,
+    /// Written by a newer version of peerbackup than this one.
+    #[serde(other)]
+    Unrecognised,
 }
 
 impl Kind {
@@ -204,6 +227,7 @@ impl Kind {
             Kind::Backup => "backup",
             Kind::Subset => "read-back",
             Kind::Canary => "test file",
+            Kind::Unrecognised => "check",
         }
     }
 }
@@ -215,6 +239,16 @@ pub enum Verdict {
     Bad,
     /// Could not tell. Never treated as a failure of the data.
     Unknown,
+    /// A verdict this version does not know about, written by a newer one.
+    ///
+    /// Strict deserialisation rejected the whole record, and the backwards walk
+    /// then dropped it. That is safe for a verdict that means something good and
+    /// unsafe for one that does not: if a future version adds a failure verdict,
+    /// an older binary would silently un-see it. Kept and reported instead, and
+    /// treated as `Unknown` -- it cannot count towards freshness, and this
+    /// version has no business claiming damage it does not understand.
+    #[serde(other)]
+    Unrecognised,
 }
 
 /// Identify the repository a record is about, from its URL.
@@ -396,7 +430,11 @@ impl Evidence {
             if len - pos > MAX_RESOLVE_BYTES {
                 break;
             }
-            let take = BLOCK.min(pos as usize);
+            // `pos` is a u64 file offset and `BLOCK` is a usize. Taking the min
+            // in u64 and converting afterwards is exact on every target; casting
+            // first truncated on a 32-bit one, so an evidence log over 4GiB read
+            // from the wrong offsets.
+            let take = usize::try_from(u64::from(BLOCK as u32).min(pos)).unwrap_or(BLOCK);
             pos -= take as u64;
             if let Err(e) = f.seek(SeekFrom::Start(pos)) {
                 h.incomplete = Some(format!("{} could not be read: {e}", path.display()));
@@ -534,6 +572,10 @@ pub struct PeerStatus {
     /// and only while that check is still within its window.
     pub coverage_pct: Option<u8>,
     pub problem: Option<String>,
+    /// This peer has records this version cannot interpret, written by a newer
+    /// peerbackup. They are kept and shown rather than dropped, but they cannot
+    /// count as a successful check.
+    pub unrecognised: bool,
     /// This peer has records dated further ahead than the clock can explain.
     /// They are excluded from freshness rather than believed; see
     /// [`CLOCK_SKEW_TOLERANCE_SECS`].
@@ -610,7 +652,7 @@ pub fn status(cfg: &Config, records: &[Record], now_ts: u64) -> Vec<PeerStatus> 
                     match r.verdict {
                         Verdict::Bad => standing = Some(r),
                         Verdict::Good => standing = None,
-                        Verdict::Unknown => {}
+                        Verdict::Unknown | Verdict::Unrecognised => {}
                     }
                 }
                 standing
@@ -650,6 +692,9 @@ pub fn status(cfg: &Config, records: &[Record], now_ts: u64) -> Vec<PeerStatus> 
             let problem = (!problems.is_empty()).then(|| problems.join("; "));
 
             let clock_skew = confirmed.iter().any(|r| r.at > horizon);
+            let unrecognised = mine
+                .iter()
+                .any(|r| r.verdict == Verdict::Unrecognised || r.kind == Kind::Unrecognised);
 
             let last_backup = last(Kind::Backup);
             let last_subset = last(Kind::Subset);
@@ -691,6 +736,7 @@ pub fn status(cfg: &Config, records: &[Record], now_ts: u64) -> Vec<PeerStatus> 
                 coverage_pct,
                 problem,
                 clock_skew,
+                unrecognised,
             }
         })
         .collect()
@@ -1075,6 +1121,50 @@ mod tests {
         let r = &status(&cfg_with_peer(), &recs, NOW)[0];
         assert_eq!(r.state, PeerState::Unknown);
         assert_eq!(r.coverage_pct, None);
+    }
+
+    #[test]
+    fn a_record_from_a_newer_version_is_kept_rather_than_dropped() {
+        // Strict deserialisation rejected the whole record and the backwards
+        // walk then dropped it. That is safe for a verdict meaning something
+        // good and unsafe for one that does not: a future version adding a
+        // failure verdict would be silently un-seen by an older binary.
+        let line = br#"{"at":1800000000,"peer":"alice","kind":"quorum","verdict":"suspect"}"#;
+        let r: Record = serde_json::from_slice(line).expect("must still parse");
+        assert_eq!(r.kind, Kind::Unrecognised);
+        assert_eq!(r.verdict, Verdict::Unrecognised);
+    }
+
+    #[test]
+    fn an_unrecognised_verdict_counts_as_neither_good_nor_bad() {
+        let recs = vec![Record {
+            verdict: Verdict::Unrecognised,
+            ..rec(Kind::Backup, Verdict::Good, NOW - 60)
+        }];
+        let r = &status(&cfg_with_peer(), &recs, NOW)[0];
+        assert_eq!(r.state, PeerState::Unknown, "cannot count as a check");
+        assert_eq!(r.last_backup, None);
+        assert!(r.unrecognised, "and the user is told why");
+    }
+
+    #[test]
+    fn an_unrecognised_verdict_does_not_clear_standing_damage() {
+        let recs = vec![
+            detailed(
+                Kind::Subset,
+                Verdict::Bad,
+                NOW - 3600,
+                "pack 4f2a hash mismatch",
+            ),
+            Record {
+                verdict: Verdict::Unrecognised,
+                ..rec(Kind::Subset, Verdict::Good, NOW - 60)
+            },
+        ];
+        assert_eq!(
+            status(&cfg_with_peer(), &recs, NOW)[0].state,
+            PeerState::Bad
+        );
     }
 
     #[test]
