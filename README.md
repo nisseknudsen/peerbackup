@@ -183,15 +183,16 @@ windows must be non-zero, and `verify_subset_pct` must be between 1 and 100.
 ### Timeouts
 
 restic retries transport failures with exponential backoff and no overall
-deadline, so every operation except the backup itself runs under one. A backup
-has none on purpose: a 300GB first seed at 40Mbit legitimately takes seventeen
-hours. Override any of them, in seconds, if your link needs it:
+deadline, so most operations run under one. Two do not, for the same reason: a
+300GB first seed at 40Mbit legitimately takes seventeen hours, and so does
+getting it back. `backup` and `restore` have no deadline on purpose. Override the
+rest, in seconds, if your link needs it:
 
 | Variable | Default | Bounds |
 |---|---|---|
 | `PEERBACKUP_PROBE_TIMEOUT` | 20 | Deciding whether a peer answers at all |
 | `PEERBACKUP_LIST_TIMEOUT` | 120 | `snapshots`, and creating a repository |
-| `PEERBACKUP_RESTORE_TIMEOUT` | 1800 | `restore`, and the test-file check |
+| `PEERBACKUP_RESTORE_TIMEOUT` | 1800 | The test-file check during `verify` |
 | `PEERBACKUP_VERIFY_TIMEOUT` | 3600 | Reading data back during `verify` |
 
 ### Scheduling

@@ -18,6 +18,30 @@ use super::{
     BackupEngine, EngineError, RestoredFile, Snapshot, SnapshotId, SnapshotMeta, SnapshotOpts,
 };
 
+/// The operations peerbackup runs, for the one purpose of saying what deadline
+/// each gets.
+///
+/// Gathered into one function because the policy is not uniform and the reasons
+/// are not obvious: two operations are deliberately unbounded, and which two is
+/// the difference between a restore that finishes and a restore that is killed
+/// half way. Scattered across four call sites, one of them was wrong for as long
+/// as it existed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Op {
+    /// Is this peer answering at all?
+    Probe,
+    /// Listing snapshots, and creating a repository.
+    List,
+    /// Reading a percentage of stored data back and checking it.
+    Verify,
+    /// Fetching the canary. A few kilobytes.
+    CanaryRestore,
+    /// Sending a backup.
+    Backup,
+    /// Getting everything back. The disaster operation.
+    RestoreAll,
+}
+
 /// A restic invocation, and the short-lived files it needs on disk.
 ///
 /// The files must outlive the child process and not one moment longer, which is
@@ -78,7 +102,10 @@ pub struct ResticEngine {
     /// PEM bundle for a peer with a self-signed certificate.
     pub ca_cert: Option<PathBuf>,
     pub verify_timeout: Duration,
-    pub restore_timeout: Duration,
+    /// Bounds the canary restore, which fetches a few kilobytes.
+    ///
+    /// Deliberately *not* used for `restore_all`. See [`BackupEngine::restore_all`].
+    pub canary_restore_timeout: Duration,
     pub list_timeout: Duration,
     /// How long to spend deciding whether a peer is reachable at all.
     pub probe_timeout: Duration,
@@ -90,7 +117,7 @@ impl ResticEngine {
     /// before being killed. Unbounded waits stall the scheduler and every status
     /// read behind it.
     pub const DEFAULT_VERIFY_TIMEOUT: Duration = Duration::from_secs(3600);
-    pub const DEFAULT_RESTORE_TIMEOUT: Duration = Duration::from_secs(1800);
+    pub const DEFAULT_CANARY_RESTORE_TIMEOUT: Duration = Duration::from_secs(1800);
     pub const DEFAULT_LIST_TIMEOUT: Duration = Duration::from_secs(120);
     pub const DEFAULT_PROBE_TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -101,7 +128,7 @@ impl ResticEngine {
             password_file: password_file.into(),
             ca_cert: None,
             verify_timeout: Self::DEFAULT_VERIFY_TIMEOUT,
-            restore_timeout: Self::DEFAULT_RESTORE_TIMEOUT,
+            canary_restore_timeout: Self::DEFAULT_CANARY_RESTORE_TIMEOUT,
             list_timeout: Self::DEFAULT_LIST_TIMEOUT,
             probe_timeout: Self::DEFAULT_PROBE_TIMEOUT,
         }
@@ -188,6 +215,30 @@ impl ResticEngine {
         }
     }
 
+    /// How long each operation may take before it is killed.
+    ///
+    /// `None` means unbounded, and exactly two operations get it. A 300GB first
+    /// seed at 40Mbps legitimately takes seventeen hours, so `Backup` cannot
+    /// have a wall-clock budget that is not either useless or lethal --  and
+    /// `RestoreAll` is the same transfer in the other direction, at the one
+    /// moment the user has already lost a disk. It used to share the canary
+    /// restore's 1800s, which is the right size for a few kilobytes and killed a
+    /// real restore after thirty minutes with a partial tree on disk and a
+    /// message about a deadline rather than about their data.
+    ///
+    /// Telling a stalled transfer from a slow one needs progress monitoring, for
+    /// both of them. Until that exists the honest answer is to let them run.
+    #[must_use]
+    pub fn timeout_for(&self, op: Op) -> Option<Duration> {
+        match op {
+            Op::Probe => Some(self.probe_timeout),
+            Op::List => Some(self.list_timeout),
+            Op::Verify => Some(self.verify_timeout),
+            Op::CanaryRestore => Some(self.canary_restore_timeout),
+            Op::Backup | Op::RestoreAll => None,
+        }
+    }
+
     /// Could not even get as far as running restic.
     fn spawn_error(&self, e: &std::io::Error) -> EngineError {
         EngineError {
@@ -203,7 +254,7 @@ impl ResticEngine {
     /// Create the repository. Not on the trait: it is setup, not a backup
     /// operation, and only `peer add` ever calls it.
     pub fn init_repo(&self) -> Result<(), EngineError> {
-        self.run(&["init"], Some(self.list_timeout)).map(|_| ())
+        self.run(&["init"], self.timeout_for(Op::List)).map(|_| ())
     }
 
     fn to_engine_error(&self, out: &Output) -> EngineError {
@@ -253,7 +304,7 @@ impl BackupEngine for ResticEngine {
         // missing data, which is precisely the case worth telling the user
         // about. `run` rejects every non-zero exit, so this is unwrapped here
         // rather than treated as a failure with raw restic text attached.
-        let out = match self.run(&refs, None) {
+        let out = match self.run(&refs, self.timeout_for(Op::Backup)) {
             Ok(out) => out,
             Err(e) if e.exit_code == Some(EXIT_INCOMPLETE) => {
                 return match parse_snapshot_id(&e.message) {
@@ -299,7 +350,7 @@ impl BackupEngine for ResticEngine {
                 "--include",
                 &path.display().to_string(),
             ],
-            Some(self.restore_timeout),
+            self.timeout_for(Op::CanaryRestore),
         )?;
 
         // restic reconstructs the full source path under target.
@@ -321,6 +372,7 @@ impl BackupEngine for ResticEngine {
         })
     }
 
+    /// Unbounded. See [`ResticEngine::timeout_for`].
     fn restore_all(&self, snapshot: &SnapshotId, target: &Path) -> Result<(), EngineError> {
         self.run(
             &[
@@ -329,7 +381,7 @@ impl BackupEngine for ResticEngine {
                 "--target",
                 &target.display().to_string(),
             ],
-            Some(self.restore_timeout),
+            self.timeout_for(Op::RestoreAll),
         )?;
         Ok(())
     }
@@ -350,7 +402,7 @@ impl BackupEngine for ResticEngine {
             }
         };
 
-        let out = match run_bounded(inv.command, Some(self.verify_timeout)) {
+        let out = match run_bounded(inv.command, self.timeout_for(Op::Verify)) {
             Ok(Some(o)) => o,
             // Waited, got no answer. Not corruption, not health.
             Ok(None) => {
@@ -384,14 +436,14 @@ impl BackupEngine for ResticEngine {
     /// happening is not something anyone will sit through, and the answer is
     /// known within seconds anyway.
     fn probe(&self) -> Option<Cause> {
-        match self.run(&["cat", "config"], Some(self.probe_timeout)) {
+        match self.run(&["cat", "config"], self.timeout_for(Op::Probe)) {
             Ok(_) => None,
             Err(e) => Some(e.cause),
         }
     }
 
     fn list_snapshots(&self) -> Result<Vec<SnapshotMeta>, EngineError> {
-        let out = self.run(&["snapshots", "--json"], Some(self.list_timeout))?;
+        let out = self.run(&["snapshots", "--json"], self.timeout_for(Op::List))?;
         parse_snapshots(&String::from_utf8_lossy(&out.stdout)).map_err(|e| EngineError {
             message: format!("could not parse restic snapshot output: {e}"),
             exit_code: None,
@@ -772,6 +824,47 @@ mod tests {
                 .is_none()
         );
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn a_full_restore_is_unbounded_and_the_canary_restore_is_not() {
+        // They shared one 1800s budget. That is the right size for the few
+        // kilobytes the canary fetches, and no budget at all for the operation
+        // this program exists to make possible: a 300GB restore over the link
+        // that took seventeen hours to seed was killed after thirty minutes,
+        // leaving a partial tree, at the one moment the user has already lost a
+        // disk.
+        let e = ResticEngine::new("rest:https://host/me/", "/tmp/pw");
+        assert_eq!(e.timeout_for(Op::RestoreAll), None);
+        assert_eq!(
+            e.timeout_for(Op::Backup),
+            None,
+            "unchanged, and for the same reason"
+        );
+        assert_eq!(
+            e.timeout_for(Op::CanaryRestore),
+            Some(ResticEngine::DEFAULT_CANARY_RESTORE_TIMEOUT)
+        );
+        for op in [Op::Probe, Op::List, Op::Verify] {
+            assert!(
+                e.timeout_for(op).is_some(),
+                "{op:?} must stay bounded: restic retries transport failures \
+                 forever, so a dead peer would stall the whole run"
+            );
+        }
+    }
+
+    #[test]
+    fn the_restore_timeout_env_var_moves_the_canary_budget() {
+        // The variable is documented and keeps its name; what it bounds is now
+        // only the check, because the disaster restore has no deadline to set.
+        let mut e = ResticEngine::new("rest:https://host/me/", "/tmp/pw");
+        e.canary_restore_timeout = Duration::from_secs(60);
+        assert_eq!(
+            e.timeout_for(Op::CanaryRestore),
+            Some(Duration::from_secs(60))
+        );
+        assert_eq!(e.timeout_for(Op::RestoreAll), None);
     }
 
     #[test]

@@ -60,12 +60,12 @@ fn engine_for(peer: &Peer) -> ResticEngine {
     if let Some(bin) = std::env::var_os("PEERBACKUP_RESTIC") {
         e.binary = PathBuf::from(bin);
     }
-    // All four, not two. `restore_timeout` and `list_timeout` existed as fields
-    // with no way to set them, so the pair that were honoured looked arbitrary.
-    // These are escape hatches for a slow link, documented in the README.
+    // Escape hatches for a slow link, documented in the README. `restore` has
+    // no deadline to override: it is the disaster operation, and the budget that
+    // used to bound it belonged to the canary restore all along.
     set_from_env("PEERBACKUP_PROBE_TIMEOUT", &mut e.probe_timeout);
     set_from_env("PEERBACKUP_VERIFY_TIMEOUT", &mut e.verify_timeout);
-    set_from_env("PEERBACKUP_RESTORE_TIMEOUT", &mut e.restore_timeout);
+    set_from_env("PEERBACKUP_RESTORE_TIMEOUT", &mut e.canary_restore_timeout);
     set_from_env("PEERBACKUP_LIST_TIMEOUT", &mut e.list_timeout);
     e
 }
