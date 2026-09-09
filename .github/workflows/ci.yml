@@ -31,7 +31,8 @@ jobs:
             deploy/test-provision-root.sh \
             spike/lifecycle-spike.sh \
             tests/end_to_end.sh \
-            tests/docker.sh
+            tests/docker.sh \
+            tests/lib/scratch.sh
 
   rust:
     name: rust (fmt, clippy, tests)
