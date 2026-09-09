@@ -17,6 +17,9 @@ on:
         required: false
         default: ""
 
+permissions:
+  contents: read
+
 env:
   RESTIC_VERSION: "0.19.1"
   RESTIC_SHA256: "f415415624dcc452f2a02b8c33641791a8c6d6d3b65bbb3543fcf9a25151585c"
@@ -27,7 +30,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
       - name: resolve restic version
         id: ver

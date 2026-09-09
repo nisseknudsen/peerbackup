@@ -216,8 +216,15 @@ for delay in 0.15 0.3 0.5 0.8 1.2; do
   "$RESTIC" -r "$R" backup "$SRC" >>"$LOG" 2>&1
 done
 
-if [ "$KILL_TOO_FAST" -eq "$KILL_ATTEMPTS" ]; then
-  warn "every prune finished before the kill landed — inconclusive, needs more data"
+# A warning is not enough here. This is the phase the whole spike exists for --
+# "is a repository still openable after an interrupted prune?" -- and if every
+# prune finished before the kill landed, it was never asked. A `warn` leaves
+# FAIL at 0, so the run printed "VERDICT: the rev 5 assumptions hold" in green
+# and exited 0 while testing nothing. On a weekly schedule that is a job that
+# goes green every Monday forever.
+if [ "$KILL_SURVIVED" -eq 0 ]; then
+  bad "phase 2 never landed a kill inside a running prune, so the assumption it exists to test was not tested"
+  note "raise the source tree, or lower --pack-size so prune has more work to do"
 fi
 
 # ---------------------------------------------------------------- phase 3
@@ -338,7 +345,7 @@ printf '  passed: %d   failed: %d   warnings: %d\n' "$PASS" "$FAIL" "$WARN"
 printf '  interrupted-prune survivals: %d/%d attempts (%d finished too fast to kill)\n' \
   "$KILL_SURVIVED" "$KILL_ATTEMPTS" "$KILL_TOO_FAST"
 printf '  full log: %s\n' "$LOG"
-if [ "$FAIL" -eq 0 ]; then
+if [ "$FAIL" -eq 0 ] && [ "$KILL_SURVIVED" -gt 0 ]; then
   printf '\n  \033[32mVERDICT: the rev 5 assumptions hold.\033[0m\n'
 else
   printf '\n  \033[31mVERDICT: %d assumption(s) in the design are WRONG. Read the log.\033[0m\n' "$FAIL"

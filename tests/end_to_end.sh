@@ -221,7 +221,14 @@ hdr "DISASTER: everything peerbackup ever wrote is gone"
 REPO=$(grep -oP "(?<=^Repository: ).*" "$WORK/recovery.txt" | head -1)
 PW=$(grep -oP "(?<=^Password:   ).*" "$WORK/recovery.txt" | head -1)
 rm -rf "$WORK/cfg" "$WORK/state" "$WORK/data"
-[ ! -d "$WORK/cfg" ] && ok "config, state and source data deleted"
+# The whole disaster-recovery premise is that these are gone. Without the else
+# branch, a delete that silently failed left the rest of the section restoring
+# against files that were still there.
+if [ ! -d "$WORK/cfg" ] && [ ! -d "$WORK/state" ] && [ ! -d "$WORK/data" ]; then
+  ok "config, state and source data deleted"
+else
+  bad "the disaster setup did not delete everything, so what follows proves nothing"
+fi
 
 # Only restic, only what is written on the recovery page.
 export RESTIC_PASSWORD="$PW"

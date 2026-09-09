@@ -72,3 +72,12 @@ scratch_mark() {
   mkdir -p "$1" || return 1
   : > "$1/$scratch_marker" || return 1
 }
+
+# A check that could not run. Not a pass: `ok "skipped: ..."` inflates the pass
+# count and reads as green in CI, so a section that never ran once still looked
+# like a section that ran and succeeded.
+#
+# Suites that define their own SKIP counter can override this; the default just
+# prints and records nothing.
+SKIP=${SKIP:-0}
+skip() { printf '  \033[33mSKIP\033[0m  %s\n' "$*"; SKIP=$((SKIP+1)); }

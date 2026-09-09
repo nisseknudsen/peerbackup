@@ -129,8 +129,18 @@ grep -q '403' "$PB_ROOT/ao.out" && ok "prune failure carries HTTP 403" || bad "n
   || bad "repo damaged by a blocked prune"
 
 hdr "host-side file ownership"
-if du -sh "$PB_ROOT/mnt/alice" >/dev/null 2>&1 && [ -r "$PB_ROOT/mnt/alice" ]; then
-  ok "host owner can read and du its own peer directory"
+# The directory itself is created by this script, so its permissions prove
+# nothing. What matters is the files the *container* wrote into it: if it ran as
+# root, those are root-owned and the host owner cannot read them without sudo,
+# which is the symptom the README's troubleshooting section describes.
+WROTE=$(find "$PB_ROOT/mnt/alice" -type f -print -quit 2>/dev/null)
+if [ -z "$WROTE" ]; then
+  bad "the container wrote no files into alice's directory, so ownership is untested"
+elif [ "$(stat -c %u "$WROTE")" != "$PB_UID" ]; then
+  bad "the container wrote files as uid $(stat -c %u "$WROTE"), not $PB_UID — is it running as root?"
+  ls -l "$WROTE" | sed 's/^/        /'
+elif du -sh "$PB_ROOT/mnt/alice" >/dev/null 2>&1 && [ -r "$PB_ROOT/mnt/alice" ]; then
+  ok "host owner can read and du its own peer directory, and owns what is in it"
   printf '        %s\n' "$(ls -ld "$PB_ROOT/mnt/alice")"
 else
   bad "host owner cannot read its own peer directory — is the container running as root?"
