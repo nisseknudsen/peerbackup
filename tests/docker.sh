@@ -11,6 +11,9 @@ HERE="$(cd "$(dirname "$0")/.." && pwd)"
 . "$HERE/tests/lib/scratch.sh"
 WORK="${WORK:-/tmp/pb-docker-e2e}"
 PORT="${PORT:-8023}"
+# See the note in deploy/test-compose-e2e.sh: a known credential should not be
+# reachable from off the machine.
+export PB_BIND="${PB_BIND:-127.0.0.1}"
 SERVER=peerbackup-rest   # the name compose.host.yml uses
 IMAGE="${IMAGE:-peerbackup:test}"
 

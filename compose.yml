@@ -18,7 +18,11 @@ services:
     user: "${PB_UID:-1000}:${PB_GID:-1000}"
 
     ports:
-      - "${PB_PORT:-51515}:8000"
+      # PB_BIND exists so binding to one interface is a variable rather than an
+      # edit. The default stays 0.0.0.0, because the whole point is a friend on
+      # another machine reaching this -- but on a host where a reverse proxy
+      # terminates TLS, set PB_BIND=127.0.0.1 and publish nothing else.
+      - "${PB_BIND:-0.0.0.0}:${PB_PORT:-51515}:8000"
 
     environment:
       #   --private-repos  confines each login to its own subdirectory, so one
@@ -36,8 +40,14 @@ services:
 
     volumes:
       - "${PB_DATA:-${HOME}/.local/share/peerbackup-data}:/data"
-      # TLS: put fullchain.pem and privkey.pem here, then set
-      # PB_EXTRA_OPTIONS="--tls --tls-cert /certs/fullchain.pem --tls-key /certs/privkey.pem"
+      # TLS: put fullchain.pem and privkey.pem in $PB_CERTS, uncomment the line
+      # below, and set both of these:
+      #   PB_CERTS=~/.local/share/peerbackup-certs
+      #   PB_EXTRA_OPTIONS="--tls --tls-cert /certs/fullchain.pem --tls-key /certs/privkey.pem"
+      #   PB_HEALTHCHECK_SCHEME=https
+      # The certificate has to be readable by PB_UID: this container does not
+      # run as root, so a key left at 0600 root:root is a key it cannot open.
+      # See the README's TLS section, which has the copy-and-chown recipe.
       # - "${PB_CERTS:-./certs}:/certs:ro"
 
     healthcheck:
@@ -47,11 +57,29 @@ services:
       # an HTTP error exactly as it does for nothing listening, so a code check
       # marks a working server permanently unhealthy. Orchestrators that route
       # on container health then drop the route without logging why.
-      test: ["CMD-SHELL", "wget -q -S -O /dev/null -T 3 http://127.0.0.1:8000/ 2>&1 | grep -q 'HTTP/'"]
+      # The scheme follows PB_EXTRA_OPTIONS. Hardcoded to http it did not
+      # break under --tls, but it passed for the wrong reason: Go answers a
+      # plaintext request to a TLS port with `HTTP/1.0 400 Bad Request`, which
+      # contains the status line this looks for. So the container read healthy
+      # on the strength of a handshake failure, and would keep doing so with a
+      # certificate the server could not load -- which is precisely the silent
+      # route-drop the paragraph above is about.
+      test: ["CMD-SHELL", "wget -q -S -O /dev/null -T 3 --no-check-certificate ${PB_HEALTHCHECK_SCHEME:-http}://127.0.0.1:8000/ 2>&1 | grep -q 'HTTP/'"]
       interval: 30s
       timeout: 5s
       retries: 3
       start_period: 10s
+
+    # rest-server serves the internet in the default deployment and needs none
+    # of this. `no-new-privileges` blocks setuid escalation from inside the
+    # container, and the capability set it actually uses is empty: it binds
+    # 8000, which is unprivileged, and writes files as PB_UID.
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    # A fork bomb in a compromised container should not take the host with it.
+    pids_limit: 512
 
     logging:
       driver: json-file
