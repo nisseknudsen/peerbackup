@@ -87,8 +87,19 @@ enum Command {
     Recovery(RecoveryCmd),
 
     /// Host backups for a friend: grants, the server, and its logins
-    #[command(subcommand)]
-    Host(HostCmd),
+    Host {
+        /// Print what would happen and touch nothing
+        ///
+        /// A flag and not only an environment variable because every command
+        /// that needs it also needs root, and `sudo` resets the environment.
+        #[arg(long, global = true)]
+        dry_run: bool,
+        /// Skip the confirmation on `release`, which destroys backups
+        #[arg(long, global = true)]
+        force: bool,
+        #[command(subcommand)]
+        cmd: HostCmd,
+    },
 }
 
 #[derive(Subcommand)]
@@ -165,8 +176,8 @@ enum HostCmd {
     Down,
 }
 
-fn run_host(cmd: HostCmd) -> Res {
-    let ctx = host::Ctx::from_env();
+fn run_host(cmd: HostCmd, flags: host::Flags) -> Res {
+    let ctx = host::Ctx::from_env(flags)?;
     // Server settings are read only by the two commands that talk to the
     // server. Reading them up front meant a typo in PB_PORT failed `host guard`
     // -- which runs as ExecStartPre -- for a reason that had nothing to do with
@@ -222,7 +233,11 @@ fn main() {
         } => cli::restore(&peer, &target, snapshot.as_deref()),
         Command::Recovery(RecoveryCmd::Export { out }) => cli::recovery_export(out),
         Command::Recovery(RecoveryCmd::Check) => cli::recovery_check(),
-        Command::Host(h) => run_host(h),
+        Command::Host {
+            cmd,
+            dry_run,
+            force,
+        } => run_host(cmd, host::Flags { dry_run, force }),
     };
 
     if let Err(e) = result {

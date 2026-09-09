@@ -298,7 +298,16 @@ sudo peerbackup host release alice
 ```
 
 This destroys their backups and cannot be undone, so it asks you to type the
-peer name first.
+peer name first. `--force` skips the prompt, for scripts. Every `host` command
+also takes `--dry-run`, which prints what it would do and touches nothing:
+
+```sh
+sudo peerbackup host provision alice 500G --dry-run
+```
+
+Pass it as a flag rather than as `DRY_RUN=1`. These commands need root, and
+`sudo` clears the environment, so `DRY_RUN=1 sudo peerbackup host provision ...`
+does a real provision.
 
 ### Running it as a service
 
