@@ -15,6 +15,7 @@ is in the finding.
 | [`03-engine.md`](03-engine.md) | `engine/*`: driving restic, error classification |
 | [`04-host.md`](04-host.md) | `host/*`: grants, loop devices, the server |
 | [`05-deploy-and-docs.md`](05-deploy-and-docs.md) | Dockerfile, compose, systemd, CI, README |
+| [`STATUS.md`](STATUS.md) | Which pull request fixed each finding |
 
 Report only. No behaviour was changed.
 
