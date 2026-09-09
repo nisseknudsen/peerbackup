@@ -10,7 +10,7 @@ use crate::engine::{BackupEngine, Cause, SnapshotId, SnapshotMeta, SnapshotOpts}
 use crate::redact;
 use crate::state::{
     Canary, Evidence, Kind, PeerState, PeerStatus, Record, Verdict, ago, canary_dir, now,
-    sha256_bytes, state_dir, status,
+    sha256_bytes, state_dir, status, utc_date,
 };
 
 use crate::Res;
@@ -984,7 +984,31 @@ pub fn recovery_export(out: Option<PathBuf>) -> Res {
     if cfg.peers.is_empty() {
         return Err("no peers to export".into());
     }
-    let path = out.unwrap_or_else(|| state_dir().join("recovery.txt"));
+    // An explicit --out must land where the user said, not somewhere near it.
+    // `write_private` creates parent directories, so
+    // `recovery export --out /mnt/usb/recovery.txt` with the stick not mounted
+    // created /mnt/usb on the root filesystem, wrote the passwords that decrypt
+    // every backup into it, recorded the fingerprint as current, and printed
+    // "Written to /mnt/usb/recovery.txt". The user then believes the only copy
+    // is on removable media. It is on the disk they are backing up.
+    let path = match out {
+        Some(p) => {
+            let parent = p.parent().filter(|d| !d.as_os_str().is_empty());
+            if let Some(dir) = parent
+                && !dir.is_dir()
+            {
+                return Err(format!(
+                    "{} does not exist.\n  \
+                     Create it first, or check the drive is mounted. This file holds the \
+                     passwords\n  that decrypt every backup, so it is not written \
+                     somewhere approximate.",
+                    dir.display()
+                ));
+            }
+            p
+        }
+        None => state_dir().join("recovery.txt"),
+    };
 
     let mut s = String::new();
     s.push_str("PEERBACKUP RECOVERY DETAILS\n");
@@ -1002,28 +1026,47 @@ pub fn recovery_export(out: Option<PathBuf>) -> Res {
         s.push_str(&format!("--- {} ---\n\n", peer.name));
         s.push_str(&format!("Repository: {}\n", peer.url));
         s.push_str(&format!("Password:   {}\n", pw.trim()));
-        if let Some(ca) = &peer.ca_cert {
-            s.push_str(&format!(
-                "Certificate: {} (copy this file too)\n",
-                ca.display()
-            ));
-        }
+        // The flag has to appear in the commands, not just the certificate in a
+        // note above them. Someone recovering onto a fresh machine from a host
+        // with a self-signed certificate would otherwise paste a command that
+        // fails on TLS, with nothing here telling them what to add -- and this
+        // file exists precisely to work without peerbackup, on a machine that
+        // may have just been installed.
+        let cacert = match &peer.ca_cert {
+            Some(ca) => {
+                s.push_str(&format!(
+                    "Certificate: {}\n            Copy this file too. Without it the \
+                     commands below fail on TLS.\n",
+                    ca.display()
+                ));
+                format!(" --cacert '{}'", ca.display())
+            }
+            None => String::new(),
+        };
         s.push_str("\nTo see what is stored:\n");
-        s.push_str(&format!("  restic -r '{}' snapshots\n", peer.url));
+        s.push_str(&format!("  restic -r '{}'{cacert} snapshots\n", peer.url));
         s.push_str("\n(The --tag below matters: it skips the small connection test\n");
         s.push_str(" that peerbackup uploads when a peer is first set up.)\n");
         s.push_str("\nTo get everything back:\n");
         s.push_str(&format!(
-            "  restic -r '{}' restore latest --tag {BACKUP_TAG} --target /where/to/put/it\n\n",
+            "  restic -r '{}'{cacert} restore latest --tag {BACKUP_TAG} \
+             --target /where/to/put/it\n\n",
             peer.url
         ));
     }
 
-    s.push_str(&format!("Exported: {}\n", now()));
-    s.push_str(&format!("Fingerprint: {}\n", fingerprint(&cfg)));
+    // A date, not a Unix timestamp. This document is meant to be printed and
+    // read years later, by someone who has just lost a machine.
+    let stamp = now();
+    s.push_str(&format!("Exported: {} ({stamp})\n", utc_date(stamp)));
+    let fp = fingerprint(&cfg);
+    s.push_str(&format!("Fingerprint: {fp}\n"));
 
     write_private(&path, s.as_bytes()).map_err(err("could not write the recovery file"))?;
-    std::fs::write(state_dir().join("recovery.fingerprint"), fingerprint(&cfg))
+    // The fingerprint is a digest over the peer names, URLs and passwords, so it
+    // is derived from secrets and gets the same handling as the file beside it
+    // rather than the process umask.
+    write_private(&state_dir().join("recovery.fingerprint"), fp.as_bytes())
         .map_err(err("could not record the fingerprint"))?;
 
     println!("Written to {}", path.display());
