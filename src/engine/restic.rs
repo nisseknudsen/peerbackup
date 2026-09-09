@@ -18,10 +18,59 @@ use super::{
     BackupEngine, EngineError, RestoredFile, Snapshot, SnapshotId, SnapshotMeta, SnapshotOpts,
 };
 
+/// A restic invocation, and the short-lived files it needs on disk.
+///
+/// The files must outlive the child process and not one moment longer, which is
+/// exactly a value's lifetime, so they ride along with the `Command` rather than
+/// being cleaned up by whoever remembers.
+struct Invocation {
+    command: Command,
+    _repo_file: SecretFile,
+}
+
+/// A 0600 file holding one secret, deleted when it goes out of scope.
+///
+/// `create_new` rather than `create`: the temp directory is world-writable, and
+/// O_EXCL is what stops someone pre-creating the path as a symlink to something
+/// they would like peerbackup to overwrite. The name is random for the same
+/// reason, not for uniqueness -- a pid would do for that.
+struct SecretFile(PathBuf);
+
+impl SecretFile {
+    fn new(tag: &str, contents: &[u8]) -> std::io::Result<Self> {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        let suffix = crate::config::random_token(16)?;
+        let path = std::env::temp_dir().join(format!("peerbackup-{tag}-{suffix}"));
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)?;
+        f.write_all(contents)?;
+        f.sync_all()?;
+        Ok(Self(path))
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for SecretFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 /// A peer's repository.
 #[derive(Debug, Clone)]
 pub struct ResticEngine {
-    /// e.g. `rest:https://user:pw@peer.example.org:8000/nisse/`
+    /// e.g. `rest:https://user:pw@peer.example.org:8000/nisse/`.
+    ///
+    /// Carries the peer's HTTP credentials, which is why it reaches restic
+    /// through `--repository-file` and never as an argument.
     pub repo_url: String,
     pub binary: PathBuf,
     /// A file, not an env var, so the secret stays out of process environments.
@@ -60,26 +109,63 @@ impl ResticEngine {
 
     /// Build a restic invocation against this peer's repository.
     ///
-    /// Every call gets the repository, the password file and the certificate,
-    /// so no caller has to remember them. The password goes in as a file rather
-    /// than an environment variable or an argument: both are readable by other
-    /// processes, and this one decrypts the whole repository.
-    fn command(&self, args: &[&str]) -> Command {
+    /// Every call gets the repository, the password file and the certificate, so
+    /// no caller has to remember them.
+    ///
+    /// **Neither secret goes on the command line.** The repository password has
+    /// always used `--password-file`; the doc here used to explain why and then,
+    /// three lines up, pass `-r rest:https://user:pw@peer/` as an argument. That
+    /// URL carries the peer's HTTP credentials, and on Linux with the default
+    /// `hidepid=0` any local user can read `/proc/<pid>/cmdline` -- for the whole
+    /// seventeen hours of the 300GB first seed this project is designed around.
+    /// Whoever reads it can write to and read the repository at that peer.
+    ///
+    /// So the URL goes into a 0600 file too, and the file lives exactly as long
+    /// as the invocation: [`Invocation`] owns it and deletes it on drop, which
+    /// is why this returns a struct rather than a bare `Command`.
+    fn command(&self, args: &[&str]) -> std::io::Result<Invocation> {
+        let repo_file = SecretFile::new("repo", self.repo_url.as_bytes())?;
         let mut c = Command::new(&self.binary);
-        c.arg("-r").arg(&self.repo_url);
+        c.arg("--repository-file").arg(repo_file.path());
         c.arg("--password-file").arg(&self.password_file);
         if let Some(ca) = &self.ca_cert {
             c.arg("--cacert").arg(ca);
         }
+        // Anything restic would read from the environment that peerbackup has
+        // not decided on itself. `--repository-file` and `--password-file` are
+        // mutually exclusive with some of these, so an inherited value does not
+        // quietly change behaviour -- it makes every operation fail with a
+        // restic message about flags the user never passed. `RESTIC_CACERT` is
+        // the quiet one: it would silently supply the trust store while
+        // peerbackup believed it was using the system's.
+        for k in [
+            "RESTIC_REPOSITORY",
+            "RESTIC_REPOSITORY_FILE",
+            "RESTIC_PASSWORD",
+            "RESTIC_PASSWORD_FILE",
+            "RESTIC_PASSWORD_COMMAND",
+            "RESTIC_KEY_HINT",
+            "RESTIC_CACERT",
+            "RESTIC_TLS_CLIENT_CERT",
+        ] {
+            c.env_remove(k);
+        }
         c.args(args);
-        c
+        Ok(Invocation {
+            command: c,
+            _repo_file: repo_file,
+        })
     }
 
     /// `None` timeout means unbounded, which is correct for `snapshot`: a 300GB
     /// seed at 40Mbps legitimately takes 17 hours. Telling a stalled transfer
     /// from a slow one needs progress monitoring, which is separate work.
     fn run(&self, args: &[&str], timeout: Option<Duration>) -> Result<Output, EngineError> {
-        match run_bounded(self.command(args), timeout) {
+        let inv = match self.command(args) {
+            Ok(i) => i,
+            Err(e) => return Err(self.spawn_error(&e)),
+        };
+        match run_bounded(inv.command, timeout) {
             Err(e) => Err(EngineError {
                 message: format!("could not execute {}: {e}", self.binary.display()),
                 exit_code: None,
@@ -99,6 +185,18 @@ impl ResticEngine {
             }
             Ok(Some(out)) if out.status.success() => Ok(out),
             Ok(Some(out)) => Err(self.to_engine_error(&out)),
+        }
+    }
+
+    /// Could not even get as far as running restic.
+    fn spawn_error(&self, e: &std::io::Error) -> EngineError {
+        EngineError {
+            message: format!("could not prepare the restic invocation: {e}"),
+            exit_code: None,
+            cause: Cause::Unclassified {
+                detail: e.to_string(),
+            },
+            damage: None,
         }
     }
 
@@ -243,9 +341,16 @@ impl BackupEngine for ResticEngine {
         // some, three layers from where they wrote it. This stays because the
         // trait is a public seam and restic rejects a 0% subset outright.
         let pct = percent.clamp(1, 100);
-        let cmd = self.command(&["check", "--read-data-subset", &format!("{pct}%")]);
+        let inv = match self.command(&["check", "--read-data-subset", &format!("{pct}%")]) {
+            Ok(i) => i,
+            Err(e) => {
+                return VerifyOutcome::Indeterminate(Cause::Unclassified {
+                    detail: format!("could not prepare the restic invocation: {e}"),
+                });
+            }
+        };
 
-        let out = match run_bounded(cmd, Some(self.verify_timeout)) {
+        let out = match run_bounded(inv.command, Some(self.verify_timeout)) {
             Ok(Some(o)) => o,
             // Waited, got no answer. Not corruption, not health.
             Ok(None) => {
@@ -667,6 +772,78 @@ mod tests {
                 .is_none()
         );
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn no_secret_ever_reaches_the_command_line() {
+        // `/proc/<pid>/cmdline` is world-readable under the default hidepid=0,
+        // and a first seed runs for hours. The password was already handled;
+        // the repository URL, which carries the peer's HTTP credentials, was
+        // passed as `-r rest://user:pw@host/` three lines below the comment
+        // explaining why arguments are unsafe.
+        let e = ResticEngine::new(
+            "rest:https://me:hunter2@alice.example.org:8000/me/",
+            "/tmp/pw",
+        );
+        let inv = e.command(&["snapshots", "--json"]).unwrap();
+        let argv: Vec<String> = std::iter::once(inv.command.get_program())
+            .chain(inv.command.get_args())
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let joined = argv.join(" ");
+        assert!(!joined.contains("hunter2"), "password on argv: {joined}");
+        assert!(
+            !joined.contains("alice.example.org"),
+            "repository on argv: {joined}"
+        );
+        assert!(joined.contains("--repository-file"), "{joined}");
+        assert!(joined.contains("--password-file"), "{joined}");
+        assert!(joined.contains("snapshots"), "the real args must survive");
+    }
+
+    #[test]
+    fn the_repository_file_holds_the_url_at_0600_and_is_removed_after() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let e = ResticEngine::new("rest:https://me:hunter2@alice.example.org/me/", "/tmp/pw");
+        let path;
+        {
+            let inv = e.command(&["snapshots"]).unwrap();
+            path = inv._repo_file.path().to_path_buf();
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                "rest:https://me:hunter2@alice.example.org/me/"
+            );
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "was {mode:o}");
+        }
+        assert!(!path.exists(), "the file must not outlive the invocation");
+    }
+
+    #[test]
+    fn restic_env_vars_from_the_ambient_environment_are_not_honoured() {
+        // `RESTIC_CACERT` is the quiet one: it would supply the TLS trust store
+        // while peerbackup believed it was using the system's. The mutually
+        // exclusive ones are merely baffling -- every operation fails citing a
+        // flag the user never passed.
+        let e = ResticEngine::new("rest:https://host/me/", "/tmp/pw");
+        let inv = e.command(&["snapshots"]).unwrap();
+        let removed: Vec<_> = inv
+            .command
+            .get_envs()
+            .filter(|(_, v)| v.is_none())
+            .map(|(k, _)| k.to_string_lossy().into_owned())
+            .collect();
+        for k in [
+            "RESTIC_REPOSITORY",
+            "RESTIC_PASSWORD_COMMAND",
+            "RESTIC_CACERT",
+        ] {
+            assert!(
+                removed.iter().any(|r| r == k),
+                "{k} not cleared: {removed:?}"
+            );
+        }
     }
 
     #[test]
