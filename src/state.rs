@@ -592,6 +592,36 @@ pub fn status(cfg: &Config, records: &[Record], now_ts: u64) -> Vec<PeerStatus> 
         .collect()
 }
 
+/// A Unix timestamp as `YYYY-MM-DD HH:MM:SS UTC`.
+///
+/// Hand-rolled rather than pulling in a date library for one line of one file.
+/// The civil-from-days conversion is Howard Hinnant's, which is exact for every
+/// date the Gregorian calendar covers; the only assumption is that the input is
+/// seconds since the epoch, which is what [`now`] produces.
+///
+/// UTC, deliberately. The recovery file may be read on another machine in
+/// another place, and a local time with no zone on it is worse than no time.
+#[must_use]
+pub fn utc_date(secs: u64) -> String {
+    let days = (secs / 86_400) as i64;
+    let rem = secs % 86_400;
+    let (h, mi, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+
+    // Days since 1970-01-01 -> civil date.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+
+    format!("{y:04}-{m:02}-{d:02} {h:02}:{mi:02}:{s:02} UTC")
+}
+
 /// "3 hours ago", for humans reading a table.
 pub fn ago(then: Option<u64>, now_ts: u64) -> String {
     let Some(t) = then else {
@@ -866,6 +896,20 @@ mod tests {
         let r = &status(&cfg_with_peer(), &recs, NOW)[0];
         assert_eq!(r.state, PeerState::Unknown);
         assert_eq!(r.coverage_pct, None);
+    }
+
+    #[test]
+    fn a_timestamp_renders_as_a_date_a_person_can_read() {
+        // The recovery file said `Exported: 1788934589`, in a document meant to
+        // be printed and read years later by someone who has just lost a
+        // machine.
+        assert_eq!(utc_date(0), "1970-01-01 00:00:00 UTC");
+        assert_eq!(utc_date(1_000_000_000), "2001-09-09 01:46:40 UTC");
+        // A leap day, and the day after.
+        assert_eq!(utc_date(1_709_164_800), "2024-02-29 00:00:00 UTC");
+        assert_eq!(utc_date(1_709_251_200), "2024-03-01 00:00:00 UTC");
+        // 2000 is a leap year, 1900 was not; the century rules have to hold.
+        assert_eq!(utc_date(951_782_400), "2000-02-29 00:00:00 UTC");
     }
 
     #[test]
