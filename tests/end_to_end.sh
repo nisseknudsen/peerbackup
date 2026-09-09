@@ -120,12 +120,28 @@ hdr "init"
 sed -i "s|sources = \[\]|sources = [\"$WORK/data\"]|" "$WORK/cfg/config.toml"
 
 hdr "peer add checks the whole path before trusting it"
-OUT=$("$BIN" peer add alice "rest:http://me:pw@127.0.0.1:$PORT/me/" 2>&1)
+# The password arrives on stdin, not in the URL -- the documented shape, and the
+# reason `host quickstart` prints the two apart. stdin is not a terminal here, so
+# this is the same path a scripted setup takes.
+OUT=$(printf 'pw\n' | "$BIN" peer add alice "rest:http://me@127.0.0.1:$PORT/me/" 2>&1)
 echo "$OUT" | grep -q "matches" && ok "upload and download round-trip verified" || { bad "peer add did not verify"; echo "$OUT"; }
 [ "$(stat -c %a "$WORK/cfg/secrets/alice")" = "600" ] && ok "password file is private" || bad "password file is readable"
 
+hdr "a password never has to reach the command line"
+# The invite is an address plus a password, and only the address is safe to type.
+# A URL that still carries one is accepted -- older invites exist -- but it says
+# what that cost.
+OUT=$("$BIN" peer add legacy "rest:http://me:pw@127.0.0.1:$PORT/me/" 2>&1)
+echo "$OUT" | grep -qi 'shell history' \
+  && ok "a password in the URL is accepted with a warning" \
+  || bad "no warning for a password passed on the command line: $OUT"
+OUT=$(printf '' | "$BIN" peer add empty "rest:http://me@127.0.0.1:$PORT/me/" 2>&1)
+echo "$OUT" | grep -qi 'no password given' \
+  && ok "an empty password is refused rather than tried" \
+  || bad "empty stdin was not refused: $OUT"
+
 hdr "peer add rejects a peer that does not work"
-OUT=$("$BIN" peer add broken "rest:http://me:wrongpw@127.0.0.1:$PORT/me/" 2>&1)
+OUT=$(printf 'wrongpw\n' | "$BIN" peer add broken "rest:http://me@127.0.0.1:$PORT/me/" 2>&1)
 if echo "$OUT" | grep -qi "error"; then
   ok "bad credentials rejected at add time, not hours into a backup"
 else

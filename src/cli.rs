@@ -71,12 +71,13 @@ fn engine_for(peer: &Peer) -> ResticEngine {
         );
         e.binary = PathBuf::from(bin);
     }
-    // Escape hatches for a slow link, documented in the README. `restore` has
-    // no deadline to override: it is the disaster operation, and the budget that
-    // used to bound it belonged to the canary restore all along.
+    // Escape hatches for a slow link, documented in the README. `restore` has no
+    // deadline to override: it is the disaster operation, and the budget that
+    // used to bound it belonged to the canary restore all along -- so the
+    // variable is named for the canary, not for a restore it no longer bounds.
     set_from_env("PEERBACKUP_PROBE_TIMEOUT", &mut e.probe_timeout);
     set_from_env("PEERBACKUP_VERIFY_TIMEOUT", &mut e.verify_timeout);
-    set_from_env("PEERBACKUP_RESTORE_TIMEOUT", &mut e.canary_restore_timeout);
+    set_from_env("PEERBACKUP_CANARY_TIMEOUT", &mut e.canary_restore_timeout);
     set_from_env("PEERBACKUP_LIST_TIMEOUT", &mut e.list_timeout);
     e
 }
@@ -236,7 +237,7 @@ pub fn connect(
     }
     cfg.save().map_err(err("could not save config"))?;
 
-    let url = &url_arg(url)?;
+    let url = &complete_url(url)?;
     let name = match name {
         Some(n) => n.to_owned(),
         None => peer_name_from_url(url).ok_or(
@@ -294,27 +295,88 @@ fn peer_name_from_url(url: &str) -> Option<String> {
 
 // ----------------------------------------------------------------------- peer
 
-/// The repository URL, read from stdin when the argument is `-`.
+/// Complete a repository URL by asking for the password, if it needs one.
 ///
-/// The URL carries the peer's password. Passed on a command line it lands in
-/// shell history, in `ps` for the life of the call, and -- when peerbackup runs
-/// in a container, which is how the README documents it -- permanently in
-/// `docker inspect .Config.Cmd`. The host side of this same codebase already
-/// refuses argv for this secret and pipes it to `htpasswd` on stdin; the client
-/// side did the opposite and the README taught it.
-fn url_arg(url: &str) -> Result<String, String> {
-    if url != "-" {
+/// An invite is two things: an address, which is not secret, and a password,
+/// which is. `host quickstart` prints them apart, so the address can be pasted
+/// into a command and the password cannot end up there.
+///
+/// A password on a command line goes into shell history, into `ps` for the life
+/// of the call, and -- when peerbackup runs in a container, which is how the
+/// README documents it -- permanently into `docker inspect .Config.Cmd`. Every
+/// tool that got this right does the same thing: prompt on a terminal, read
+/// stdin otherwise, never take it as an argument. restic itself has no
+/// `--password` flag; `docker login --password` prints a warning telling you to
+/// use `--password-stdin` instead.
+///
+/// A URL that already contains a password is accepted rather than refused --
+/// someone will have an older invite, and a hard error there helps nobody --
+/// but it says what it cost.
+fn complete_url(url: &str) -> Result<String, String> {
+    if redact::url_has_password(url) {
+        eprintln!(
+            "warning: that URL has the password in it, so it is now in your shell \
+             history\n  and was visible in `ps` while this ran. Newer invites keep \
+             them apart."
+        );
         return Ok(url.to_owned());
     }
-    let mut s = String::new();
-    io::stdin()
-        .read_line(&mut s)
-        .map_err(err("could not read the URL from stdin"))?;
-    let s = s.trim();
-    if s.is_empty() {
-        return Err("nothing arrived on stdin. Pipe the URL in, or pass it as an argument".into());
+    let password = read_secret(&format!("Password for {}: ", redact::url(url)))?;
+    if password.is_empty() {
+        return Err("no password given, so there is nothing to connect with".into());
     }
-    Ok(s.to_owned())
+    Ok(redact::url_with_password(url, &password))
+}
+
+/// Read a secret without echoing it, or from stdin when there is no terminal.
+///
+/// The non-terminal path is what makes this scriptable:
+/// `peerbackup connect <url> --source /srv/data < password.txt`, the same shape
+/// as `docker login --password-stdin`.
+fn read_secret(prompt: &str) -> Result<String, String> {
+    use std::io::BufRead;
+
+    // SAFETY: isatty inspects a file descriptor and cannot fail in a way that
+    // matters here; a non-tty answer is the safe one, since it only means the
+    // password is read rather than prompted for.
+    let interactive = unsafe { libc::isatty(libc::STDIN_FILENO) } == 1;
+    if interactive {
+        eprint!("{prompt}");
+        io::stderr().flush().ok();
+    }
+
+    let restore = interactive.then(disable_echo).flatten();
+    let mut line = String::new();
+    let read = io::stdin().lock().read_line(&mut line);
+    if let Some(term) = restore {
+        // SAFETY: `term` came from tcgetattr on this same descriptor.
+        unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &raw const term) };
+        eprintln!();
+    }
+    read.map_err(err("could not read the password"))?;
+    Ok(line.trim_end_matches(['\n', '\r']).to_owned())
+}
+
+/// Turn off terminal echo, returning the settings to put back.
+///
+/// `None` when the terminal will not say what its settings are, in which case
+/// the password is echoed -- visible, but typed rather than lost, which is the
+/// better of the two failures.
+fn disable_echo() -> Option<libc::termios> {
+    // SAFETY: tcgetattr fills the struct only on success, which is what the
+    // return value is checked for.
+    unsafe {
+        let mut term = std::mem::zeroed::<libc::termios>();
+        if libc::tcgetattr(libc::STDIN_FILENO, &raw mut term) != 0 {
+            return None;
+        }
+        let original = term;
+        term.c_lflag &= !libc::ECHO;
+        if libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &raw const term) != 0 {
+            return None;
+        }
+        Some(original)
+    }
 }
 
 /// Add a peer and prove the whole path works before trusting it.
@@ -326,7 +388,7 @@ pub fn peer_add(name: &str, url: &str, ca_cert: Option<PathBuf>) -> Res {
     // Validate before the name reaches a path. Everything downstream takes a
     // PeerName, so this is the only place the raw argument exists.
     let name = PeerName::new(name)?;
-    let url = &url_arg(url)?;
+    let url = &complete_url(url)?;
     let mut cfg = Config::load().map_err(err("could not read config"))?;
     if cfg.peer(&name).is_some() {
         return Err(format!("peer '{name}' already exists"));

@@ -247,7 +247,7 @@ OUT=$(PB_MAX_SIZE=not-a-number "${HOST[@]}" quickstart tester 2>&1)
 echo "$OUT" | grep -qi 'PB_MAX_SIZE' \
   && ok "an unparseable PB_MAX_SIZE is refused by name" \
   || bad "PB_MAX_SIZE=not-a-number was not rejected: $OUT"
-echo "$OUT" | grep -q "Ready. Send this" \
+echo "$OUT" | grep -q "Ready. Send both" \
   && bad "printed a peer URL despite a bad size limit" \
   || ok "no URL printed when the size limit is unusable"
 OUT=$(PB_MAX_SIZE=10G PB_CONTAINER=pb-size-probe "${HOST[@]}" quickstart tester 2>&1)
@@ -265,7 +265,7 @@ if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
   # The point is the reaction, not the cause -- no URL, and a clear reason.
   OUT=$(PB_DATA="$WORK/dies" PB_PORT=51599 PB_CONTAINER="bad/name" \
         "${HOST[@]}" quickstart tester 2>&1)
-  if echo "$OUT" | grep -q "Ready. Send this"; then
+  if echo "$OUT" | grep -q "Ready. Send both"; then
     bad "printed a peer URL even though the server failed to start"
   else
     ok "a server that fails to start does not print a URL"
@@ -284,7 +284,7 @@ if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
     restic/rest-server:0.14.0 >/dev/null 2>&1
   sleep 2
   OUT=$(PB_DATA="$WORK/d1" PB_PORT=51598 "${HOST[@]}" quickstart tester 2>&1)
-  if echo "$OUT" | grep -q "Ready. Send this"; then
+  if echo "$OUT" | grep -q "Ready. Send both"; then
     bad "printed a URL while a stale container held the name"
   else
     ok "refuses when a container is up but not serving the expected port"
@@ -301,7 +301,7 @@ if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
   sleep 2
   rm -rf "$WORK/vanish"
   OUT=$(PB_DATA="$WORK/d2" PB_PORT=51597 "${HOST[@]}" quickstart tester 2>&1)
-  if echo "$OUT" | grep -q "Ready. Send this"; then
+  if echo "$OUT" | grep -q "Ready. Send both"; then
     bad "printed a URL when the login could not be created"
   else
     ok "refuses when the login cannot be created"
@@ -310,6 +310,29 @@ if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
 else
   printf '  \033[33mSKIP\033[0m  quickstart failure path (needs docker)\n'
 fi
+
+hdr "the invite keeps the address and the password apart"
+# A password on a command line lands in shell history, in `ps`, and permanently
+# in `docker inspect`. The invite used to be one URL with the password in it, so
+# the only way to use it was to paste it onto a command line.
+OUT=$(PB_CONTAINER=pb-invite-probe PB_PORT=51598 "${HOST[@]}" quickstart invitee 2>&1)
+if echo "$OUT" | grep -qE 'URL: +rest:http://invitee@'; then
+  ok "the invite URL carries a username and no password"
+else
+  bad "the invite URL is not in the expected shape"
+  echo "$OUT" | sed 's/^/        /' | tail -6
+fi
+if echo "$OUT" | grep -qE '^ *Password: +[A-Za-z0-9]{16,}'; then
+  ok "the password is printed on its own line"
+else
+  bad "no separate password line in the invite"
+fi
+if echo "$OUT" | grep -q "connect 'rest:http://invitee@"; then
+  ok "the suggested command contains no secret"
+else
+  bad "the suggested connect command is not password-free"
+fi
+docker rm -f pb-invite-probe >/dev/null 2>&1 || true
 
 hdr "compose.yml"
 COMPOSE="$(dirname "$0")/../compose.yml"

@@ -1,5 +1,11 @@
-//! Keeping credentials and terminal control sequences out of everything we
-//! print or persist.
+//! Repository-URL parsing, and keeping credentials and terminal control
+//! sequences out of everything we print or persist.
+//!
+//! One authority parser, used three ways: to hide a password before printing a
+//! URL, to ask whether a URL carries one, and to put one in. Splitting them
+//! would mean three chances to disagree about where the credential ends, and
+//! the last time that happened a password containing an `@` was printed in
+//! full.
 //!
 //! Two different hazards, both of which reached the same places -- the terminal
 //! and the evidence log -- through the same channel, which is restic's error
@@ -19,6 +25,77 @@
 //! erases a line, so a peer could rewrite the `FAILED` row an operator was
 //! looking at. The exit code was never at risk; the human reading the table was.
 
+/// Split a URL into `(prefix, authority, rest)` around its authority segment.
+///
+/// One parser for every question anyone asks about these URLs. The separator
+/// between credentials and host is the *last* `@` inside the authority, and the
+/// authority ends at the first `/` after the scheme -- an `@` later in the path
+/// is not a credential separator.
+///
+/// The slicing is safe despite the lint: every index comes from `find` or
+/// `rfind`, which only ever return character boundaries.
+#[allow(clippy::string_slice)]
+fn split_authority(u: &str) -> Option<(&str, &str, &str)> {
+    let scheme_end = u.find("://")?;
+    let start = scheme_end + 3;
+    let end = u[start..].find('/').map_or(u.len(), |i| start + i);
+    Some((&u[..start], &u[start..end], &u[end..]))
+}
+
+/// Does this URL already carry a password?
+///
+/// A userinfo with no colon -- `rest:http://alice@host/alice/` -- is a username
+/// and nothing secret, which is the shape an invite should have.
+///
+/// Slicing is safe despite the lint: `at` comes from `rfind`, which only ever
+/// returns a character boundary.
+#[allow(clippy::string_slice)]
+#[must_use]
+pub fn url_has_password(u: &str) -> bool {
+    let Some((_, authority, _)) = split_authority(u) else {
+        return false;
+    };
+    let Some(at) = authority.rfind('@') else {
+        return false;
+    };
+    authority[..at].contains(':')
+}
+
+/// Put a password into a URL that has a username and no password.
+///
+/// Returns the URL unchanged when there is nowhere to put one, so the caller
+/// gets restic's own complaint about the address rather than a second opinion
+/// from here.
+///
+/// Slicing is safe despite the lint, for the same reason as above.
+#[allow(clippy::string_slice)]
+#[must_use]
+pub fn url_with_password(u: &str, password: &str) -> String {
+    let Some((prefix, authority, rest)) = split_authority(u) else {
+        return u.to_owned();
+    };
+    let Some(at) = authority.rfind('@') else {
+        return u.to_owned();
+    };
+    let (user, host) = (&authority[..at], &authority[at..]);
+    if user.contains(':') || user.is_empty() {
+        return u.to_owned();
+    }
+    // Percent-encode the delimiters that would otherwise re-split the URL. The
+    // generated password uses none of them, but an operator-chosen one can.
+    let escaped: String = password
+        .chars()
+        .map(|c| match c {
+            '@' => "%40".to_owned(),
+            ':' => "%3A".to_owned(),
+            '/' => "%2F".to_owned(),
+            '%' => "%25".to_owned(),
+            other => other.to_string(),
+        })
+        .collect();
+    format!("{prefix}{user}:{escaped}{host}{rest}")
+}
+
 /// Hide the password in a repository URL before printing it.
 ///
 /// The separator is the *last* `@` in the authority segment, not the first.
@@ -36,29 +113,21 @@
 /// or `rfind`, which only ever return character boundaries.
 #[allow(clippy::string_slice)]
 pub fn url(url: &str) -> String {
-    let Some(scheme_end) = url.find("://") else {
+    let Some((prefix, authority, rest)) = split_authority(url) else {
         return url.to_owned();
     };
-    let authority_start = scheme_end + 3;
-    let authority_end = url[authority_start..]
-        .find('/')
-        .map_or(url.len(), |i| authority_start + i);
-
-    let authority = &url[authority_start..authority_end];
     let Some(at) = authority.rfind('@') else {
         return url.to_owned();
     };
     let credentials = &authority[..at];
-    let user = credentials.split(':').next().unwrap_or("");
+    let Some(user) = credentials.split(':').next() else {
+        return url.to_owned();
+    };
     if credentials.len() == user.len() {
         // A userinfo with no colon carries no password to hide.
         return url.to_owned();
     }
-    format!(
-        "{}{user}:***{}",
-        &url[..authority_start],
-        &url[authority_start + at..]
-    )
+    format!("{prefix}{user}:***{}{rest}", &authority[at..])
 }
 
 /// Redact every credentialed URL anywhere in a block of free text.
@@ -146,6 +215,47 @@ fn fold_controls(text: &str, keep_newlines: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_invite_url_without_a_password_is_recognised_as_needing_one() {
+        assert!(!url_has_password("rest:http://alice@host:51515/alice/"));
+        assert!(url_has_password("rest:http://alice:pw@host:51515/alice/"));
+        // No userinfo at all: nothing to complete, and nothing to hide.
+        assert!(!url_has_password("rest:http://host:51515/alice/"));
+        // An `@` in the path is not a credential separator.
+        assert!(!url_has_password("rest:http://host/me@home/"));
+    }
+
+    #[test]
+    fn a_password_goes_into_the_url_and_comes_back_out_redacted() {
+        let got = url_with_password("rest:http://alice@host:51515/alice/", "hunter2");
+        assert_eq!(got, "rest:http://alice:hunter2@host:51515/alice/");
+        assert!(url_has_password(&got));
+        assert_eq!(url(&got), "rest:http://alice:***@host:51515/alice/");
+    }
+
+    #[test]
+    fn a_password_containing_url_delimiters_does_not_re_split_the_url() {
+        // The generated password uses none of these; an operator-chosen one can.
+        // Left unescaped, `@` or `:` would move where the authority ends and the
+        // URL would address a different host entirely.
+        let got = url_with_password("rest:http://alice@host/alice/", "p@ss:w/rd%1");
+        assert_eq!(got, "rest:http://alice:p%40ss%3Aw%2Frd%251@host/alice/");
+        assert_eq!(url(&got), "rest:http://alice:***@host/alice/");
+    }
+
+    #[test]
+    fn a_url_with_nowhere_to_put_a_password_is_left_alone() {
+        // restic's own complaint about the address is more use than a second
+        // opinion from here.
+        for u in [
+            "rest:http://host/alice/",
+            "rest:http://alice:already@host/alice/",
+            "not a url at all",
+        ] {
+            assert_eq!(url_with_password(u, "hunter2"), u);
+        }
+    }
 
     #[test]
     fn passwords_are_hidden_when_urls_are_printed() {
