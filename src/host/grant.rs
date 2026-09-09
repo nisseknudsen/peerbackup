@@ -392,6 +392,20 @@ fn take_ownership(ctx: &Ctx, dir: &Path, unit: &str) -> Res {
     let own = format!("{uid}:{gid}");
     let mnt = ctx.mnt();
 
+    // Which uid this is, out loud, because nothing else compares it against the
+    // uid the server will actually run as. Under `sudo peerbackup host
+    // provision`, sudo's env_reset drops any exported PB_UID and `SUDO_UID`
+    // wins -- so an admin at 1001 chowned the grant to 1001 while the service
+    // unit started rest-server as 1000. rest-server then got EACCES creating the
+    // peer's directory, backups failed with a 500, and `list`, `guard` and
+    // `doctor` all reported the host as healthy, because `doctor` checks
+    // readability by the *invoking* user rather than by PB_UID.
+    ctx.say(&format!(
+        "the grant will be owned by {own}. The server must run as that same uid:\n  \
+         compose.yml and deploy/systemd/peerbackup-rest.service both read PB_UID/PB_GID.\n  \
+         Under sudo, export it explicitly: sudo PB_UID={uid} PB_GID={gid} peerbackup host ..."
+    ));
+
     if ctx.dry_run {
         println!("  would run: chown {own} {}", mnt.display());
         println!("  would run: chown -R {own} {}", dir.display());
@@ -710,6 +724,41 @@ pub fn doctor(ctx: &Ctx) -> Res {
         }
     }
 
+    // The uid the grants are owned by against the uid the server will run as.
+    // Nothing compared these, and the check above cannot: it tests readability
+    // by whoever ran `doctor`, which under sudo is root and can read anything.
+    // An admin at 1001 chowning grants to 1001 while the service unit starts
+    // rest-server as PB_UID=1000 gets EACCES on every write, 500s on the peer's
+    // side, and a clean bill of health from every host command.
+    if let Ok(entries) = std::fs::read_dir(ctx.mnt()) {
+        let want = numeric_env(&["PB_UID"])?;
+        for grant in entries.filter_map(Result::ok).map(|e| e.path()) {
+            if !grant.is_dir() {
+                continue;
+            }
+            let Ok(meta) = std::fs::metadata(&grant) else {
+                continue;
+            };
+            let owner = meta.uid();
+            if let Some(w) = want
+                && owner != w
+            {
+                warn(&format!(
+                    "{} is owned by uid {owner}, but PB_UID says the server runs as \
+                     {w}.\n       The server will not be able to write to it.",
+                    grant.display()
+                ));
+                problems += 1;
+            } else if want.is_none() {
+                ctx.say(&format!(
+                    "{} is owned by uid {owner}; the server must run as that uid \
+                     (PB_UID)",
+                    grant.display()
+                ));
+            }
+        }
+    }
+
     if problems == 0 {
         ctx.info("host looks healthy");
         return Ok(());
@@ -827,6 +876,33 @@ mod tests {
         let d = std::env::temp_dir().join(format!("pb-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         d
+    }
+
+    #[test]
+    fn doctor_notices_a_grant_the_server_will_not_be_able_to_write_to() {
+        // `sudo peerbackup host provision` chowns to SUDO_UID, because sudo's
+        // env_reset drops any exported PB_UID. An admin at 1001 therefore got a
+        // grant owned by 1001 while the service unit starts rest-server as
+        // PB_UID=1000 -- EACCES on every write, 500s on the peer's side, and a
+        // clean bill of health from every host command, because the existing
+        // check tests readability by whoever ran `doctor` and under sudo that
+        // is root.
+        let dir = tmp("doctoruid");
+        std::fs::create_dir_all(dir.join("mnt").join("alice")).unwrap();
+        let ctx = ctx_in(&dir);
+
+        // A uid this grant certainly is not owned by.
+        let me = std::fs::metadata(dir.join("mnt").join("alice"))
+            .unwrap()
+            .uid();
+        // SAFETY: this key is used by no other test and by no other thread.
+        unsafe { std::env::set_var("PB_UID", (me + 1).to_string()) };
+        let e = doctor(&ctx).unwrap_err();
+        // SAFETY: as above.
+        unsafe { std::env::remove_var("PB_UID") };
+
+        assert!(e.contains("problem"), "got: {e}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
