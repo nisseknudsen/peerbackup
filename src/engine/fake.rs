@@ -32,6 +32,11 @@ pub struct FakeEngine {
     /// an `EngineError` carrying `damage`. That path had no coverage at all,
     /// which is how it came to record `Unknown` for observed corruption.
     pub restore_damage: Option<Corruption>,
+    /// Makes `restore_path` fail without any verdict about the data -- a dead
+    /// connection, a timeout. `restore_path` used to return `Ok` even for a peer
+    /// built with [`FakeEngine::unreachable`], so no test could exercise a
+    /// canary restore that simply did not happen.
+    pub restore_error: Option<Cause>,
     /// Every operation asked of this engine, in order.
     ///
     /// Shared rather than owned so a test can keep a handle to the log while
@@ -56,6 +61,7 @@ impl FakeEngine {
                 tags: vec!["peerbackup".into()],
             }],
             restore_damage: None,
+            restore_error: None,
             calls: Rc::new(RefCell::new(Vec::new())),
         }
     }
@@ -113,6 +119,14 @@ impl BackupEngine for FakeEngine {
         self.calls
             .borrow_mut()
             .push(format!("restore_path({snapshot}, {})", path.display()));
+        if let Some(c) = &self.restore_error {
+            return Err(EngineError {
+                message: c.to_string(),
+                exit_code: Some(1),
+                cause: c.clone(),
+                damage: None,
+            });
+        }
         if let Some(d) = &self.restore_damage {
             return Err(EngineError {
                 message: format!("Fatal: {d}"),

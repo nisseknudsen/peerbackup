@@ -542,7 +542,7 @@ fn check_sources(sources: &[PathBuf]) -> Res {
 
 // --------------------------------------------------------------------- verify
 
-pub fn verify(only: Option<&str>) -> Res {
+pub fn verify(only: Option<&str>) -> Result<(), VerifyFailure> {
     let cfg = Config::load().map_err(err("could not read config"))?;
     verify_in(&Runtime::from_env(), &cfg, only, engine_for)
 }
@@ -552,12 +552,18 @@ fn verify_in<E: BackupEngine>(
     cfg: &Config,
     only: Option<&str>,
     make: impl Fn(&Peer) -> E,
-) -> Res {
+) -> Result<(), VerifyFailure> {
     let peers = select(cfg, only)?;
     let canary =
         Canary::load_at(&rt.canary_manifest()).map_err(err("could not read the canary"))?;
     let pct = cfg.settings.verify_subset_pct;
     let mut bad = 0;
+    // Something was actually read back and found correct. Without this, a run in
+    // which every peer was unreachable returned `Ok` -- and the README says
+    // there is no built-in scheduler, so people wire this into cron and alert on
+    // a non-zero exit. A peer unreachable every night for a month produced
+    // `unknown` records and exit 0 every night, and no alert ever fired.
+    let mut verified = 0;
 
     for peer in &peers {
         let engine = make(peer);
@@ -577,11 +583,42 @@ fn verify_in<E: BackupEngine>(
             continue;
         }
 
+        // An empty repository passes `restic check`, which exits 0 with nothing
+        // to read. That was recorded as `Subset/Good` with the full requested
+        // coverage, so `status` showed a read-back percentage for a peer holding
+        // none of the user's data. Checking nothing is not a successful check.
+        match engine.list_snapshots() {
+            Ok(s) if s.is_empty() => {
+                println!("  holds no backups yet, so there is nothing to check");
+                rt.record(
+                    peer,
+                    Kind::Subset,
+                    Verdict::Unknown,
+                    Some("the peer holds no snapshots".into()),
+                    None,
+                )?;
+                continue;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                println!("  could not list what is stored: {e}");
+                rt.record(
+                    peer,
+                    Kind::Subset,
+                    Verdict::Unknown,
+                    Some(e.to_string()),
+                    None,
+                )?;
+                continue;
+            }
+        }
+
         print!("  checking {pct}% of the stored data... ");
         io::stdout().flush().ok();
         match engine.verify_subset(pct) {
             VerifyOutcome::Good { coverage_pct } => {
                 println!("ok");
+                verified += 1;
                 rt.record(peer, Kind::Subset, Verdict::Good, None, Some(coverage_pct))?;
             }
             VerifyOutcome::Bad(c) => {
@@ -608,6 +645,7 @@ fn verify_in<E: BackupEngine>(
         match restore_canary(&engine, &canary) {
             CanaryCheck::Matches => {
                 println!("matches");
+                verified += 1;
                 rt.record(peer, Kind::Canary, Verdict::Good, None, None)?;
             }
             CanaryCheck::DoesNotMatch => {
@@ -636,11 +674,69 @@ fn verify_in<E: BackupEngine>(
     }
 
     if bad > 0 {
-        return Err(format!(
+        return Err(VerifyFailure::Damage(format!(
             "{bad} check(s) failed. Run `peerbackup status` for details."
-        ));
+        )));
+    }
+    if verified == 0 {
+        return Err(VerifyFailure::NothingVerified(format!(
+            "nothing could be checked on {}. \
+             Run `peerbackup status` for what each peer last reported.",
+            if peers.len() == 1 {
+                "this peer".to_owned()
+            } else {
+                format!("any of {} peers", peers.len())
+            }
+        )));
     }
     Ok(())
+}
+
+/// Why `verify` did not succeed, kept apart so the exit code can say which.
+///
+/// A cron job alerts on a non-zero exit, and "your backup is damaged" and "we
+/// could not look at it" want different responses at three in the morning. The
+/// three-state model runs all the way through the program except at the process
+/// boundary, where it used to collapse into two -- and it collapsed in the
+/// reassuring direction, because `Indeterminate` did not affect the exit status
+/// at all.
+pub enum VerifyFailure {
+    /// Something was read back and was wrong. Exit 1.
+    Damage(String),
+    /// Nothing could be read back at all. Exit 2.
+    NothingVerified(String),
+}
+
+impl VerifyFailure {
+    #[must_use]
+    pub fn code(&self) -> i32 {
+        match self {
+            Self::Damage(_) => 1,
+            Self::NothingVerified(_) => 2,
+        }
+    }
+}
+
+impl std::fmt::Debug for VerifyFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "exit {}: {self}", self.code())
+    }
+}
+
+impl std::fmt::Display for VerifyFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Damage(m) | Self::NothingVerified(m) => f.write_str(m),
+        }
+    }
+}
+
+impl From<String> for VerifyFailure {
+    /// Everything that is not a verdict about data -- a missing config, an
+    /// unreadable canary, an unknown peer name -- is an ordinary failure.
+    fn from(s: String) -> Self {
+        Self::Damage(s)
+    }
 }
 
 /// What restoring the test file told us. Three states, like every other check
@@ -1390,11 +1486,12 @@ mod tests {
         Canary::create_at(&h.rt.canary_dir(), &h.rt.canary_manifest()).unwrap();
         let log = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         let handle = log.clone();
-        verify_in(&h.rt, &h.cfg, None, move |_| FakeEngine {
+        let e = verify_in(&h.rt, &h.cfg, None, move |_| FakeEngine {
             calls: handle.clone(),
             ..FakeEngine::unreachable("connection refused")
         })
-        .unwrap();
+        .unwrap_err();
+        assert_eq!(e.code(), 2, "a run that checked nothing is not a success");
 
         assert_eq!(
             &*log.borrow(),
@@ -1424,9 +1521,13 @@ mod tests {
 
         let calls = log.borrow();
         assert_eq!(calls[0], "probe()");
-        assert_eq!(calls[1], "verify_subset(1)");
-        assert_eq!(calls[2], "list_snapshots()");
-        assert!(calls[3].starts_with("restore_path("), "got {}", calls[3]);
+        // Listing comes before the subset check now: an empty repository passes
+        // `restic check` with nothing to read, and calling that a successful
+        // read-back is a green light for a peer holding none of your data.
+        assert_eq!(calls[1], "list_snapshots()");
+        assert_eq!(calls[2], "verify_subset(1)");
+        assert_eq!(calls[3], "list_snapshots()");
+        assert!(calls[4].starts_with("restore_path("), "got {}", calls[4]);
     }
 
     #[test]
@@ -1439,7 +1540,7 @@ mod tests {
             }))
         })
         .unwrap_err();
-        assert!(err.contains("failed"), "{err}");
+        assert!(err.to_string().contains("failed"), "{err}");
 
         let subset = records(&h)
             .into_iter()
@@ -1480,7 +1581,7 @@ mod tests {
             }
         })
         .unwrap_err();
-        assert!(err.contains("failed"), "{err}");
+        assert!(err.to_string().contains("failed"), "{err}");
         let canary = records(&h)
             .into_iter()
             .find(|r| r.kind == Kind::Canary)
@@ -1505,7 +1606,10 @@ mod tests {
             ..FakeEngine::always(VerifyOutcome::Good { coverage_pct: 1 })
         })
         .unwrap_err();
-        assert!(err.contains("failed"), "verify must not exit 0: {err}");
+        assert!(
+            err.to_string().contains("failed"),
+            "verify must not exit 0: {err}"
+        );
 
         let canary = records(&h)
             .into_iter()
@@ -1524,14 +1628,82 @@ mod tests {
         // reach the peer must never age into "your backup is corrupt".
         let h = harness("canaryunreach");
         Canary::create_at(&h.rt.canary_dir(), &h.rt.canary_manifest()).unwrap();
-        verify_in(&h.rt, &h.cfg, None, |_| {
+        let e = verify_in(&h.rt, &h.cfg, None, |_| {
             FakeEngine::unreachable("connection refused")
         })
-        .unwrap();
+        .unwrap_err();
+        assert_eq!(e.code(), 2, "could-not-check is exit 2, not exit 1");
         assert!(
             records(&h).iter().all(|r| r.verdict != Verdict::Bad),
             "nothing here is evidence about the data"
         );
+    }
+
+    #[test]
+    fn an_empty_repository_is_not_a_successful_read_back() {
+        // `restic check --read-data-subset` exits 0 on a repository with nothing
+        // in it, so a peer whose disk was reimaged and handed back a fresh empty
+        // repo printed `ok` and recorded Subset/Good with the full requested
+        // coverage. `status` then showed a read-back percentage for a peer
+        // holding none of the user's data.
+        let h = harness("emptyrepo");
+        Canary::create_at(&h.rt.canary_dir(), &h.rt.canary_manifest()).unwrap();
+        let e = verify_in(&h.rt, &h.cfg, None, |_| FakeEngine {
+            snapshots: Vec::new(),
+            ..FakeEngine::always(VerifyOutcome::Good { coverage_pct: 5 })
+        })
+        .unwrap_err();
+        assert_eq!(e.code(), 2);
+
+        let r = records(&h);
+        assert!(
+            r.iter().all(|r| r.verdict != Verdict::Good),
+            "checking nothing is not a successful check: {r:?}"
+        );
+        assert!(
+            r.iter().all(|r| r.coverage_pct.is_none()),
+            "no coverage may be claimed for a repository with nothing in it"
+        );
+    }
+
+    #[test]
+    fn damage_exits_one_and_could_not_check_exits_two() {
+        // A cron job alerts on a non-zero exit, and "your backup is damaged" and
+        // "we could not look at it" want different responses at three in the
+        // morning. `Indeterminate` used not to affect the exit status at all.
+        let h = harness("codes");
+        Canary::create_at(&h.rt.canary_dir(), &h.rt.canary_manifest()).unwrap();
+
+        let damaged = verify_in(&h.rt, &h.cfg, None, |_| {
+            FakeEngine::always(VerifyOutcome::Bad(Corruption::PackHashMismatch {
+                pack: "4f2a".into(),
+            }))
+        })
+        .unwrap_err();
+        assert_eq!(damaged.code(), 1);
+
+        let h2 = harness("codes2");
+        Canary::create_at(&h2.rt.canary_dir(), &h2.rt.canary_manifest()).unwrap();
+        let unchecked = verify_in(&h2.rt, &h2.cfg, None, |_| FakeEngine {
+            restore_error: Some(Cause::TimedOut { after_secs: 1800 }),
+            ..FakeEngine::always(VerifyOutcome::Indeterminate(Cause::TimedOut {
+                after_secs: 3600,
+            }))
+        })
+        .unwrap_err();
+        assert_eq!(unchecked.code(), 2);
+    }
+
+    #[test]
+    fn a_run_that_verified_something_still_exits_zero() {
+        // The direction that has to keep working, or every scheduled verify
+        // starts alerting.
+        let h = harness("codesok");
+        Canary::create_at(&h.rt.canary_dir(), &h.rt.canary_manifest()).unwrap();
+        verify_in(&h.rt, &h.cfg, None, |_| {
+            FakeEngine::always(VerifyOutcome::Good { coverage_pct: 1 })
+        })
+        .unwrap();
     }
 
     // ---------------------------------------------------------- restore choice
