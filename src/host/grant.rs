@@ -126,7 +126,13 @@ pub fn provision(ctx: &Ctx, peer: &PeerName, size: &str) -> Res {
     //
     // Without it every grant is sparse, and the host can be overcommitted by
     // exactly the mechanism this design exists to prevent.
-    ctx.run(
+    // `?` here would return with the image already allocated. `mkfs` fails for
+    // ordinary reasons -- a size ext4 cannot format, an interrupted run -- and
+    // the only way out of a stranded image was `host release`, the
+    // type-the-name-to-confirm destructor whose own warning is that it
+    // permanently destroys the peer's backups. Up to the whole grant, e.g.
+    // 500GB, left behind by a failure that touched nothing else.
+    if let Err(e) = ctx.run(
         "mkfs.ext4",
         &[
             OsStr::new("-q"),
@@ -137,7 +143,13 @@ pub fn provision(ctx: &Ctx, peer: &PeerName, size: &str) -> Res {
             OsStr::new("-F"),
             img.as_os_str(),
         ],
-    )?;
+    ) {
+        remove_quietly(ctx, &img);
+        return Err(format!(
+            "{e}\n       The image was removed, so this can be run again once the \
+             cause is fixed."
+        ));
+    }
 
     verify_not_sparse(ctx, &img)?;
 
@@ -202,19 +214,47 @@ pub fn provision(ctx: &Ctx, peer: &PeerName, size: &str) -> Res {
     let mut unit = String::new();
     if let Err(e) = finish(&mut unit) {
         warn("provisioning failed part-way; undoing what was created");
+        // Same order as `release`, and for the reason written down there:
+        // unlinking a mounted image is not a teardown. The space stays allocated
+        // to the open loop device and the mount goes on serving, so the next
+        // `provision` allocates a second image beside a first one that nothing
+        // can see. This skipped straight to `rm`.
         if !unit.is_empty() {
             ctx.run_best_effort("systemctl", &["disable", "--now", &unit]);
             remove_quietly(ctx, &ctx.units.join(&unit));
         }
-        if !ctx.would(&format!("rmdir {}", dir.display())) {
-            let _ = std::fs::remove_dir(&dir);
+        let mut stranded = Vec::new();
+        if is_mountpoint(&dir) && ctx.run("umount", &[dir.as_os_str()]).is_err() {
+            stranded.push(format!("{} is still mounted", dir.display()));
         }
-        remove_quietly(ctx, &img);
+        for loopdev in loop_devices_for(&img) {
+            if ctx.run("losetup", &["-d", &loopdev]).is_err() {
+                stranded.push(format!("{loopdev} is still attached to the image"));
+            }
+        }
+        if stranded.is_empty() {
+            remove_quietly(ctx, &img);
+            if !ctx.would(&format!("rmdir {}", dir.display())) {
+                let _ = std::fs::remove_dir(&dir);
+            }
+        }
         ctx.run_best_effort("systemctl", &["daemon-reload"]);
-        return Err(format!(
-            "{e}\n       Nothing was left behind, so this can be run again once the \
-             cause is fixed."
-        ));
+        // Claimed unconditionally before, including on the paths where it was
+        // not true.
+        return Err(if stranded.is_empty() {
+            format!(
+                "{e}\n       Nothing was left behind, so this can be run again once \
+                 the cause is fixed."
+            )
+        } else {
+            format!(
+                "{e}\n       Could not fully undo it: {}.\n       \
+                 The image is still at {} and is still using its space. Clear that \
+                 first;\n       `peerbackup host release {peer}` will do it.",
+                stranded.join(", "),
+                img.display()
+            )
+        });
     }
 
     ctx.info("");
@@ -429,8 +469,26 @@ pub fn release(ctx: &Ctx, peer: &PeerName) -> Res {
             )
         })?;
     }
-    if let Some(loopdev) = loop_device_for(&img) {
-        ctx.run_best_effort("losetup", &["-d", &loopdev]);
+    // Not best-effort. With the container running, its bind mount holds the loop
+    // device open and `losetup -d` fails with EBUSY -- and the image was then
+    // unlinked anyway, so the space stayed allocated to a device with no name.
+    // "capacity returned to the host" was printed regardless.
+    let mut still_attached = Vec::new();
+    for loopdev in loop_devices_for(&img) {
+        if let Err(e) = ctx.run("losetup", &["-d", &loopdev]) {
+            warn(&e);
+            still_attached.push(loopdev);
+        }
+    }
+    if !still_attached.is_empty() {
+        return Err(format!(
+            "the grant for '{peer}' was not released: {} still attached to {}.\n       \
+             Removing the image now would leak the space rather than return it.\n       \
+             Something has it open -- the server container is the usual answer.\n       \
+             Stop it and run this again.",
+            still_attached.join(", "),
+            img.display()
+        ));
     }
     // std::fs rather than shelling out: these are three syscalls, and going
     // through a process each time only adds a PATH lookup and an error string
@@ -459,16 +517,32 @@ fn remove_quietly(ctx: &Ctx, path: &Path) {
     }
 }
 
-fn loop_device_for(img: &Path) -> Option<String> {
-    let out = std::process::Command::new("losetup")
+/// Every loop device backed by this image, not just the first.
+///
+/// `losetup -j` prints one line per attachment and nothing stops there being
+/// more than one -- a stale attachment from an earlier run, or a second
+/// `losetup -f` by hand. Taking only the first line meant `release` detached one
+/// device, unlinked the image, and left the rest holding its space with no name
+/// left to find them by.
+///
+/// Also ignores `losetup`'s exit status on purpose: a non-zero exit with no
+/// output is "no devices", which is the normal case for a grant that was never
+/// mounted.
+fn loop_devices_for(img: &Path) -> Vec<String> {
+    let Ok(out) = std::process::Command::new("losetup")
         .arg("-j")
         .arg(img)
         .output()
-        .ok()?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    let first = text.lines().next()?;
-    let dev = first.split(':').next()?.trim().to_owned();
-    (!dev.is_empty()).then_some(dev)
+    else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| {
+            let dev = l.split(':').next()?.trim();
+            (!dev.is_empty()).then(|| dev.to_owned())
+        })
+        .collect()
 }
 
 pub fn list(ctx: &Ctx, only: Option<&str>) -> Res {

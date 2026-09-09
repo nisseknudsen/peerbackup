@@ -181,6 +181,45 @@ fi
 rmdir "$PEERBACKUP_ROOT/mnt/rollbackpeer" 2>/dev/null || true
 rm -f "$WORK/not-a-dir"
 
+hdr "a mkfs failure rolls back too, not just a later one"
+# `mkfs.ext4` sat outside the rollback boundary behind a bare `?`, so a size ext4
+# cannot format -- or an interrupted mkfs on a 500G image -- returned with the
+# whole allocation on disk and `host release` as the only way out.
+MKFS_OUT=$($HOST provision toosmall 8K 2>&1)
+MKFS_IMG="$PEERBACKUP_ROOT/images/toosmall.img"
+if [ -f "$MKFS_IMG" ]; then
+  bad "a failed mkfs stranded the allocated image at $MKFS_IMG"
+  echo "$MKFS_OUT" | sed 's/^/        /' | tail -3
+else
+  ok "a failed mkfs removes the image it allocated"
+fi
+
+hdr "release detaches every loop device, not just the first"
+# `losetup -j` prints one line per attachment, and taking only the first meant
+# release detached one device, unlinked the image, and left the rest holding its
+# space with no name left to find them by.
+$HOST provision loopy 64M >/dev/null 2>&1
+LOOPY_IMG="$PEERBACKUP_ROOT/images/loopy.img"
+if [ -f "$LOOPY_IMG" ]; then
+  EXTRA=$(losetup -f --show "$LOOPY_IMG" 2>/dev/null || true)
+  if [ -n "$EXTRA" ] && [ "$(losetup -j "$LOOPY_IMG" | wc -l)" -ge 2 ]; then
+    $HOST release --force loopy >/dev/null 2>&1
+    if losetup -j "$LOOPY_IMG" 2>/dev/null | grep -q loop; then
+      bad "release left a loop device attached, so the space is still allocated"
+      losetup -j "$LOOPY_IMG" | sed 's/^/        /'
+      losetup -d "$EXTRA" 2>/dev/null || true
+    else
+      ok "every loop device backed by the image was detached"
+    fi
+  else
+    [ -n "$EXTRA" ] && losetup -d "$EXTRA" 2>/dev/null
+    $HOST release --force loopy >/dev/null 2>&1 || true
+    printf '  \033[33mSKIP\033[0m  could not attach a second loop device\n'
+  fi
+else
+  printf '  \033[33mSKIP\033[0m  could not provision the fixture grant\n'
+fi
+
 hdr "the mount unit is written correctly"
 UNIT=""
 for _u in "$SYSTEMD_UNIT_DIR"/*testpeer*.mount; do
