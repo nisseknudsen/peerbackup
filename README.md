@@ -28,11 +28,24 @@ Starts a server in Docker and prints a URL to send them:
 Ready. Send this to alice, over something you trust:
 
   rest:http://alice:nq7Y7PYN44nqKG83mNc9@your-host:51515/alice/
+
+They run:  peerbackup connect '<that url>' --source /path/to/back/up
+
+Storage:   /home/you/.local/share/peerbackup-data
+Port 51515 must reach this machine. Use TLS if it is exposed to the
+internet: see the README.
 ```
 
 No root, no systemd. Storage goes to `~/.local/share/peerbackup-data`; change it
 with `PB_DATA=`. Forward port 51515 to the machine, or pick another with
 `PB_PORT=`.
+
+That last line is not boilerplate. The URL above is `http://`, and HTTP basic
+auth sends that password with every request. Backups stay encrypted either way,
+but anyone on the path can read the credential and then append to or read your
+friend's repository. Forward the port to the internet only behind [TLS](#tls) or
+a reverse proxy that terminates it. Between two machines on the same LAN or over
+a VPN, plain HTTP is fine.
 
 ### Send: back up to that URL
 
@@ -239,18 +252,35 @@ way to pass `PB_EXTRA_OPTIONS`, so TLS means using compose.
 Backups are encrypted before upload, but the login password is sent with every
 request. Use TLS on anything reachable from the internet.
 
+The container runs as `PB_UID`, not as root, so it needs a copy of the
+certificate it can actually read. Let's Encrypt keeps the live directory at
+`0700 root`, so this needs `sudo` to read and a `chown` to be useful afterwards:
+
 ```sh
-mkdir -p ~/.local/share/peerbackup-certs
-cp /etc/letsencrypt/live/example.org/fullchain.pem ~/.local/share/peerbackup-certs/
-cp /etc/letsencrypt/live/example.org/privkey.pem   ~/.local/share/peerbackup-certs/
+export PB_CERTS=~/.local/share/peerbackup-certs
+mkdir -p "$PB_CERTS"
+sudo cp /etc/letsencrypt/live/example.org/fullchain.pem "$PB_CERTS/"
+sudo cp /etc/letsencrypt/live/example.org/privkey.pem   "$PB_CERTS/"
+sudo chown "$(id -u):$(id -g)" "$PB_CERTS"/*.pem
+chmod 600 "$PB_CERTS/privkey.pem"
 ```
 
-Uncomment the certs volume in `compose.yml`, then:
+Do not `chmod 644` the key instead. It is readable by the container because the
+container runs as you, not because the key is world-readable.
+
+Uncomment the certs volume in `compose.yml`, then bring it up with both
+variables set — `PB_CERTS` is what the volume line reads, and leaving it unset
+falls back to `./certs` inside the repository:
 
 ```sh
+PB_CERTS=~/.local/share/peerbackup-certs \
 PB_EXTRA_OPTIONS="--tls --tls-cert /certs/fullchain.pem --tls-key /certs/privkey.pem" \
   docker compose up -d
 ```
+
+Renewals replace the files under `/etc/letsencrypt`, not your copies, so repeat
+the four commands above and `docker compose restart` when the certificate
+rolls.
 
 Peers then use `rest:https://...`. With a self-signed certificate they also need
 a copy of it, and pass it when they connect:
@@ -268,6 +298,13 @@ certificate for other services on this host? Skip the above entirely — leave
 everything else. Don't publish `8000`/`51515` to the internet in this case;
 only the proxy's `80`/`443` need to be reachable. The invite URL loses the
 port: `rest:https://alice:PASSWORD@your-domain.example/alice/`.
+
+Set `PB_HEALTHCHECK_SCHEME=https` alongside `PB_EXTRA_OPTIONS`. The check does
+not fail without it, but it passes for the wrong reason: Go answers a plaintext
+request to a TLS port with `HTTP/1.0 400 Bad Request`, which contains the status
+line the check looks for. So the container reads healthy on the strength of a
+handshake failure, and would go on doing so with a certificate the server could
+not load.
 
 If your proxy routes on Docker's `HEALTHCHECK`, note that `compose.yml`'s check
 looks for any HTTP status line rather than a specific code. With
@@ -372,6 +409,9 @@ Protection is off for every peer during the window, so keep it short.
 | `PB_UID` / `PB_GID` | `1000` | Owner of the stored files |
 | `PB_MAX_SIZE` | `536870912000` | Total bytes, all peers |
 | `PB_EXTRA_OPTIONS` | empty | Extra rest-server flags, e.g. TLS |
+| `PB_CERTS` | `./certs` | Directory holding `fullchain.pem` and `privkey.pem` |
+| `PB_HEALTHCHECK_SCHEME` | `http` | Set to `https` when `PB_EXTRA_OPTIONS` turns on TLS |
+| `PB_BIND` | `0.0.0.0` | Address the published port listens on |
 
 ## Docker (sending backups)
 
