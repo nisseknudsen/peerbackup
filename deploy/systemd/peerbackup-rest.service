@@ -34,6 +34,10 @@ Type=oneshot
 RemainAfterExit=yes
 WorkingDirectory=/usr/local/share/peerbackup
 
+# Where the server keeps backups. This default is the per-peer grant root, which
+# is right only if you ran `host provision`. After `host quickstart` your data is
+# under ~/.local/share/peerbackup-data and this line must be changed to match, or
+# the service comes up serving an empty directory on the right port.
 Environment=PB_DATA=/srv/peerbackup/mnt
 # The same port quickstart, compose.yml and the README all use. This said 8000,
 # so following the README's "Running it as a service" section published a server

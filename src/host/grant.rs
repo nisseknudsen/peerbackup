@@ -478,16 +478,50 @@ pub fn list(ctx: &Ctx, only: Option<&str>) -> Res {
     Ok(())
 }
 
+/// `guard` found no grants, which is a legitimate configuration rather than a
+/// reason to block the boot.
+fn nothing_to_guard(ctx: &Ctx, why: &str) {
+    ctx.info(&format!("no per-peer grants on this host ({why})."));
+    ctx.info("  Nothing to check: storage is whatever PB_DATA points at, under one");
+    ctx.info("  shared size limit. `host provision` is what creates grants.");
+}
+
 /// Fail-closed. Runs as ExecStartPre on the container unit.
 ///
 /// If Docker starts before the mounts settle, a bind mount resolves to an
 /// ordinary directory on the root filesystem with no size limit, and the first
 /// symptom is a full host disk. Refusing to start is the cheaper failure.
+///
+/// What it guards is *grants*. It used to refuse whenever it found none at all,
+/// which reads as fail-closed and is not: someone who ran `host quickstart` has
+/// no grants by design, and installing the service unit then gave them a service
+/// that could never start, for a reason the README explicitly said applied only
+/// "if you are using per-peer images".
+///
+/// A provisioned grant leaves an image behind, so images are what says whether
+/// this host uses them. No images and no grant directories means there is
+/// nothing here to protect and the guard says so rather than blocking the boot.
+/// Anything else is checked as strictly as before.
 pub fn guard(ctx: &Ctx) -> Res {
     let mnt = ctx.mnt();
+    // A provisioned grant leaves an image behind, so images are what say whether
+    // this host uses per-peer grants at all.
+    let images = std::fs::read_dir(ctx.images())
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .filter(|e| e.path().extension().is_some_and(|x| x == "img"))
+        .count();
+
     if !mnt.is_dir() {
+        if images == 0 {
+            nothing_to_guard(ctx, &format!("{} does not exist", mnt.display()));
+            return Ok(());
+        }
         return Err(format!(
-            "{} does not exist; nothing provisioned",
+            "{images} grant image(s) exist but {} does not.\n       \
+             Nothing is mounted, so writes would land on the root filesystem \
+             with no quota.",
             mnt.display()
         ));
     }
@@ -509,8 +543,14 @@ pub fn guard(ctx: &Ctx) -> Res {
         }
     }
     if dirs.is_empty() {
+        if images == 0 {
+            nothing_to_guard(ctx, &format!("{} is empty", mnt.display()));
+            return Ok(());
+        }
         return Err(format!(
-            "no grant directories under {}; refusing to start a server with nothing to serve",
+            "{images} grant image(s) exist but there are no grant directories \
+             under {}.\n       Nothing is mounted, so writes would land on the \
+             root filesystem with no quota.",
             mnt.display()
         ));
     }
@@ -687,20 +727,52 @@ mod tests {
     }
 
     #[test]
-    fn guard_refuses_when_there_is_nothing_to_serve() {
+    fn guard_lets_a_host_with_no_grants_start() {
+        // It refused whenever it found no grants, which reads as fail-closed
+        // and is not. Someone who ran `host quickstart` has no grants by
+        // design, so installing the service unit gave them a service that could
+        // never start -- for a reason the README said applied only "if you are
+        // using per-peer images".
         let dir = tmp("g5");
         std::fs::create_dir_all(dir.join("mnt")).unwrap();
         let ctx = ctx_in(&dir);
-        let err = guard(&ctx).unwrap_err();
-        assert!(err.contains("nothing to serve"), "got: {err}");
+        guard(&ctx).expect("a host with no grants has nothing to guard");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn guard_refuses_when_the_mount_root_is_missing_entirely() {
+    fn guard_lets_a_host_start_when_the_mount_root_was_never_created() {
+        // The same case one step earlier: `quickstart` never creates
+        // /srv/peerbackup at all.
         let dir = tmp("g6");
         let ctx = ctx_in(&dir);
-        assert!(guard(&ctx).is_err());
+        guard(&ctx).expect("nothing provisioned means nothing to guard");
+    }
+
+    #[test]
+    fn guard_still_fails_closed_when_a_grant_exists_but_is_not_mounted() {
+        // The case it is actually for. A provisioned grant leaves an image
+        // behind, so an image with no mount under it means Docker would write
+        // to the root filesystem with no quota.
+        let dir = tmp("g5b");
+        std::fs::create_dir_all(dir.join("mnt")).unwrap();
+        std::fs::create_dir_all(dir.join("images")).unwrap();
+        std::fs::write(dir.join("images").join("alice.img"), b"").unwrap();
+        let ctx = ctx_in(&dir);
+        let err = guard(&ctx).unwrap_err();
+        assert!(err.contains("no quota"), "got: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn guard_fails_closed_when_the_mount_root_vanished_under_a_grant() {
+        let dir = tmp("g6b");
+        std::fs::create_dir_all(dir.join("images")).unwrap();
+        std::fs::write(dir.join("images").join("alice.img"), b"").unwrap();
+        let ctx = ctx_in(&dir);
+        let err = guard(&ctx).unwrap_err();
+        assert!(err.contains("no quota"), "got: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
