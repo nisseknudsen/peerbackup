@@ -214,6 +214,18 @@ ExecStart=-/usr/local/bin/peerbackup backup
 ExecStart=/usr/local/bin/peerbackup verify
 ```
 
+`verify` distinguishes its two kinds of failure in the exit code, because they
+want different responses at three in the morning:
+
+| Exit | Meaning |
+|---|---|
+| 0 | Something was read back and it was correct |
+| 1 | Something was read back and it was wrong |
+| 2 | Nothing could be read back at all |
+
+A peer that is unreachable every night is exit 2 every night, which is worth an
+alert even though nothing is known to be damaged.
+
 ```ini
 # /etc/systemd/system/peerbackup.timer
 [Timer]

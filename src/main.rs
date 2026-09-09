@@ -213,7 +213,18 @@ fn main() {
         Command::Peer(PeerCmd::List) => cli::peer_list(),
         Command::Peer(PeerCmd::Remove { name }) => cli::peer_remove(&name),
         Command::Backup { peer } => cli::backup(peer.as_deref()),
-        Command::Verify { peer } => cli::verify(peer.as_deref()),
+        // Handled below rather than here: `verify` is the one command whose
+        // failure has more than one meaning, and the exit code has to say which.
+        Command::Verify { peer } => match cli::verify(peer.as_deref()) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                eprintln!("error: {e}");
+                if nag_after {
+                    cli::warn_if_recovery_stale();
+                }
+                std::process::exit(e.code());
+            }
+        },
         Command::Status => cli::status_cmd(),
         Command::Snapshots { peer } => cli::snapshots(&peer),
         Command::Restore {
