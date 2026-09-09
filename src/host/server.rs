@@ -320,16 +320,24 @@ pub fn quickstart(ctx: &Ctx, peer: &PeerName, o: &ServerOpts) -> Res {
 
     let host = hostname();
     ctx.info("");
+    // The address and the password, separately, because they are not the same
+    // kind of thing. The address is not secret and belongs on a command line;
+    // the password is and does not. `peerbackup connect` asks for it, so it
+    // never reaches shell history, `ps`, or `docker inspect`.
+    let url = format!("rest:http://{peer}@{host}:{}/{peer}/", o.port);
     ctx.info(&format!(
-        "Ready. Send this to {peer}, over something you trust:"
+        "Ready. Send both of these to {peer}, over something you trust:"
     ));
     ctx.info("");
+    ctx.info(&format!("  URL:      {url}"));
+    ctx.info(&format!("  Password: {pw}"));
+    ctx.info("");
+    ctx.info("They run:");
     ctx.info(&format!(
-        "  rest:http://{peer}:{pw}@{host}:{}/{peer}/",
-        o.port
+        "  peerbackup connect '{url}' --source /path/to/back/up"
     ));
     ctx.info("");
-    ctx.info("They run:  peerbackup connect '<that url>' --source /path/to/back/up");
+    ctx.info("and paste the password when it asks.");
     ctx.info("");
     ctx.info(&format!("Storage:   {}", o.data.display()));
     ctx.info(&format!(
@@ -381,7 +389,8 @@ pub fn adduser(
 
     if generated {
         ctx.say(&format!("generated password for '{peer}': {pw}"));
-        ctx.say("send it over a channel you trust. It is not stored anywhere in plaintext.");
+        ctx.say("send it over a channel you trust, apart from the URL. It is not stored");
+        ctx.say("anywhere in plaintext, so this is the only time it is shown.");
     }
 
     if ctx.would(&format!(

@@ -22,54 +22,55 @@ Two commands. One person hosts, the other sends.
 peerbackup host quickstart alice
 ```
 
-Starts a server in Docker and prints a URL to send them:
+Starts a server in Docker and prints an invite:
 
 ```
-Ready. Send this to alice, over something you trust:
+Ready. Send both of these to alice, over something you trust:
 
-  rest:http://alice:nq7Y7PYN44nqKG83mNc9@your-host:51515/alice/
+  URL:      rest:http://alice@your-host:51515/alice/
+  Password: nq7Y7PYN44nqKG83mNc9
 
-They run:  peerbackup connect '<that url>' --source /path/to/back/up
+They run:
+  peerbackup connect 'rest:http://alice@your-host:51515/alice/' --source /path/to/back/up
+
+and paste the password when it asks.
 
 Storage:   /home/you/.local/share/peerbackup-data
 Port 51515 must reach this machine. Use TLS if it is exposed to the
 internet: see the README.
 ```
 
+Two pieces, because they are two kinds of thing. The URL is an address and
+belongs on a command line; the password does not, and never goes there.
+
 No root, no systemd. Storage goes to `~/.local/share/peerbackup-data`; change it
 with `PB_DATA=`. Forward port 51515 to the machine, or pick another with
 `PB_PORT=`.
 
-That last line is not boilerplate. The URL above is `http://`, and HTTP basic
-auth sends that password with every request. Backups stay encrypted either way,
-but anyone on the path can read the credential and then append to or read your
+That last line is not boilerplate. The URL is `http://`, and HTTP basic auth
+sends the password with every request. Backups stay encrypted either way, but
+anyone on the path can read the credential and then append to or read your
 friend's repository. Forward the port to the internet only behind [TLS](#tls) or
-a reverse proxy that terminates it. Between two machines on the same LAN or over
-a VPN, plain HTTP is fine.
+a reverse proxy that terminates it. On a LAN or over a VPN, plain HTTP is fine.
 
 ### Send: back up to that URL
 
 ```sh
-peerbackup connect 'rest:http://...' --source /srv/data
+peerbackup connect 'rest:http://alice@your-host:51515/alice/' --source /srv/data
 ```
 
-Creates the repository, uploads a test file, downloads it again and compares it,
-so a wrong URL or password fails immediately. Then:
+It asks for the password. Then it creates the repository, uploads a test file,
+downloads it again and compares it, so a wrong address or password fails in
+seconds rather than hours into a first backup.
 
 ```sh
 peerbackup backup      # send a backup
 peerbackup status      # is everything still fine?
 ```
 
-That URL contains the password. On a command line it goes into your shell
-history and into `ps` for the life of the call, and in a container it stays in
-`docker inspect` forever. Pass `-` to read it from stdin instead:
-
-```sh
-peerbackup connect - --source /srv/data < invite.txt
-```
-
-`peer add` takes `-` the same way.
+With no terminal it reads the password from stdin instead, so a scripted setup
+is `peerbackup connect '<url>' --source /srv/data < password.txt`. `peer add`
+behaves the same way.
 
 ### The same two, in Docker
 
@@ -90,16 +91,17 @@ docker run -d --name peerbackup-rest --restart unless-stopped \
   && docker restart peerbackup-rest
 
 # Send
-docker run --rm \
+docker run --rm -i \
   -v ~/.config/peerbackup:/config \
   -v ~/.local/share/peerbackup:/state \
   -v /srv/data:/srv/data:ro \
-  -i peerbackup connect - --source /srv/data < invite.txt
+  peerbackup connect 'rest:http://alice@your-host:51515/alice/' \
+  --source /srv/data < password.txt
 ```
 
-`-` and `-i` rather than the URL as an argument: anything in `docker run`'s
-command line is kept in the container's metadata and comes back out of
-`docker inspect` for as long as the container exists.
+`-i` and stdin for the password. Anything in `docker run`'s command line is kept
+in the container's metadata and comes back out of `docker inspect` for as long as
+the container exists.
 
 Source directories must be mounted at the same paths they have on the host. See
 [Docker](#docker-sending-backups) below for why.
@@ -139,7 +141,7 @@ docker build -t peerbackup .
 ## Commands
 
 ```sh
-peerbackup connect <url> --source <dir>   # set up and connect to a peer
+peerbackup connect <url> --source <dir>   # set up a peer; asks for the password
 peerbackup init                           # config and test files, nothing else
 peerbackup backup [--peer <name>]         # send a backup
 peerbackup verify [--peer <name>]         # read data back and check it
@@ -213,10 +215,13 @@ canary_days = 35
 
 [[peer]]
 name = "alice"
-url = "rest:https://me:PASSWORD@alice.example.org:51515/me/"
+url = "rest:https://me:PASSWORD@alice.example.org:51515/me/"  # written by `connect`
 ```
 
-Passwords are stored separately in `~/.config/peerbackup/secrets/`, mode 0600.
+There are two passwords per peer and they are not interchangeable. The one in
+the URL is the server login, which only reaches that friend's rest-server. The
+one that decrypts the backups lives in `~/.config/peerbackup/secrets/` at mode
+0600, is never in the config, and is what a recovery file exists to preserve.
 
 Every setting has a default, so a config only needs the ones you are changing.
 The values above are the defaults.
@@ -239,7 +244,7 @@ rest, in seconds, if your link needs it:
 |---|---|---|
 | `PEERBACKUP_PROBE_TIMEOUT` | 20 | Deciding whether a peer answers at all |
 | `PEERBACKUP_LIST_TIMEOUT` | 120 | `snapshots`, and creating a repository |
-| `PEERBACKUP_RESTORE_TIMEOUT` | 1800 | The test-file check during `verify` |
+| `PEERBACKUP_CANARY_TIMEOUT` | 1800 | Fetching the test file during `verify` |
 | `PEERBACKUP_VERIFY_TIMEOUT` | 3600 | Reading data back during `verify` |
 
 ### Scheduling
@@ -256,18 +261,6 @@ ExecStart=-/usr/local/bin/peerbackup backup
 ExecStart=/usr/local/bin/peerbackup verify
 ```
 
-`verify` distinguishes its two kinds of failure in the exit code, because they
-want different responses at three in the morning:
-
-| Exit | Meaning |
-|---|---|
-| 0 | Something was read back and it was correct |
-| 1 | Something was read back and it was wrong |
-| 2 | Nothing could be read back at all |
-
-A peer that is unreachable every night is exit 2 every night, which is worth an
-alert even though nothing is known to be damaged.
-
 ```ini
 # /etc/systemd/system/peerbackup.timer
 [Timer]
@@ -277,6 +270,18 @@ Persistent=true
 [Install]
 WantedBy=timers.target
 ```
+
+`verify` distinguishes its two kinds of failure in the exit code, because they
+want different responses at three in the morning:
+
+| Exit | Meaning |
+|---|---|
+| 0 | Something was read back and it was correct |
+| 1 | Something was read back and it was wrong |
+| 2 | Nothing could be read back at all |
+
+A peer unreachable every night is exit 2 every night, which is worth an alert
+even though nothing is known to be damaged.
 
 ## Hosting
 
@@ -327,7 +332,8 @@ Peers then use `rest:https://...`. With a self-signed certificate they also need
 a copy of it, and pass it when they connect:
 
 ```sh
-peerbackup connect 'rest:https://...' --source /srv/data --cacert /path/to/ca.pem
+peerbackup connect 'rest:https://alice@host/alice/' --source /srv/data \
+  --cacert /path/to/ca.pem
 ```
 
 `peerbackup peer add` takes the same flag.
@@ -338,20 +344,19 @@ certificate for other services on this host? Skip the above entirely — leave
 (`8000` inside the container), and let it terminate TLS the way it does
 everything else. Don't publish `8000`/`51515` to the internet in this case;
 only the proxy's `80`/`443` need to be reachable. The invite URL loses the
-port: `rest:https://alice:PASSWORD@your-domain.example/alice/`.
+port: `rest:https://alice@your-domain.example/alice/`.
 
-Set `PB_HEALTHCHECK_SCHEME=https` alongside `PB_EXTRA_OPTIONS`. The check does
-not fail without it, but it passes for the wrong reason: Go answers a plaintext
-request to a TLS port with `HTTP/1.0 400 Bad Request`, which contains the status
-line the check looks for. So the container reads healthy on the strength of a
-handshake failure, and would go on doing so with a certificate the server could
-not load.
+Set `PB_HEALTHCHECK_SCHEME=https` alongside `PB_EXTRA_OPTIONS`. Without it the
+check still passes, but for the wrong reason: Go answers a plaintext request to a
+TLS port with `HTTP/1.0 400 Bad Request`, which contains the status line it looks
+for. The container would read healthy on the strength of a handshake failure, and
+keep doing so with a certificate the server could not load.
 
-If your proxy routes on Docker's `HEALTHCHECK`, note that `compose.yml`'s check
-looks for any HTTP status line rather than a specific code. With
-`--private-repos` the server answers `401` on `/` forever, and busybox `wget`
-exits `1` for that exactly as it does for nothing listening, so a check for one
-exact code marks a working server unhealthy and the route silently disappears.
+That check looks for any HTTP status line rather than a specific code, which
+matters if your proxy routes on Docker's `HEALTHCHECK`. With `--private-repos`
+the server answers `401` on `/` forever, and busybox `wget` exits `1` for that
+exactly as it does for nothing listening -- so a check for one exact code marks a
+working server unhealthy and the route silently disappears.
 
 ### A size limit per peer
 
@@ -574,12 +579,11 @@ backup and compares it against a digest recorded when it was created; it reads
 back a percentage of stored data and checks it; and it asks the peer whether it
 still lists the snapshot your last backup produced.
 
-That last one is about the host rather than the data. Storage is append-only so a
-compromised client cannot erase its own history, and nothing else here would
-notice the host not holding up their end: an old repository is internally
-consistent, so `restic check` passes, and the test file is unchanged, so it still
-restores. The local record of what was sent is the one thing the host cannot
-rewrite.
+That last one is about the host rather than the data. Append-only stops the
+*client* erasing its history; nothing else here would notice the *host* not
+holding up their end. An old repository is internally consistent, so
+`restic check` passes, and the test file is unchanged, so it still restores. The
+local record of what was sent is the one thing the host cannot rewrite.
 
 Results go to an append-only log, which is what `status` reads.
 
@@ -609,8 +613,8 @@ cargo clippy --all-targets -- -D warnings
 Lints are declared in `Cargo.toml` rather than passed on the command line, so a
 local `cargo clippy` enforces exactly what CI does.
 
-Integration tests use a real rest-server and a real restic. The first four need
-neither root nor a privileged container:
+Integration tests use a real rest-server and a real restic. These need neither
+root nor a privileged container:
 
 ```sh
 ./tests/end_to_end.sh                             # full client lifecycle
