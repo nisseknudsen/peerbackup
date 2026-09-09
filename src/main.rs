@@ -98,7 +98,7 @@ enum PeerCmd {
     Add {
         /// Short name, e.g. alice
         name: String,
-        /// Repository URL, e.g. rest:https://me:pw@alice.example.org:8000/me/
+        /// Repository URL, e.g. rest:https://me:pw@alice.example.org:51515/me/
         url: String,
         /// Certificate file, if they use a self-signed one
         #[arg(long)]

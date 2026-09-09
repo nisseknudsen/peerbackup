@@ -293,6 +293,11 @@ impl BackupEngine for ResticEngine {
             args.extend(["--limit-upload".into(), kib.to_string()]);
         }
         for t in &opts.tags {
+            // restic splits `--tag` on commas, so one containing a comma would
+            // silently become two and `restore --tag peerbackup` would stop
+            // matching. Both tags are constants today; this is here so that
+            // stays true if one ever is not.
+            debug_assert!(!t.contains(','), "a tag must not contain a comma: {t}");
             args.extend(["--tag".into(), t.clone()]);
         }
         // Everything after `--` is a path, whatever it starts with. A `sources`
@@ -497,6 +502,11 @@ impl BackupEngine for ResticEngine {
 ///
 /// `Ok(None)` means the deadline expired and the child was killed.
 fn run_bounded(mut cmd: Command, timeout: Option<Duration>) -> std::io::Result<Option<Output>> {
+    // Nothing here is interactive, and `snapshot` runs with no deadline -- so a
+    // restic that decided to prompt on an inherited terminal would hang the
+    // backup with nothing to break it. Closing stdin turns any such prompt into
+    // an immediate EOF and an error we can classify.
+    cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = cmd.spawn()?;
 
@@ -513,25 +523,53 @@ fn run_bounded(mut cmd: Command, timeout: Option<Duration>) -> std::io::Result<O
         v
     });
 
-    let deadline = timeout.map(|d| Instant::now() + d);
+    let start = Instant::now();
+    let deadline = timeout.map(|d| start + d);
     let status = loop {
         if let Some(s) = child.try_wait()? {
             break Some(s);
         }
         if deadline.is_some_and(|dl| Instant::now() >= dl) {
+            // Ask once more before killing. A child that exited inside the
+            // window between the `try_wait` above and this check was killed and
+            // reported as `TimedOut`, so a verify that finished on the deadline
+            // read as "could not check" instead of using its answer. The window
+            // is microseconds and the misclassification is fail-safe, but the
+            // answer is right here.
+            if let Some(s) = child.try_wait()? {
+                break Some(s);
+            }
             let _ = child.kill();
             let _ = child.wait();
             break None;
         }
-        thread::sleep(Duration::from_millis(50));
+        // 50ms is fine for an operation measured in seconds; a verify can run
+        // for an hour, and waking 72,000 times to ask a question whose answer
+        // almost never changes is pure waste. Backing off to a quarter second
+        // after the first few seconds keeps a short command responsive and a
+        // long one cheap.
+        thread::sleep(if start.elapsed() < Duration::from_secs(5) {
+            Duration::from_millis(50)
+        } else {
+            Duration::from_millis(250)
+        });
     };
 
     // Join on both paths. On the timeout path these used to be dropped and the
     // threads detached; they do exit once the pipes close after the kill, but
     // leaving them unjoined asserts a cleanup that was not performed. The kill
     // and wait above have already happened, so neither can block.
-    let stdout = t_out.join().unwrap_or_default();
-    let stderr = t_err.join().unwrap_or_default();
+    // A reader thread only panics if the allocator gives out, and then its
+    // output is empty -- which `classify` reads as `Unclassified`, i.e. a
+    // verdict of "we learned nothing". Fail-safe, but silent, and a run whose
+    // output vanished should say so rather than looking like a run that
+    // produced none.
+    let stdout = t_out
+        .join()
+        .unwrap_or_else(|_| b"peerbackup: the thread reading restic's stdout failed".to_vec());
+    let stderr = t_err
+        .join()
+        .unwrap_or_else(|_| b"peerbackup: the thread reading restic's stderr failed".to_vec());
 
     Ok(status.map(|status| Output {
         status,

@@ -37,7 +37,7 @@ with `PB_DATA=`. Forward port 51515 to the machine, or pick another with
 ### Send: back up to that URL
 
 ```sh
-peerbackup connect 'rest://...' --source /srv/data
+peerbackup connect 'rest:http://...' --source /srv/data
 ```
 
 Creates the repository, uploads a test file, downloads it again and compares it,
@@ -65,7 +65,7 @@ docker run --rm \
   -v ~/.config/peerbackup:/config \
   -v ~/.local/share/peerbackup:/state \
   -v /srv/data:/srv/data:ro \
-  peerbackup connect 'rest://...' --source /srv/data
+  peerbackup connect 'rest:http://...' --source /srv/data
 ```
 
 Source directories must be mounted at the same paths they have on the host. See
@@ -107,12 +107,14 @@ docker build -t peerbackup .
 
 ```sh
 peerbackup connect <url> --source <dir>   # set up and connect to a peer
-peerbackup backup                         # send a backup to every peer
-peerbackup verify                         # read data back and check it
+peerbackup init                           # config and test files, nothing else
+peerbackup backup [--peer <name>]         # send a backup
+peerbackup verify [--peer <name>]         # read data back and check it
 peerbackup status                         # summary per peer
 peerbackup snapshots <peer>               # list backups stored on a peer
-peerbackup restore <peer> <target>        # restore the most recent backup
-peerbackup recovery export                # save what you need to restore later
+peerbackup restore <peer> <target> [--snapshot <id>]
+peerbackup recovery export [--out <file>] # save what you need to restore later
+peerbackup recovery check                 # is that file still current?
 peerbackup peer add|list|remove           # manage peers individually
 ```
 
@@ -121,10 +123,17 @@ Hosting:
 ```sh
 peerbackup host quickstart <peer>    # start a server and add a peer
 peerbackup host adduser <peer>       # add another peer later
-peerbackup host list                 # allowances and usage
+peerbackup host list [<peer>]        # allowances and usage
 peerbackup host provision <peer> <size>   # per-peer size limit (needs root)
-peerbackup host release <peer>       # give the space back
+peerbackup host release <peer>       # give the space back (needs root)
+peerbackup host doctor               # is this machine set up to host?
+peerbackup host guard                # refuse to start unless grants are mounted
+peerbackup host up|down              # docker compose, against the shipped file
 ```
+
+`host guard` is the one that looks optional and is not: it is the `ExecStartPre`
+in the service unit, and it is what stops a boot where Docker won the race
+writing to your root filesystem with no size limit.
 
 `status` reads locally recorded results and does not contact peers, so it
 returns immediately and works offline:
@@ -171,7 +180,7 @@ canary_days = 35
 
 [[peer]]
 name = "alice"
-url = "rest:https://me:PASSWORD@alice.example.org:8000/me/"
+url = "rest:https://me:PASSWORD@alice.example.org:51515/me/"
 ```
 
 Passwords are stored separately in `~/.config/peerbackup/secrets/`, mode 0600.
@@ -365,6 +374,8 @@ Protection is off for every peer during the window, so keep it short.
 | `PB_UID` / `PB_GID` | `1000` | Owner of the stored files |
 | `PB_MAX_SIZE` | `536870912000` | Total bytes, all peers |
 | `PB_EXTRA_OPTIONS` | empty | Extra rest-server flags, e.g. TLS |
+| `PB_CONTAINER` | `peerbackup-rest` | Container name `quickstart` and `adduser` act on |
+| `PB_COMPOSE_FILE` | shipped `compose.yml` | Compose file `host up`/`down` use |
 
 ## Docker (sending backups)
 
@@ -496,15 +507,24 @@ cargo clippy --all-targets -- -D warnings
 Lints are declared in `Cargo.toml` rather than passed on the command line, so a
 local `cargo clippy` enforces exactly what CI does.
 
-Integration tests use a real rest-server and a real restic. None require root:
+Integration tests use a real rest-server and a real restic. The first four need
+neither root nor a privileged container:
 
 ```sh
 ./tests/end_to_end.sh                             # full client lifecycle
 ./tests/docker.sh                                 # container image, both sides
 ./deploy/test-host-tooling.sh                     # host tooling
 ./deploy/test-compose-e2e.sh                      # container and isolation
-./deploy/test-provision-root.sh --in-container    # storage provisioning
 ./spike/lifecycle-spike.sh                        # slow, ~2GB
+```
+
+Provisioning needs real loop devices, so it needs real privilege. `--in-container`
+is `docker run --privileged` with the repository mounted, which is not a smaller
+ask than sudo:
+
+```sh
+sudo ./deploy/test-provision-root.sh
+./deploy/test-provision-root.sh --in-container
 ```
 
 ## License
