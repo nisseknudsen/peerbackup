@@ -9,14 +9,15 @@
 //! a crash mid-write should cost one line rather than the whole record.
 
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::config::{Config, PeerName, home};
+use crate::config::{Config, PeerName, create_dir_private, home};
 
 pub fn state_dir() -> PathBuf {
     std::env::var_os("PEERBACKUP_STATE_DIR")
@@ -68,7 +69,7 @@ impl Canary {
     /// The same, against explicit paths, so a test can build one in a temporary
     /// directory without pointing the whole process at it.
     pub fn create_at(dir: &Path, manifest: &Path) -> std::io::Result<Self> {
-        fs::create_dir_all(dir)?;
+        create_dir_private(dir)?;
         let mut files = Vec::new();
         for i in 0..3 {
             let path = dir.join(format!("canary-{i}.bin"));
@@ -93,7 +94,7 @@ impl Canary {
 
     pub fn save_at(&self, p: &Path) -> std::io::Result<()> {
         if let Some(parent) = p.parent() {
-            fs::create_dir_all(parent)?;
+            create_dir_private(parent)?;
         }
         fs::write(
             p,
@@ -171,6 +172,19 @@ pub struct Record {
     pub snapshot: Option<String>,
 }
 
+/// What a peer's history says, plus whether we managed to read all of it.
+///
+/// `incomplete` exists because the old signature was `Vec<Record>` and every
+/// I/O failure -- a bad sector, a root-owned file left by one `sudo` run --
+/// returned a silently *partial* history that the caller could not tell from a
+/// complete one. A read error on the evidence log is itself evidence that
+/// something is wrong, and it must not resolve to a green dashboard.
+#[derive(Debug, Default)]
+pub struct History {
+    pub records: Vec<Record>,
+    pub incomplete: Option<String>,
+}
+
 pub struct Evidence;
 
 impl Evidence {
@@ -181,60 +195,126 @@ impl Evidence {
     /// edition 2024 for a real reason: other tests in the same binary read the
     /// environment concurrently, so a test that sets a variable is a data race
     /// against every one of them, and it passed only by luck of scheduling.
+    ///
+    /// The write is synced before returning. `Runtime::record` goes to some
+    /// trouble over write *errors* for a `Bad` verdict -- "the next `status`
+    /// would call this peer healthy" -- but a successful `write_all` only
+    /// reaches the page cache, which on ext4 defaults is up to thirty seconds
+    /// of exposure. `verify` observing damage, printing `DOES NOT MATCH`, and
+    /// then losing the record to a power cut is the same failure by a slower
+    /// route, on machines that are by definition the ones people lose.
     pub fn append_to(path: &Path, r: &Record) -> std::io::Result<()> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
+        let mut line = serde_json::to_string(r).map_err(std::io::Error::other)?;
+        line.push('\n');
+
+        let parent = path.parent();
+        let fresh = !path.exists();
+        if let Some(p) = parent {
+            create_dir_private(p)?;
         }
         let mut f = fs::OpenOptions::new()
             .create(true)
             .append(true)
+            // 0600 from the moment it exists, matching the config beside it.
+            // The log carries peer names, the exact backup schedule, and
+            // restic's error text, and under a umask of 002 -- common in
+            // containers and on Debian with per-user groups -- the default
+            // would be group-*writable*, which makes records forgeable.
+            .mode(0o600)
             .open(path)?;
-        let mut line = serde_json::to_string(r).map_err(std::io::Error::other)?;
-        line.push('\n');
-        f.write_all(line.as_bytes())
+        f.write_all(line.as_bytes())?;
+        f.sync_data()?;
+        // A rename is not involved, but the file's first appearance in the
+        // directory is a directory operation and is journalled separately.
+        if fresh && let Some(p) = parent {
+            fs::File::open(p)?.sync_all()?;
+        }
+        Ok(())
     }
 
-    /// Records newer than `oldest`, newest last. Pass `0` for everything.
+    /// Records at or after `oldest`, newest last. Pass `0` for everything.
     ///
-    /// `status` needs at most `canary_days` of history, but this read the whole
-    /// file and parsed every line of it. Hourly backups and daily verifies to
-    /// three peers is tens of thousands of lines a year, growing forever,
-    /// re-read on every invocation of the command people run most.
-    ///
-    /// Seeks to the end and walks backwards a block at a time, stopping at the
-    /// first record older than the cutoff. The file is append-only and written
-    /// in time order, so everything before that point is older too.
-    ///
-    /// The intermediate version of this stopped *parsing* early but still began
-    /// with `read_to_string`, so the JSON cost was bounded and the I/O was not
-    /// -- while the comment claimed both. Now the whole cost is the window.
+    /// A thin wrapper over [`Evidence::read`] with nothing to resolve, for
+    /// callers that only want a time window.
+    #[cfg(test)]
     pub fn read_since(path: &Path, oldest: u64) -> Vec<Record> {
+        Self::read(path, oldest, &[]).records
+    }
+
+    /// The history `status` needs: a time window, plus however much further back
+    /// it takes to learn where each of `resolve_for` currently stands.
+    ///
+    /// `status` needs at most a window of history to answer "how long ago", but
+    /// reading only a window is not enough to answer "is anything wrong". A
+    /// `Bad` record that nothing has refuted does not stop being true because it
+    /// is old -- and with a window alone, an observed pack-hash mismatch quietly
+    /// downgraded from `FAILED` to `unchecked` the day it aged out. So the walk
+    /// also continues until, for every peer named, it has seen a `Good` or a
+    /// `Bad` of every kind. Walking backwards, the first of those it meets is
+    /// the one that decides the kind, because `Unknown` neither raises nor
+    /// clears anything.
+    ///
+    /// Cost: the file is append-only and written in time order, so the walk
+    /// seeks to the end and reads backwards a block at a time. The common case
+    /// -- a peer checked within its windows -- resolves in the first block. The
+    /// walk past the cutoff is bounded by [`MAX_RESOLVE_BYTES`] so that a peer
+    /// which has never had a check of some kind cannot turn every `status` into
+    /// a full scan of a log that grows forever.
+    pub fn read(path: &Path, oldest: u64, resolve_for: &[PeerName]) -> History {
         use std::io::{Seek, SeekFrom};
 
         // Comfortably more than a window's worth of records for a normal
         // schedule, so the common case is one read.
         const BLOCK: usize = 64 * 1024;
 
-        let Ok(mut f) = fs::File::open(path) else {
-            return Vec::new();
+        let mut h = History::default();
+        let mut f = match fs::File::open(path) {
+            Ok(f) => f,
+            // A log that does not exist yet is a complete history of nothing.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return h,
+            Err(e) => {
+                h.incomplete = Some(format!("{} could not be opened: {e}", path.display()));
+                return h;
+            }
         };
-        let Ok(len) = f.seek(SeekFrom::End(0)) else {
-            return Vec::new();
+        let len = match f.seek(SeekFrom::End(0)) {
+            Ok(n) => n,
+            Err(e) => {
+                h.incomplete = Some(format!("{} could not be read: {e}", path.display()));
+                return h;
+            }
         };
 
-        let mut out: Vec<Record> = Vec::new();
+        let mut pending = Unresolved::new(resolve_for);
         let mut pos = len;
         // Bytes already read that belong to a line beginning further left.
         let mut carry: Vec<u8> = Vec::new();
 
+        // A run of records older than the cutoff, rather than the first one.
+        // The walk used to stop at the first, on the assumption that an
+        // append-only file is in time order -- so one record written while the
+        // clock was wrong discarded everything to its left, permanently. A
+        // handful of stragglers is a bad clock; a real cutoff is followed by the
+        // entire rest of the file.
+        const OLD_RUN: usize = 8;
+        let mut consecutive_old = 0usize;
+
         'blocks: while pos > 0 {
+            // The reach-back past the cutoff is bounded so that a peer which has
+            // never had a check of some kind cannot turn every `status` into a
+            // full scan.
+            if len - pos > MAX_RESOLVE_BYTES {
+                break;
+            }
             let take = BLOCK.min(pos as usize);
             pos -= take as u64;
-            if f.seek(SeekFrom::Start(pos)).is_err() {
+            if let Err(e) = f.seek(SeekFrom::Start(pos)) {
+                h.incomplete = Some(format!("{} could not be read: {e}", path.display()));
                 break;
             }
             let mut buf = vec![0u8; take];
-            if f.read_exact(&mut buf).is_err() {
+            if let Err(e) = f.read_exact(&mut buf) {
+                h.incomplete = Some(format!("{} could not be read: {e}", path.display()));
                 break;
             }
             buf.extend_from_slice(&carry);
@@ -242,11 +322,21 @@ impl Evidence {
             // While there is still file to the left, the bytes before the first
             // newline are the tail of a line that starts in the next block.
             // At pos == 0 there is nothing to the left, so they are a whole line.
+            //
+            // A block with no newline in it at all is entirely the middle of one
+            // very long line, so *everything* here has to be carried. Resetting
+            // the carry to empty in that case -- which is what this did -- threw
+            // away the right-hand half of the record, so when the left-hand half
+            // was finally reached the two could never be rejoined and the record
+            // was lost. `detail` holds restic's whole combined output, which is
+            // megabytes for a backup that failed over a large tree, so the
+            // record this dropped was reliably the most broken peer's.
             let split = (pos > 0)
                 .then(|| buf.iter().position(|b| *b == b'\n'))
                 .flatten();
             let (keep, lines): (Vec<u8>, &[u8]) = match split {
                 Some(i) => (buf[..i].to_vec(), &buf[i + 1..]),
+                None if pos > 0 => (buf.clone(), &[]),
                 None => (Vec::new(), &buf[..]),
             };
 
@@ -257,15 +347,66 @@ impl Evidence {
                     continue;
                 };
                 if r.at < oldest {
+                    consecutive_old += 1;
+                } else {
+                    consecutive_old = 0;
+                }
+                // Asked before `saw`, or the very record that resolves a kind is
+                // the one dropped for being outside the window.
+                let keep = r.at >= oldest || pending.wanted(&r);
+                pending.saw(&r);
+                if keep {
+                    h.records.push(r);
+                }
+                if pending.done() && consecutive_old >= OLD_RUN {
                     break 'blocks;
                 }
-                out.push(r);
             }
             carry = keep;
         }
 
-        out.reverse();
-        out
+        h.records.reverse();
+        h
+    }
+}
+
+/// Hard ceiling on how far back the walk will go, in bytes.
+///
+/// Bounds the case where a peer has never had a check of some kind, which would
+/// otherwise never resolve and would turn every `status` into a full scan. At
+/// roughly 150 bytes a record this is some tens of thousands of records, which
+/// is well over a year of an hourly schedule. A `Bad` older than that with no
+/// intervening `Good` means the peer has gone unverified for longer than the log
+/// covers, and it reads `unchecked` on freshness alone.
+const MAX_RESOLVE_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Tracks which `(peer, kind)` pairs still have no `Good` or `Bad` behind them.
+struct Unresolved(Vec<(PeerName, Kind)>);
+
+impl Unresolved {
+    fn new(peers: &[PeerName]) -> Self {
+        Self(
+            peers
+                .iter()
+                .flat_map(|p| [Kind::Backup, Kind::Subset, Kind::Canary].map(|k| (p.clone(), k)))
+                .collect(),
+        )
+    }
+
+    /// True while this record is one the walk is still reaching back for, so it
+    /// is kept even though it sits outside the time window.
+    fn wanted(&self, r: &Record) -> bool {
+        r.verdict != Verdict::Unknown && self.0.iter().any(|(p, k)| *k == r.kind && r.peer == *p)
+    }
+
+    fn saw(&mut self, r: &Record) {
+        if r.verdict != Verdict::Unknown {
+            self.0.retain(|(p, k)| !(*k == r.kind && r.peer == *p));
+        }
+    }
+
+    fn done(&self) -> bool {
+        self.0.is_empty()
     }
 }
 
@@ -469,6 +610,7 @@ pub fn ago(then: Option<u64>, now_ts: u64) -> String {
 mod tests {
     use super::*;
     use crate::config::Peer;
+    use std::os::unix::fs::PermissionsExt;
 
     fn cfg_with_peer() -> Config {
         let mut c = Config::default();
@@ -799,6 +941,178 @@ mod tests {
             status(&cfg_with_peer(), &[], NOW)[0].state,
             PeerState::Unknown
         );
+    }
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("pb-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_record_longer_than_a_block_survives_the_backwards_walk() {
+        // A block containing no newline at all is entirely the middle of one
+        // very long line. Resetting the carry to empty there threw away the
+        // right-hand half, so the record could never be rejoined and was lost.
+        // `detail` carries restic's whole combined output, which is megabytes
+        // for a backup that failed over a large tree, so the record this
+        // dropped was reliably the most broken peer's.
+        let dir = scratch("longline");
+        let path = dir.join("evidence.jsonl");
+
+        let huge = Record {
+            detail: Some("x".repeat(200_000)),
+            ..rec(Kind::Backup, Verdict::Unknown, 200)
+        };
+        Evidence::append_to(&path, &rec(Kind::Backup, Verdict::Good, 100)).unwrap();
+        Evidence::append_to(&path, &huge).unwrap();
+        Evidence::append_to(&path, &rec(Kind::Backup, Verdict::Good, 300)).unwrap();
+
+        let all = Evidence::read_since(&path, 0);
+        assert_eq!(
+            all.iter().map(|r| r.at).collect::<Vec<_>>(),
+            vec![100, 200, 300],
+            "a record spanning several blocks must not be dropped"
+        );
+        assert_eq!(all[1].detail.as_ref().unwrap().len(), 200_000);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn one_record_written_with_a_wrong_clock_does_not_truncate_the_history() {
+        // The walk used to stop at the first record older than the cutoff, on
+        // the assumption that the file is in time order. One record written
+        // while the RTC read 2001 broke that assumption permanently and
+        // discarded everything to its left, not just that record.
+        let dir = scratch("clockstep");
+        let path = dir.join("evidence.jsonl");
+
+        for at in [
+            NOW - 500,
+            NOW - 400,
+            NOW - 300,
+            1_000_000_000,
+            NOW - 200,
+            NOW - 100,
+        ] {
+            Evidence::append_to(&path, &rec(Kind::Backup, Verdict::Good, at)).unwrap();
+        }
+        let got = Evidence::read(&path, NOW - 600, &[PeerName::new("alice").unwrap()]);
+        let ats: Vec<u64> = got.records.iter().map(|r| r.at).collect();
+        assert_eq!(
+            ats,
+            vec![NOW - 500, NOW - 400, NOW - 300, NOW - 200, NOW - 100],
+            "the misdated record falls outside the window, but everything to its \
+             left must survive it"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn damage_older_than_the_window_is_still_reported() {
+        // A `Bad` nothing has refuted does not stop being true because it is
+        // old. With a window alone, an observed pack-hash mismatch downgraded
+        // from FAILED to unchecked the day it aged out, and the detail stopped
+        // being printed at all.
+        let dir = scratch("oldbad");
+        let path = dir.join("evidence.jsonl");
+        let alice = PeerName::new("alice").unwrap();
+
+        Evidence::append_to(
+            &path,
+            &detailed(
+                Kind::Subset,
+                Verdict::Bad,
+                NOW - 86400 * 80,
+                "pack 4f2a hash mismatch",
+            ),
+        )
+        .unwrap();
+        Evidence::append_to(&path, &rec(Kind::Backup, Verdict::Good, NOW - 60)).unwrap();
+        Evidence::append_to(&path, &rec(Kind::Canary, Verdict::Good, NOW - 60)).unwrap();
+
+        let window = NOW - 86400 * 70;
+        assert!(
+            Evidence::read_since(&path, window)
+                .iter()
+                .all(|r| r.verdict != Verdict::Bad),
+            "the fixture must place the Bad outside the plain window"
+        );
+
+        let got = Evidence::read(&path, window, &[alice]);
+        let r = &status(&cfg_with_peer(), &got.records, NOW)[0];
+        assert_eq!(r.state, PeerState::Bad);
+        assert!(r.problem.as_deref().unwrap_or_default().contains("4f2a"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_good_check_outside_the_window_ends_the_reach_back() {
+        // The other direction: reaching back must stop at the first Good, or a
+        // peer that was repaired years ago would still be read as damaged.
+        let dir = scratch("oldgood");
+        let path = dir.join("evidence.jsonl");
+        let alice = PeerName::new("alice").unwrap();
+
+        Evidence::append_to(
+            &path,
+            &detailed(
+                Kind::Subset,
+                Verdict::Bad,
+                NOW - 86400 * 90,
+                "pack 4f2a hash mismatch",
+            ),
+        )
+        .unwrap();
+        Evidence::append_to(&path, &rec(Kind::Subset, Verdict::Good, NOW - 86400 * 80)).unwrap();
+
+        let got = Evidence::read(&path, NOW - 86400 * 70, &[alice]);
+        let r = &status(&cfg_with_peer(), &got.records, NOW)[0];
+        assert_eq!(r.state, PeerState::Unknown, "{:?}", r.problem);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_unreadable_log_is_reported_rather_than_read_as_an_empty_one() {
+        // The old signature was a bare Vec, so every I/O failure returned a
+        // silently partial history the caller could not tell from a complete
+        // one, and a partial history of fresh Goods reports `ok`.
+        let dir = scratch("unreadable");
+        let path = dir.join("evidence.jsonl");
+        Evidence::append_to(&path, &rec(Kind::Backup, Verdict::Good, NOW)).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let got = Evidence::read(&path, 0, &[]);
+        // Running as root defeats the permission, so only assert when it bit.
+        if fs::File::open(&path).is_err() {
+            assert!(got.incomplete.is_some(), "an unreadable log must say so");
+            assert!(got.records.is_empty());
+        }
+        let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_missing_log_is_a_complete_history_of_nothing() {
+        let dir = scratch("nolog");
+        let got = Evidence::read(&dir.join("nope.jsonl"), 0, &[]);
+        assert!(got.incomplete.is_none(), "absent is not unreadable");
+        assert!(got.records.is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_evidence_log_is_not_readable_by_anyone_else() {
+        // It carries peer names, the exact schedule, and restic's error text.
+        // Under a umask of 002 the default would be group-writable, at which
+        // point records are forgeable.
+        let dir = scratch("evperm");
+        let path = dir.join("evidence.jsonl");
+        Evidence::append_to(&path, &rec(Kind::Backup, Verdict::Good, 1)).unwrap();
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "evidence must be 0600, was {mode:o}");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -689,13 +689,25 @@ pub fn status_cmd() -> Res {
         return Ok(());
     }
     let t = now();
-    // Only as far back as the widest window `status` actually consults. The
-    // evidence log is append-only and never rotated, so reading all of it meant
-    // re-parsing every record ever written on the command people run most.
+    // As far back as the widest window `status` actually consults -- all three
+    // of them. `liveness_hours` was left out of this max while `status` went on
+    // judging `last_backup` against it, so a schedule with a long backup
+    // interval and short check windows dropped a perfectly good backup out of
+    // the read and then reported "no backup has reached this peer".
+    //
     // Doubled so a boundary record is never the reason a peer looks unchecked.
-    let window = cfg.settings.canary_days.max(cfg.settings.subset_days) * 86400 * 2;
-    let records = Evidence::read_since(&rt.evidence(), t.saturating_sub(window));
-    let rows = status(&cfg, &records, t);
+    // The evidence log is append-only and never rotated, so reading all of it
+    // meant re-parsing every record ever written, on the command people run
+    // most. `Evidence::read` extends the walk past this cutoff only as far as it
+    // takes to find where each peer currently stands.
+    let window = (cfg.settings.liveness_hours * 3600)
+        .max(cfg.settings.subset_days * 86400)
+        .max(cfg.settings.canary_days * 86400)
+        * 2;
+    let names: Vec<_> = cfg.peers.iter().map(|p| p.name.clone()).collect();
+    let history = Evidence::read(&rt.evidence(), t.saturating_sub(window), &names);
+    let records = &history.records;
+    let rows = status(&cfg, records, t);
 
     println!(
         "{:<12} {:<11} {:<12} {:<12} {:<12} READ BACK",
@@ -735,7 +747,7 @@ pub fn status_cmd() -> Res {
     // failed, say so: "unchecked" alone reads as "nothing happened yet" when
     // the truth may be that every backup is being rejected.
     for r in rows.iter().filter(|r| r.state == PeerState::Unknown) {
-        if let Some(reason) = last_failure(&records, &r.name) {
+        if let Some(reason) = last_failure(records, &r.name) {
             println!();
             println!("{}: last attempt did not succeed", r.name);
             println!("  {reason}");
@@ -763,7 +775,14 @@ pub fn status_cmd() -> Res {
         );
     }
 
-    verdict(&rows)
+    if let Some(why) = &history.incomplete {
+        println!();
+        println!("Some of the history could not be read:");
+        println!("  {why}");
+        println!("  What is shown may be missing results, including failures.");
+    }
+
+    verdict(&rows, history.incomplete.is_some())
 }
 
 /// Split the `unknown` peers into "never received a backup" and "checks have
@@ -789,9 +808,19 @@ fn partition_unknown(rows: &[PeerStatus]) -> (Vec<&PeerStatus>, Vec<&PeerStatus>
 /// were partitioned out for printing and then left out of the exit code, so a
 /// peer holding none of your data exited 0 as long as some other peer was fine.
 /// That is the most alarming state of the three, and it was the only silent one.
-fn verdict(rows: &[PeerStatus]) -> Res {
+fn verdict(rows: &[PeerStatus], history_incomplete: bool) -> Res {
     if rows.iter().any(|r| r.state == PeerState::Bad) {
         return Err("one or more peers reported a problem".into());
+    }
+    // A read error on the evidence log is itself evidence that something is
+    // wrong. The old signature returned a bare `Vec`, so a bad sector partway
+    // through the file produced a shorter history that looked exactly like a
+    // shorter history, and the newest block's fresh `Good` records reported `ok`
+    // over an unrefuted `Bad` that was never reached.
+    if history_incomplete {
+        return Err(
+            "the evidence log could not be read in full, so nothing here can be trusted".into(),
+        );
     }
     if !rows.is_empty() && rows.iter().all(|r| r.state == PeerState::Unknown) {
         return Err(
@@ -1149,7 +1178,7 @@ mod tests {
             row("alice", PeerState::Good, Some(100)),
             row("bob", PeerState::Unknown, None),
         ];
-        let e = verdict(&rows).unwrap_err();
+        let e = verdict(&rows, false).unwrap_err();
         assert!(e.contains("no backup at all"), "got: {e}");
         assert!(e.contains("bob"), "must name the peer: {e}");
         assert!(!e.contains("alice"), "must not blame the healthy peer: {e}");
@@ -1161,7 +1190,7 @@ mod tests {
             row("alice", PeerState::Bad, Some(100)),
             row("bob", PeerState::Unknown, None),
         ];
-        let e = verdict(&rows).unwrap_err();
+        let e = verdict(&rows, false).unwrap_err();
         assert!(e.contains("reported a problem"), "got: {e}");
     }
 
@@ -1171,7 +1200,7 @@ mod tests {
             row("alice", PeerState::Good, Some(100)),
             row("bob", PeerState::Unknown, Some(50)),
         ];
-        let e = verdict(&rows).unwrap_err();
+        let e = verdict(&rows, false).unwrap_err();
         assert!(e.contains("not been checked"), "got: {e}");
         assert!(e.contains("bob"), "got: {e}");
     }
@@ -1183,7 +1212,7 @@ mod tests {
             row("bob", PeerState::Unknown, None),
             row("carol", PeerState::Unknown, Some(50)),
         ];
-        let e = verdict(&rows).unwrap_err();
+        let e = verdict(&rows, false).unwrap_err();
         assert!(e.contains("bob"), "the never-backed-up peer: {e}");
         assert!(e.contains("carol"), "the stale peer: {e}");
     }
@@ -1194,13 +1223,13 @@ mod tests {
             row("alice", PeerState::Good, Some(100)),
             row("bob", PeerState::Good, Some(100)),
         ];
-        assert!(verdict(&rows).is_ok());
+        assert!(verdict(&rows, false).is_ok());
     }
 
     #[test]
     fn no_peers_at_all_is_not_a_failure_here() {
         // `status_cmd` returns early with its own message before reaching this.
-        assert!(verdict(&[]).is_ok());
+        assert!(verdict(&[], false).is_ok());
     }
 
     // ------------------------------------------------- backup and verify

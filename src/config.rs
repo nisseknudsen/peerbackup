@@ -248,7 +248,7 @@ impl Config {
 
     pub fn save(&self) -> io::Result<()> {
         let dir = Self::dir();
-        fs::create_dir_all(&dir)?;
+        create_dir_private(&dir)?;
         let text = toml::to_string_pretty(self).map_err(io::Error::other)?;
         write_private(&Self::path(), text.as_bytes())
     }
@@ -271,6 +271,26 @@ pub fn home() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/root"))
 }
 
+/// Create a directory tree only the owner can enter.
+///
+/// `create_dir_all` applies the process umask, which is usually 0022, so the
+/// directory holding the repository passwords was world-traversable and the peer
+/// names in it were readable by any local account. The files inside are 0600, so
+/// this is about what the directory listing gives away rather than the contents
+/// -- but the mode is passed to `mkdir` rather than chmodded afterwards for the
+/// same reason [`write_private`] passes it to `open`: there must be no window.
+///
+/// Only newly created components get the mode. An existing directory is left
+/// alone, because tightening a directory someone deliberately opened up is not
+/// this function's call to make.
+pub fn create_dir_private(dir: &Path) -> io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+}
+
 /// Write a file only the owner can read, atomically.
 ///
 /// Two properties, both load-bearing, because this writes repository passwords
@@ -290,7 +310,7 @@ pub fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
     use std::io::Write;
 
     let parent = path.parent().unwrap_or(Path::new("."));
-    fs::create_dir_all(parent)?;
+    create_dir_private(parent)?;
 
     // Append to the file name rather than replacing its extension.
     // `with_extension` would turn both `al.ice` and `al.bob` into `al.tmp.PID`,
