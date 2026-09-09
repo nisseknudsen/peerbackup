@@ -27,13 +27,36 @@ pub fn strip_go_trace(raw: &str) -> String {
             // Frame labels: `main.init`, `runtime.goexit`, `github.com/...`
             let is_frame =
                 t.starts_with("runtime.") || t.starts_with("main.") || t.starts_with("github.com/");
-            // Source locations are indented and start with a path.
-            let is_location = line.starts_with(char::is_whitespace)
-                && (t.starts_with('/') || t.contains(".go:") || t.contains(".s:"));
+            // Source locations are indented and name a Go source file. The
+            // `.go:` / `.s:` suffix is required rather than merely "starts with
+            // a path": restic indents its own detail lines under an error
+            // header, and those are frequently absolute paths. Dropping every
+            // indented `/...` line deleted real evidence -- `classify` runs on
+            // the stripped text, so a damage keyword that appeared only on such
+            // a line was destroyed before it could be matched, and the failure
+            // fell through to `Unclassified`.
+            let is_location =
+                line.starts_with(char::is_whitespace) && (t.contains(".go:") || t.contains(".s:"));
             !(is_frame || is_location)
         })
         .map(str::trim_end)
         .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Drop restic's non-fatal retry lines.
+///
+/// restic reports a transient failure and its retry on one line, then continues.
+/// Those lines describe something that already recovered, so they say nothing
+/// about how the run ended -- but they are full of exactly the words the
+/// transport rules match on.
+fn without_retry_lines(s: &str) -> String {
+    s.lines()
+        .filter(|l| {
+            let lc = l.to_ascii_lowercase();
+            !(lc.contains("returned error, retrying") || lc.contains("retrying after"))
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -60,18 +83,38 @@ pub enum Classified {
 /// a false red is as corrosive to trust as a false green.
 pub fn classify(code: i32, output: &str) -> Classified {
     let clean = strip_go_trace(output);
-    let lc = clean.to_ascii_lowercase();
+    // Retry chatter is not an outcome, and it must not be allowed to explain
+    // one. restic prints `Load(<data/aa>) returned error, retrying after 1s:
+    // unexpected EOF` on every transient blip and then carries on, usually
+    // successfully. Because the transport rules below match anywhere in the
+    // combined output and sit above the generic `check failed` rule, a single
+    // such line during a forty-minute read-back downgraded
+    // `Fatal: repository contains errors` to `TransferInterrupted` -- so a
+    // repository restic had just called broken read `unknown` forever.
+    //
+    // The existing tests fed each transport string in isolation, which is
+    // exactly the shape that cannot catch this.
+    let outcome = without_retry_lines(&clean);
+    let lc = outcome.to_ascii_lowercase();
 
     // ---- damage: only from evidence that the bytes were read and were wrong ----
     if lc.contains("does not match its hash") || lc.contains("pack id does not match") {
-        let pack = extract_pack_id(&clean).unwrap_or_else(|| "unknown".into());
+        let pack = extract_pack_id(&outcome).unwrap_or_else(|| "unknown".into());
         return Classified::Damage(Corruption::PackHashMismatch { pack });
     }
+    // Same line, not merely both somewhere in the output. `contains` over the
+    // whole combined text needed only the word `decrypting` (restic prints it
+    // while loading keys and indexes) and the word `failed` anywhere else, and
+    // this rule sits above every transport rule -- so a peer whose router was
+    // down could be reported as having corrupt data. A false red costs the same
+    // trust as a false green.
     if lc.contains("ciphertext verification failed")
-        || lc.contains("decrypting") && lc.contains("failed")
+        || lc
+            .lines()
+            .any(|l| l.contains("decrypting") && l.contains("failed"))
     {
         return Classified::Damage(Corruption::CiphertextInvalid {
-            detail: first_line(&clean),
+            detail: first_line(&outcome),
         });
     }
     if lc.contains("blob not found")
@@ -79,7 +122,7 @@ pub fn classify(code: i32, output: &str) -> Classified {
         || lc.contains("is not found in the repository")
     {
         return Classified::Damage(Corruption::MissingData {
-            detail: first_line(&clean),
+            detail: first_line(&outcome),
         });
     }
 
@@ -128,7 +171,7 @@ pub fn classify(code: i32, output: &str) -> Classified {
     }
     if lc.contains("repository is already locked") || lc.contains("unable to create lock") {
         return Classified::NoVerdict(Cause::Locked {
-            detail: first_line(&clean),
+            detail: first_line(&outcome),
         });
     }
     if lc.contains("connection refused")
@@ -140,7 +183,7 @@ pub fn classify(code: i32, output: &str) -> Classified {
         || lc.contains("certificate")
     {
         return Classified::NoVerdict(Cause::Unreachable {
-            detail: first_line(&clean),
+            detail: first_line(&outcome),
         });
     }
     if lc.contains("unexpected eof")
@@ -149,7 +192,7 @@ pub fn classify(code: i32, output: &str) -> Classified {
         || lc.contains("context deadline exceeded")
     {
         return Classified::NoVerdict(Cause::TransferInterrupted {
-            detail: first_line(&clean),
+            detail: first_line(&outcome),
         });
     }
 
@@ -158,12 +201,12 @@ pub fn classify(code: i32, output: &str) -> Classified {
     // that a 403 or 507 encountered during a check is classified by its cause.
     if lc.contains("check failed") || lc.contains("repository contains errors") {
         return Classified::Damage(Corruption::CheckFailed {
-            detail: first_line(&clean),
+            detail: first_line(&outcome),
         });
     }
 
     Classified::NoVerdict(Cause::Unclassified {
-        detail: format!("restic exited {code}: {}", first_line(&clean)),
+        detail: format!("restic exited {code}: {}", first_line(&outcome)),
     })
 }
 
@@ -295,6 +338,109 @@ Fatal: unable to open config file: unexpected HTTP response (401): 401 Unauthori
             Classified::NoVerdict(Cause::Unauthorized) => {}
             other => panic!("401 misclassified as {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_retry_line_does_not_bury_a_real_corruption_report() {
+        // The finding. A forty-minute read-back hits one transient blip, restic
+        // retries it successfully, and then ends by saying the repository is
+        // broken. The transport rules match anywhere in the combined output and
+        // sit above the generic damage rule, so the retry line won and the
+        // damaged repository read `unknown` forever.
+        let out = "using temporary cache in /tmp/restic-check-cache-123\n\
+                   Load(<data/aa11bb22>) returned error, retrying after 1.3s: unexpected EOF\n\
+                   check snapshots, trees and blobs\n\
+                   pack 4f2a1b3c: not referenced in any index\n\
+                   Fatal: repository contains errors\n";
+        assert!(
+            matches!(classify(1, out), Classified::Damage(_)),
+            "got {:?}",
+            classify(1, out)
+        );
+    }
+
+    #[test]
+    fn a_retry_line_still_does_not_invent_damage_on_its_own() {
+        // Removing retry lines must not turn a run that only ever hiccuped into
+        // a damage verdict by leaving nothing behind to explain it.
+        let out = "Load(<data/aa11bb22>) returned error, retrying after 1.3s: unexpected EOF\n\
+                   Fatal: unable to open repository: Get \"http://host/config\": \
+                   dial tcp 10.0.0.9:8000: connect: connection refused\n";
+        assert!(
+            matches!(
+                classify(1, out),
+                Classified::NoVerdict(Cause::Unreachable { .. })
+            ),
+            "got {:?}",
+            classify(1, out)
+        );
+    }
+
+    #[test]
+    fn a_fatal_transport_failure_during_a_check_is_still_not_damage() {
+        // The reason the damage rule sits last, and it has to keep working: a
+        // check that could not read the repository at all has learned nothing
+        // about the data.
+        let out = "Load(<index/9f>) failed\n\
+                   Fatal: unable to open repository: unexpected HTTP response (403): 403 Forbidden\n\
+                   check failed\n";
+        assert!(
+            matches!(
+                classify(1, out),
+                Classified::NoVerdict(Cause::AppendOnlyRefused)
+            ),
+            "got {:?}",
+            classify(1, out)
+        );
+    }
+
+    #[test]
+    fn decrypting_and_failed_on_unrelated_lines_is_not_damage() {
+        // Both words appeared somewhere in the output, which is all the rule
+        // required -- and it sits above every transport rule, so a dead router
+        // reddened a healthy peer.
+        let out = "decrypting master key\n\
+                   Fatal: unable to open repository: Get \"http://host/config\": \
+                   dial tcp: i/o timeout, request failed\n";
+        assert!(
+            matches!(
+                classify(1, out),
+                Classified::NoVerdict(Cause::Unreachable { .. })
+            ),
+            "got {:?}",
+            classify(1, out)
+        );
+    }
+
+    #[test]
+    fn decrypting_failing_on_one_line_is_still_damage() {
+        let out = "Fatal: decrypting blob 9f2a failed: authentication check failed\n";
+        assert!(
+            matches!(
+                classify(1, out),
+                Classified::Damage(Corruption::CiphertextInvalid { .. })
+            ),
+            "got {:?}",
+            classify(1, out)
+        );
+    }
+
+    #[test]
+    fn an_indented_detail_line_is_not_mistaken_for_a_go_frame() {
+        // `starts_with('/')` on an indented line deleted restic's own detail,
+        // and `classify` runs on the stripped text -- so a damage keyword that
+        // appeared only there was destroyed before it could be matched.
+        let out = "Fatal: repository contains errors\n    \
+                   /srv/data/photos: pack 4f2a1b3c does not match its hash\n\
+                   main.main\n    \
+                   /restic/cmd/restic/main.go:98\n";
+        let stripped = strip_go_trace(out);
+        assert!(stripped.contains("/srv/data/photos"), "{stripped}");
+        assert!(!stripped.contains("main.go:98"), "{stripped}");
+        assert!(matches!(
+            classify(1, out),
+            Classified::Damage(Corruption::PackHashMismatch { .. })
+        ));
     }
 
     #[test]
