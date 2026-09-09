@@ -17,7 +17,13 @@ use super::{
 /// below cover the specific faults the command tests need to inject.
 pub struct FakeEngine {
     pub verify_default: VerifyOutcome,
-    pub snapshot_result: RefCell<Option<Result<Snapshot, EngineError>>>,
+    /// What `snapshot` answers. Cloned rather than taken, so it applies to every
+    /// peer in a run.
+    ///
+    /// This was consumed with `.take()`, so a scripted failure applied to the
+    /// *first* peer only and every peer after it silently succeeded. A
+    /// multi-peer regression test would have passed while asserting nothing.
+    pub snapshot_result: Option<Result<Snapshot, EngineError>>,
     /// What `probe` answers. `None` means reachable.
     pub probe_result: Option<Cause>,
     /// Forces the digest `restore_path` reports back.
@@ -51,7 +57,7 @@ impl FakeEngine {
     pub fn always(outcome: VerifyOutcome) -> Self {
         Self {
             verify_default: outcome,
-            snapshot_result: RefCell::new(None),
+            snapshot_result: None,
             probe_result: None,
             restored_digest: None,
             snapshots: vec![SnapshotMeta {
@@ -78,17 +84,17 @@ impl FakeEngine {
 
     pub fn failing_snapshot(e: EngineError) -> Self {
         Self {
-            snapshot_result: RefCell::new(Some(Err(e))),
+            snapshot_result: Some(Err(e)),
             ..Self::always(VerifyOutcome::Good { coverage_pct: 1 })
         }
     }
 
     pub fn incomplete_snapshot() -> Self {
         Self {
-            snapshot_result: RefCell::new(Some(Ok(Snapshot {
+            snapshot_result: Some(Ok(Snapshot {
                 id: SnapshotId("fake0001".into()),
                 incomplete: true,
-            }))),
+            })),
             ..Self::always(VerifyOutcome::Good { coverage_pct: 1 })
         }
     }
@@ -101,8 +107,8 @@ impl BackupEngine for FakeEngine {
             sources.len(),
             opts.upload_limit_kib
         ));
-        match self.snapshot_result.borrow_mut().take() {
-            Some(r) => r,
+        match &self.snapshot_result {
+            Some(r) => r.clone(),
             None => Ok(Snapshot {
                 id: SnapshotId("fake0001".into()),
                 incomplete: false,

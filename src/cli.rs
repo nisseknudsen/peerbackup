@@ -57,7 +57,18 @@ impl Drop for Scratch {
 fn engine_for(peer: &Peer) -> ResticEngine {
     let mut e = ResticEngine::new(peer.url.clone(), Config::secret_path(&peer.name));
     e.ca_cert = peer.ca_cert.clone();
+    // A test hook wired into the real command path. `PEERBACKUP_RESTIC=/bin/true
+    // peerbackup verify` printed `checking 1% of the stored data... ok` and
+    // recorded `Subset/Good` for every peer without touching the network. It is
+    // the same trust boundary as the user, so this is not an escalation -- but
+    // an environment variable that manufactures green should say so out loud
+    // rather than looking like an ordinary run.
     if let Some(bin) = std::env::var_os("PEERBACKUP_RESTIC") {
+        eprintln!(
+            "warning: PEERBACKUP_RESTIC is set, so results come from {} and not \
+             from restic.",
+            PathBuf::from(&bin).display()
+        );
         e.binary = PathBuf::from(bin);
     }
     // Escape hatches for a slow link, documented in the README. `restore` has
@@ -1704,6 +1715,33 @@ mod tests {
             FakeEngine::always(VerifyOutcome::Good { coverage_pct: 1 })
         })
         .unwrap();
+    }
+
+    #[test]
+    fn a_scripted_failure_applies_to_every_peer_not_just_the_first() {
+        // `snapshot_result` was consumed with `.take()`, so a scripted failure
+        // hit the first peer and every peer after it silently succeeded. A
+        // multi-peer regression test would have passed while asserting nothing.
+        let mut h = harness("multipeer");
+        std::fs::create_dir_all(h.rt.canary_dir()).unwrap();
+        h.cfg.peers.push(Peer {
+            name: pn("bob"),
+            url: "rest:http://example.invalid/bob/".into(),
+            ca_cert: None,
+        });
+        let e = EngineError {
+            message: "server out of space".into(),
+            exit_code: Some(1),
+            cause: Cause::OutOfSpace,
+            damage: None,
+        };
+        let err = backup_in(&h.rt, &h.cfg, None, |_| {
+            FakeEngine::failing_snapshot(e.clone())
+        })
+        .unwrap_err();
+        assert!(err.contains("2 of 2"), "both peers must fail: {err}");
+        assert_eq!(records(&h).len(), 2);
+        assert!(records(&h).iter().all(|r| r.verdict == Verdict::Unknown));
     }
 
     // ---------------------------------------------------------- restore choice
