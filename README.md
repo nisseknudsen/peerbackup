@@ -623,4 +623,4 @@ sudo ./deploy/test-provision-root.sh
 
 ## License
 
-Not yet chosen.
+MIT. See [LICENSE](LICENSE).

@@ -1,2 +1,12 @@
 /target
 /peerbackup-data
+
+# The TLS section defaults the certificate mount to ./certs, inside the tree.
+certs/
+*.pem
+.env
+
+# `recovery export` writes the passwords that decrypt every backup, in plain
+# text, and its default output lands in the state directory -- but people pass
+# --out, and they pass it somewhere convenient.
+recovery*.txt
