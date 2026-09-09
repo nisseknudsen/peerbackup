@@ -456,10 +456,19 @@ Storage on the host sits behind a size limit, and deletion is refused by default
 so a compromised client cannot erase its own backup history. Removing old backups
 requires the host to open a short maintenance window.
 
-Verification restores a small test file included in every backup and compares it
-against a digest recorded when it was created, then reads back a percentage of
-stored data and checks it. Results go to an append-only log, which is what
-`status` reads.
+Verification does three things. It restores a small test file included in every
+backup and compares it against a digest recorded when it was created; it reads
+back a percentage of stored data and checks it; and it asks the peer whether it
+still lists the snapshot your last backup produced.
+
+That last one is about the host rather than the data. Storage is append-only so a
+compromised client cannot erase its own history, and nothing else here would
+notice the host not holding up their end: an old repository is internally
+consistent, so `restic check` passes, and the test file is unchanged, so it still
+restores. The local record of what was sent is the one thing the host cannot
+rewrite.
+
+Results go to an append-only log, which is what `status` reads.
 
 ## Why not implement this as a restic backend?
 
