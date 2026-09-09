@@ -406,7 +406,15 @@ sudo mkdir -p /usr/local/share/peerbackup
 sudo cp compose.yml /usr/local/share/peerbackup/
 sudo cp deploy/systemd/peerbackup-rest.service /etc/systemd/system/
 sudo systemctl daemon-reload && sudo systemctl enable --now peerbackup-rest
+systemctl status peerbackup-rest
 ```
+
+The unit runs as root, because reading mount state and talking to docker's socket
+both need it, and it is confined to those two things. The sandboxing directives
+fail closed, so if you change `PEERBACKUP_ROOT` or put the compose file
+somewhere else, add the path to `ReadWritePaths` or the service will not start.
+`sudo systemd-analyze verify peerbackup-rest.service` checks the file before you
+find out the hard way.
 
 Set `PB_UID` and `PB_GID` in the service file to your own user.
 
