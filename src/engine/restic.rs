@@ -295,6 +295,11 @@ impl BackupEngine for ResticEngine {
         for t in &opts.tags {
             args.extend(["--tag".into(), t.clone()]);
         }
+        // Everything after `--` is a path, whatever it starts with. A `sources`
+        // entry beginning with a dash reached restic as a flag: `check_sources`
+        // only requires `metadata()` to succeed, which a file literally named
+        // `--insecure-tls` satisfies.
+        args.push("--".into());
         args.extend(sources.iter().map(|s| s.display().to_string()));
 
         let refs: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -344,11 +349,13 @@ impl BackupEngine for ResticEngine {
         self.run(
             &[
                 "restore",
-                &snapshot.0,
                 "--target",
                 &target.display().to_string(),
                 "--include",
                 &path.display().to_string(),
+                // The id last, after `--`, so it cannot be read as a flag.
+                "--",
+                &snapshot.0,
             ],
             self.timeout_for(Op::CanaryRestore),
         )?;
@@ -377,12 +384,39 @@ impl BackupEngine for ResticEngine {
         self.run(
             &[
                 "restore",
-                &snapshot.0,
                 "--target",
                 &target.display().to_string(),
+                // `restore --snapshot <s>` takes an unvalidated string straight
+                // from the command line, so `peerbackup restore alice /mnt/new
+                // --snapshot --insecure-tls` handed restic that flag and turned
+                // off certificate verification for the run.
+                "--",
+                &snapshot.0,
             ],
             self.timeout_for(Op::RestoreAll),
         )?;
+
+        // Asserted, not assumed. `restic restore` exits 0 for a selection that
+        // matched nothing, and `restore` then printed "Done." to someone who had
+        // just lost a disk. `restore_path` at least stats and hashes what
+        // landed; this had no check at all.
+        let landed = std::fs::read_dir(target)
+            .map(|mut d| d.next().is_some())
+            .unwrap_or(false);
+        if !landed {
+            return Err(EngineError {
+                message: format!(
+                    "restic reported success but {} is empty. \
+                     The snapshot may hold nothing, or nothing matched.",
+                    target.display()
+                ),
+                exit_code: None,
+                cause: Cause::Unclassified {
+                    detail: "restore wrote no files".into(),
+                },
+                damage: None,
+            });
+        }
         Ok(())
     }
 
@@ -550,8 +584,30 @@ pub const EXIT_INCOMPLETE: i32 = 3;
 /// boundaries; the lint cannot see that.
 #[allow(clippy::string_slice)]
 fn is_incomplete(combined: &str) -> bool {
-    if combined.contains("could not be read") {
-        return true;
+    // Read out of the field restic puts it in, not found anywhere in the stream.
+    // `backup --json` emits a status line per file carrying paths the user
+    // chose, so a directory named `could not be read` under `sources` made every
+    // backup report INCOMPLETE, record `Unknown` and exit non-zero. Contrived,
+    // but it is a false red on the headline command, and the fixture below shows
+    // exactly which field the real signal arrives in.
+    #[derive(Deserialize)]
+    struct Line {
+        message_type: Option<String>,
+        message: Option<String>,
+    }
+    for line in combined.lines() {
+        let said = match serde_json::from_str::<Line>(line) {
+            // A JSON line only counts when it is restic's own error summary.
+            Ok(l) => match l.message_type.as_deref() {
+                Some("exit_error" | "error") => l.message.unwrap_or_default(),
+                _ => continue,
+            },
+            // Not JSON, so it is plain stderr and all of it is restic's voice.
+            Err(_) => line.to_owned(),
+        };
+        if said.contains("could not be read") {
+            return true;
+        }
     }
     // `"error_count":0` is the healthy case; any other value is not.
     match combined.find("\"error_count\":") {
@@ -588,7 +644,13 @@ fn parse_snapshot_id(stdout: &str) -> Option<SnapshotId> {
 /// text, and the offset is restic's own so it is consistent within a
 /// repository; ties keep restic's order, which is stable.
 fn parse_snapshots(stdout: &str) -> serde_json::Result<Vec<SnapshotMeta>> {
-    let v: Vec<SnapshotJson> = serde_json::from_str(stdout)?;
+    // `Option`, because Go marshals a nil slice as `null` rather than `[]`. A
+    // bare `Vec` errors on that, so an empty repository produced
+    // "could not parse restic snapshot output: invalid type: null" instead of
+    // no snapshots -- which made `newest_real_backup`'s carefully worded
+    // "holds no backups at all" message unreachable and turned the empty-peer
+    // case into a parser bug report.
+    let v: Vec<SnapshotJson> = serde_json::from_str::<Option<_>>(stdout)?.unwrap_or_default();
     let mut out: Vec<SnapshotMeta> = v
         .into_iter()
         .map(|s| SnapshotMeta {
@@ -705,6 +767,67 @@ mod tests {
         "\n",
         r#"{"message_type":"exit_error","code":3,"message":"Warning: at least one source file could not be read"}"#,
     );
+
+    #[test]
+    fn a_filename_cannot_make_a_healthy_backup_report_incomplete() {
+        // `backup --json` emits a status line per file, carrying paths the user
+        // chose. Substring-matching the whole stream meant a directory named
+        // `could not be read` under `sources` reported INCOMPLETE on every run.
+        let hostile = concat!(
+            r#"{"message_type":"status","action":"scan_finished","current_files":["/srv/data/could not be read/x"]}"#,
+            "\n",
+            r#"{"message_type":"summary","snapshot_id":"aaaa1111","error_count":0}"#,
+        );
+        assert!(!is_incomplete(hostile), "a filename is not an error");
+    }
+
+    #[test]
+    fn restics_own_warning_still_reads_as_incomplete() {
+        // The direction that matters. Real restic 0.19.1 output; the signal
+        // arrives inside the exit_error line, which is why this is parsed
+        // rather than pattern-matched.
+        assert!(is_incomplete(REAL_INCOMPLETE_BACKUP));
+        assert!(
+            is_incomplete("Warning: at least one source file could not be read"),
+            "plain stderr counts too"
+        );
+    }
+
+    #[test]
+    fn an_empty_repository_parses_as_no_snapshots() {
+        // Go marshals a nil slice as `null`. A bare `Vec` errors on that, so the
+        // empty-peer case surfaced as "could not parse restic snapshot output"
+        // and the carefully worded "holds no backups at all" message was
+        // unreachable.
+        assert!(parse_snapshots("null").unwrap().is_empty());
+        assert!(parse_snapshots("[]").unwrap().is_empty());
+        assert!(
+            parse_snapshots("not json").is_err(),
+            "garbage is still an error"
+        );
+    }
+
+    #[test]
+    fn positional_arguments_cannot_be_read_as_flags() {
+        // `peerbackup restore alice /mnt/new --snapshot --insecure-tls` handed
+        // restic that flag and turned off certificate verification for the run.
+        // A `sources` entry starting with a dash did the same on the way out.
+        let e = ResticEngine::new("rest:https://host/me/", "/tmp/pw");
+        let inv = e
+            .command(&["restore", "--target", "/tmp/x", "--", "--insecure-tls"])
+            .unwrap();
+        let argv: Vec<String> = inv
+            .command
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let dashdash = argv.iter().position(|a| a == "--").expect("a -- guard");
+        let flag = argv.iter().position(|a| a == "--insecure-tls").unwrap();
+        assert!(
+            dashdash < flag,
+            "the guard must precede the value: {argv:?}"
+        );
+    }
 
     #[test]
     fn a_partial_backup_still_yields_its_snapshot_id() {

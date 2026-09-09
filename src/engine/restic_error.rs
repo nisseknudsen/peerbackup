@@ -232,9 +232,23 @@ fn first_line(s: &str) -> String {
     crate::redact::detail(s.lines().find(|l| !l.trim().is_empty()).unwrap_or(""))
 }
 
+/// The id from the line that actually reported the mismatch.
+///
+/// This took the first `"pack "` anywhere in the output, which need not be the
+/// pack that failed -- `check` mentions packs while it works -- so the id shown
+/// to the operator could belong to a healthy one. Scoped to the reporting line
+/// first, falling back to the old behaviour so a phrasing change costs the id
+/// rather than the verdict.
 fn extract_pack_id(s: &str) -> Option<String> {
+    let line = s
+        .lines()
+        .find(|l| {
+            let lc = l.to_ascii_lowercase();
+            lc.contains("does not match its hash") || lc.contains("pack id does not match")
+        })
+        .unwrap_or(s);
     // e.g. "pack 1a2b3c4d does not match its hash"
-    let rest = s.split_once("pack ")?.1;
+    let rest = line.split_once("pack ")?.1;
     let id: String = rest
         .chars()
         .take_while(|c| c.is_ascii_alphanumeric())
@@ -337,6 +351,23 @@ Fatal: unable to open config file: unexpected HTTP response (401): 401 Unauthori
         match classify(1, UNAUTHORIZED) {
             Classified::NoVerdict(Cause::Unauthorized) => {}
             other => panic!("401 misclassified as {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_reported_pack_is_the_one_that_failed() {
+        // The first `"pack "` in the output need not be the failing one --
+        // `check` mentions packs while it works -- so the id shown to the
+        // operator could belong to a perfectly healthy pack.
+        let out = "load pack 1111aaaa\n\
+                   check snapshots, trees and blobs\n\
+                   pack 4f2a1b3c does not match its hash\n\
+                   Fatal: repository contains errors\n";
+        match classify(1, out) {
+            Classified::Damage(Corruption::PackHashMismatch { pack }) => {
+                assert_eq!(pack, "4f2a1b3c");
+            }
+            other => panic!("expected a pack mismatch, got {other:?}"),
         }
     }
 
