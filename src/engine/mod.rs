@@ -39,8 +39,12 @@ impl SnapshotId {
 }
 
 impl std::fmt::Display for SnapshotId {
+    /// `f.pad`, for the same reason as [`crate::config::PeerName`]: an inner
+    /// `write!` discards the outer format spec, so a width would be ignored.
+    /// Nothing pads a snapshot id today; the next thing that tries should get
+    /// what it asked for.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.short())
+        f.pad(self.short())
     }
 }
 

@@ -372,8 +372,9 @@ pub fn peer_list() -> Res {
         println!("No peers yet. Add one with `peerbackup peer add <name> <url>`.");
         return Ok(());
     }
+    let w = name_width(cfg.peers.iter().map(|p| &p.name));
     for p in &cfg.peers {
-        println!("{:<12} {}", p.name, redact::url(&p.url));
+        println!("{:<w$} {}", p.name, redact::url(&p.url), w = w);
     }
     Ok(())
 }
@@ -407,6 +408,22 @@ pub fn peer_remove(name: &str) -> Res {
         println!("still hold. Delete it once they have released the space.");
     }
     Ok(())
+}
+
+/// Width for the peer-name column: the longest name, never narrower than the
+/// header.
+///
+/// Rust's padding never truncates, so a fixed `{:<12}` and a peer name longer
+/// than twelve characters -- `PeerName` allows sixty-four -- pushed every
+/// following column right on that row alone. Sizing the column to the content
+/// keeps the table square whatever the names are, and costs one pass over a list
+/// that is single digits long.
+fn name_width<'a>(names: impl Iterator<Item = &'a PeerName>) -> usize {
+    names
+        .map(|n| n.as_str().chars().count())
+        .max()
+        .unwrap_or(0)
+        .max(12)
 }
 
 // --------------------------------------------------------------------- backup
@@ -718,13 +735,19 @@ pub fn status_cmd() -> Res {
     let records = &history.records;
     let rows = status(&cfg, records, t);
 
+    let w = name_width(rows.iter().map(|r| &r.name));
     println!(
-        "{:<12} {:<11} {:<12} {:<12} {:<12} READ BACK",
-        "PEER", "STATE", "BACKED UP", "CHECKED", "TEST FILE"
+        "{:<w$} {:<11} {:<12} {:<12} {:<12} READ BACK",
+        "PEER",
+        "STATE",
+        "BACKED UP",
+        "CHECKED",
+        "TEST FILE",
+        w = w
     );
     for r in &rows {
         println!(
-            "{:<12} {:<11} {:<12} {:<12} {:<12} {}",
+            "{:<w$} {:<11} {:<12} {:<12} {:<12} {}",
             r.name,
             r.state.label(),
             ago(r.last_backup, t),
@@ -733,6 +756,7 @@ pub fn status_cmd() -> Res {
             r.coverage_pct
                 .map(|p| format!("{p}%"))
                 .unwrap_or_else(|| "-".into()),
+            w = w
         );
     }
 

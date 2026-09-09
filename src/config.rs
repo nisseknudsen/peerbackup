@@ -167,8 +167,15 @@ impl PeerName {
 }
 
 impl std::fmt::Display for PeerName {
+    /// `f.pad`, not `f.write_str`.
+    ///
+    /// `write_str` writes straight to the underlying buffer and ignores
+    /// everything in the format spec, so `{:<12}` on a `PeerName` did nothing at
+    /// all -- while the header row beside it is a `&str`, which pads. Every
+    /// table in the program printed with its columns one space wide and its
+    /// header somewhere else entirely.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
+        f.pad(&self.0)
     }
 }
 
@@ -437,6 +444,17 @@ mod tests {
         let p = Config::secret_path(&name);
         assert_eq!(p.file_name().unwrap(), "alice");
         assert!(p.parent().unwrap().ends_with("secrets"));
+    }
+
+    #[test]
+    fn a_peer_name_obeys_the_format_width_it_is_printed_with() {
+        // `write_str` ignores the format spec, so `{:<12}` was a no-op and every
+        // table printed its name column one space wide with the header, a plain
+        // `&str`, padded correctly somewhere to the right of it.
+        let n = PeerName::new("alice").unwrap();
+        assert_eq!(format!("{n:<12}|"), "alice       |");
+        assert_eq!(format!("{n:>12}|"), "       alice|");
+        assert_eq!(format!("{n}"), "alice", "unpadded stays unpadded");
     }
 
     #[test]
