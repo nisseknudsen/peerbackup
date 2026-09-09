@@ -154,9 +154,11 @@ pub fn provision(ctx: &Ctx, peer: &PeerName, size: &str) -> Res {
     // and no way forward except the destructor. `verify_not_sparse` removes the
     // image on its own failure path, which is what makes this the right seam.
     let finish = |unit: &mut String| -> Res {
+        check_mount_target(&dir)?;
         if !ctx.would(&format!("mkdir -p {}", dir.display())) {
             std::fs::create_dir_all(&dir)
                 .map_err(|e| format!("could not create {}: {e}", dir.display()))?;
+            check_mount_target(&dir)?;
         }
 
         *unit = unit_name(&dir)?;
@@ -228,6 +230,65 @@ pub fn provision(ctx: &Ctx, peer: &PeerName, size: &str) -> Res {
     Ok(())
 }
 
+/// Refuse to mount over anything that is not a real, empty, unmounted directory.
+///
+/// `take_ownership` hands the *parent* of every grant directory to an
+/// unprivileged uid, so `/srv/peerbackup/mnt` is writable by an account that is
+/// not root. `create_dir_all` then treats an existing symlink-to-a-directory as
+/// success, `systemd-escape` escapes the literal path, and `mount` canonicalises
+/// symlinks -- so someone with a foothold in that account could plant
+/// `ln -s /etc /srv/peerbackup/mnt/carol`, wait for the admin to run
+/// `sudo peerbackup host provision carol 500G`, and get a blank ext4 mounted
+/// over `/etc`.
+///
+/// `symlink_metadata` does not follow the link, which is the whole point.
+/// Checking again after `create_dir_all` closes the window between the two.
+///
+/// Emptiness matters for a different reason: mounting over a directory that
+/// already holds files hides them for as long as the mount lasts, and nothing
+/// in `host list` would say so.
+fn check_mount_target(dir: &Path) -> Res {
+    let Ok(meta) = std::fs::symlink_metadata(dir) else {
+        // Absent is fine; it is about to be created.
+        return Ok(());
+    };
+    if meta.file_type().is_symlink() {
+        return Err(format!(
+            "{} is a symbolic link, and mounting follows it.\n       \
+             Remove it and run this again. Nothing here should be a link: this \
+             directory's\n       parent is writable by a non-root account, which \
+             is how a link pointing\n       somewhere important gets planted.",
+            dir.display()
+        ));
+    }
+    if !meta.is_dir() {
+        return Err(format!(
+            "{} exists and is not a directory, so it cannot be a mount point",
+            dir.display()
+        ));
+    }
+    if is_mountpoint(dir) {
+        return Err(format!(
+            "{} is already a mount point. Run `peerbackup host list` to see what \
+             this\n       host thinks is there.",
+            dir.display()
+        ));
+    }
+    match std::fs::read_dir(dir) {
+        Ok(mut entries) => {
+            if entries.next().is_some() {
+                return Err(format!(
+                    "{} is not empty, and mounting over it would hide what is in \
+                     it.\n       Move that aside first.",
+                    dir.display()
+                ));
+            }
+            Ok(())
+        }
+        Err(e) => Err(format!("could not read {}: {e}", dir.display())),
+    }
+}
+
 /// Check what was actually shipped, not an intermediate state.
 ///
 /// The first version of this check ran immediately after `fallocate`, passed,
@@ -243,7 +304,13 @@ fn verify_not_sparse(ctx: &Ctx, img: &Path) -> Res {
     // st_blocks is in 512-byte units by POSIX, whatever the filesystem's own
     // block size happens to be.
     let allocated = m.blocks() * 512;
-    if allocated < apparent / 2 {
+    // 95%, not 50%. A grant is a hard reservation or it is nothing, and a
+    // filesystem that half-honours `fallocate` -- or an image whose allocation
+    // was partly discarded -- is exactly the overcommit this check exists to
+    // catch. At 50% a 500GB grant backed by 255GB passed and printed
+    // "preallocation verified". With `-E nodiscard` on a working filesystem the
+    // ratio is ~1.0, so the margin only has to cover filesystem metadata.
+    if allocated < apparent / 100 * 95 {
         let _ = std::fs::remove_file(img);
         return Err(format!(
             "refusing to create a sparse grant: only {} of {} is actually allocated.\n       \
@@ -612,6 +679,59 @@ fn first_numeric<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_planted_symlink_cannot_become_a_mount_point() {
+        // `take_ownership` chowns the parent of every grant directory to an
+        // unprivileged uid, and `create_dir_all` treats a symlink to a
+        // directory as success. `ln -s /etc /srv/peerbackup/mnt/carol` followed
+        // by `sudo peerbackup host provision carol 500G` mounted a blank ext4
+        // over /etc.
+        let dir = std::env::temp_dir().join(format!("pb-symlink-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("real")).unwrap();
+        let link = dir.join("carol");
+        std::os::unix::fs::symlink(dir.join("real"), &link).unwrap();
+
+        let e = check_mount_target(&link).unwrap_err();
+        assert!(e.contains("symbolic link"), "got: {e}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_absent_or_empty_directory_is_a_fine_mount_point() {
+        let dir = std::env::temp_dir().join(format!("pb-mnttarget-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        check_mount_target(&dir.join("not-there")).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        check_mount_target(&dir).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mounting_over_something_that_already_has_files_in_it_is_refused() {
+        // The mount hides them for as long as it lasts, and nothing in
+        // `host list` would say so.
+        let dir = std::env::temp_dir().join(format!("pb-mntfull-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("someones-backup"), b"x").unwrap();
+        let e = check_mount_target(&dir).unwrap_err();
+        assert!(e.contains("not empty"), "got: {e}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_file_where_a_mount_point_should_be_is_refused() {
+        let dir = std::env::temp_dir().join(format!("pb-mntfile-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("carol");
+        std::fs::write(&f, b"x").unwrap();
+        let e = check_mount_target(&f).unwrap_err();
+        assert!(e.contains("not a directory"), "got: {e}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn ctx_in(dir: &Path) -> Ctx {
         Ctx {
