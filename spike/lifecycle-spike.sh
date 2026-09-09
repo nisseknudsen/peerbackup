@@ -86,7 +86,7 @@ if [ "${REUSE_DATA:-0}" = "1" ] && [ -d "$SRC" ]; then
   SKIP_GEN=1
 else
   rm -rf "${WORK:?}"; mkdir -p "$SRC" "$SRV" "$OUT"
-  scratch_claim "$WORK" || exit 1
+  scratch_mark "$WORK"
   SKIP_GEN=0
 fi
 : > "$LOG"

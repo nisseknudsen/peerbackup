@@ -40,7 +40,7 @@ hdr "setup"
 cleanup
 scratch_claim "$WORK" || exit 1
 rm -rf "${WORK:?}"; mkdir -p "$WORK"/{cfg,state,srv,data}
-scratch_claim "$WORK" || exit 1
+scratch_mark "$WORK"
 echo "the file that matters" > "$WORK/data/notes.txt"
 head -c 3000000 /dev/urandom > "$WORK/data/photo.bin"
 ORIGINAL_SHA=$(sha256sum "$WORK/data/photo.bin" | awk '{print $1}')
