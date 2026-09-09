@@ -54,5 +54,51 @@ ExecStop=/usr/bin/docker compose -f /usr/local/share/peerbackup/compose.yml down
 
 TimeoutStartSec=120
 
+# This unit runs as root, because `host guard` reads mount state and
+# `docker compose` talks to a root-owned socket. Neither needs anything else, so
+# nothing else is available to it.
+#
+# Type=oneshot with RemainAfterExit means the long-lived process is the
+# container, which docker supervises under its own confinement -- see compose.yml
+# for that side. What is confined here is the short-lived guard and the compose
+# invocation, which is exactly where a compromised peerbackup binary or a
+# tampered compose file would run.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+# The compose file and the guard create nothing world-readable on purpose.
+UMask=0077
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+# ProtectSystem=strict makes the whole hierarchy read-only, so everything this
+# genuinely needs to write has to be named. The grant root is where the
+# container's storage lives. The docker socket is how compose reaches the
+# daemon, and connecting to a unix socket needs write access to it -- if you run
+# rootless docker, or your distribution puts the socket elsewhere, change this
+# line or the service will not start.
+ReadWritePaths=/srv/peerbackup
+ReadWritePaths=/run/docker.sock
+
+# Verify after any change to the list above -- these directives fail closed, and
+# a service that will not start is a host that is not serving backups:
+#   sudo systemd-analyze verify peerbackup-rest.service
+#   sudo systemctl restart peerbackup-rest && systemctl status peerbackup-rest
+
 [Install]
 WantedBy=multi-user.target
