@@ -20,6 +20,10 @@ RESTIC="${RESTIC_BIN:-restic}"
 export PB_ROOT="${PB_ROOT:-/tmp/pb-e2e}"
 export PB_DATA="$PB_ROOT/mnt"
 export PB_PORT="${PB_PORT:-8011}"
+# Loopback, as tests/end_to_end.sh and the spike already do. This publishes a
+# writable rest-server with a known password, and a shared or self-hosted runner
+# is not a private machine. Uses the PB_BIND compose.yml now understands.
+export PB_BIND="${PB_BIND:-127.0.0.1}"
 PB_UID="$(id -u)"; PB_GID="$(id -g)"; export PB_UID PB_GID
 BASE="http://127.0.0.1:$PB_PORT"
 
