@@ -17,7 +17,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::config::{Config, PeerName, create_dir_private, home};
+use crate::config::{Config, PeerName, create_dir_private, home, write_private};
 
 pub fn state_dir() -> PathBuf {
     std::env::var_os("PEERBACKUP_STATE_DIR")
@@ -92,13 +92,23 @@ impl Canary {
         serde_json::from_str(&text).map_err(std::io::Error::other)
     }
 
+    /// Atomically, through the same helper the config uses.
+    ///
+    /// This was `fs::write`, which truncates and then writes, so a crash or a
+    /// full disk part-way through left a half-written manifest. The next
+    /// `backup` then could not parse it, silently regenerated the canary with
+    /// fresh contents and fresh digests, and if *that* backup failed for any
+    /// reason -- peer unreachable, out of space, upload aborted -- the peer's
+    /// newest snapshot still held the old bytes while the manifest held the new
+    /// digest. The next `verify` restored the old bytes, compared them against
+    /// the new digest, and reported `FAILED -- restored test file did not match
+    /// what was sent` for a purely local cause.
+    ///
+    /// A false red costs the same trust as a false green, one iteration later.
     pub fn save_at(&self, p: &Path) -> std::io::Result<()> {
-        if let Some(parent) = p.parent() {
-            create_dir_private(parent)?;
-        }
-        fs::write(
+        write_private(
             p,
-            serde_json::to_vec_pretty(self).map_err(std::io::Error::other)?,
+            &serde_json::to_vec_pretty(self).map_err(std::io::Error::other)?,
         )
     }
 
@@ -106,11 +116,60 @@ impl Canary {
         Self::load_or_create_at(&canary_dir(), &Self::manifest_path())
     }
 
+    /// Load the manifest, check it still describes the files on disk, and only
+    /// create a new canary when there is genuinely nothing usable.
+    ///
+    /// The manifest was trusted without ever being reconciled against the files
+    /// it describes, which fails in both directions:
+    ///
+    /// * A canary file that changed locally -- an errant edit, a bad block, a
+    ///   state directory restored from another machine -- meant `backup`
+    ///   uploaded the new bytes while the manifest kept the old digest, so
+    ///   `verify` reported the *peer* as damaged for a problem on this disk.
+    /// * Canary files deleted while the directory and manifest survived passed
+    ///   `check_sources`, produced backups carrying no canary at all, and left
+    ///   every `verify` recording `Unknown` with no explanation.
+    ///
+    /// Re-hashing three 64KiB files costs nothing next to a backup.
     pub fn load_or_create_at(dir: &Path, manifest: &Path) -> std::io::Result<Self> {
         match Self::load_at(manifest) {
-            Ok(c) => Ok(c),
-            Err(_) => Self::create_at(dir, manifest),
+            Ok(c) => match c.disagreement_with_disk() {
+                None => Ok(c),
+                Some(why) => {
+                    // Said out loud. Regenerating silently is what turned a
+                    // local problem into a report about the peer.
+                    eprintln!(
+                        "warning: the test files no longer match what was recorded ({why}).\n                           Making a new set. Until the next backup reaches a peer and is \
+                         verified,\n  that peer's test-file check will read `unchecked`."
+                    );
+                    Self::create_at(dir, manifest)
+                }
+            },
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Self::create_at(dir, manifest),
+            Err(e) => {
+                eprintln!(
+                    "warning: could not read the test-file manifest ({e}). Making a new set."
+                );
+                Self::create_at(dir, manifest)
+            }
         }
+    }
+
+    /// Why the recorded digests do not describe what is on disk, if they do not.
+    fn disagreement_with_disk(&self) -> Option<String> {
+        if self.files.is_empty() {
+            return Some("it lists no files".into());
+        }
+        for f in &self.files {
+            match fs::read(&f.path) {
+                Err(e) => return Some(format!("{}: {e}", f.path.display())),
+                Ok(bytes) if sha256_bytes(&bytes) != f.sha256 => {
+                    return Some(format!("{} has changed", f.path.display()));
+                }
+                Ok(_) => {}
+            }
+        }
+        None
     }
 
     pub fn first(&self) -> Option<&CanaryFile> {
@@ -992,6 +1051,90 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn a_locally_modified_canary_file_is_noticed_rather_than_blamed_on_the_peer() {
+        // The manifest was trusted without ever being compared to the files it
+        // describes. A canary file that changed on this disk meant `backup`
+        // uploaded the new bytes while the manifest kept the old digest, so
+        // `verify` restored exactly what it had just sent, saw a mismatch, and
+        // reported the *peer* as damaged.
+        let dir = scratch("canarymod");
+        let manifest = dir.join("canary.json");
+        let cdir = dir.join("canary");
+        let c = Canary::create_at(&cdir, &manifest).unwrap();
+        assert!(
+            c.disagreement_with_disk().is_none(),
+            "a fresh canary agrees"
+        );
+
+        fs::write(&c.files[0].path, b"tampered").unwrap();
+        let reloaded = Canary::load_at(&manifest).unwrap();
+        let why = reloaded
+            .disagreement_with_disk()
+            .expect("a changed file must be noticed");
+        assert!(why.contains("canary-0.bin"), "must name the file: {why}");
+
+        // And loading regenerates rather than carrying on with a lie.
+        let fresh = Canary::load_or_create_at(&cdir, &manifest).unwrap();
+        assert!(fresh.disagreement_with_disk().is_none());
+        assert_ne!(fresh.files[0].sha256, c.files[0].sha256, "new contents");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn deleted_canary_files_are_noticed_even_though_the_manifest_survived() {
+        // `check_sources` passes on the directory, so backups carried no canary
+        // and every verify recorded Unknown with no explanation.
+        let dir = scratch("canarygone");
+        let manifest = dir.join("canary.json");
+        let cdir = dir.join("canary");
+        let c = Canary::create_at(&cdir, &manifest).unwrap();
+        for f in &c.files {
+            fs::remove_file(&f.path).unwrap();
+        }
+        let reloaded = Canary::load_at(&manifest).unwrap();
+        assert!(reloaded.disagreement_with_disk().is_some());
+
+        let fresh = Canary::load_or_create_at(&cdir, &manifest).unwrap();
+        assert!(fresh.files.iter().all(|f| f.path.exists()));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_intact_canary_is_never_regenerated() {
+        // The other direction, and the one that matters: rotating the canary
+        // when nothing is wrong invalidates the digest the peer's snapshots were
+        // made against, which is the false-FAILED this is meant to prevent.
+        let dir = scratch("canarykeep");
+        let manifest = dir.join("canary.json");
+        let cdir = dir.join("canary");
+        let first = Canary::create_at(&cdir, &manifest).unwrap();
+        for _ in 0..3 {
+            let again = Canary::load_or_create_at(&cdir, &manifest).unwrap();
+            assert_eq!(again.files[0].sha256, first.files[0].sha256);
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_manifest_is_written_atomically_and_privately() {
+        // It used `fs::write`, which truncates first, so a crash part-way left a
+        // half-file -- and the recovery from that was a silent regeneration.
+        let dir = scratch("canaryperm");
+        let manifest = dir.join("canary.json");
+        Canary::create_at(&dir.join("canary"), &manifest).unwrap();
+        let mode = fs::metadata(&manifest).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "was {mode:o}");
+        let strays: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains("tmp"))
+            .collect();
+        assert!(strays.is_empty(), "left temp files behind: {strays:?}");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
