@@ -251,6 +251,39 @@ impl ResticEngine {
         }
     }
 
+    /// The restic version on `PATH`, checked against what this depends on.
+    ///
+    /// The README says "restic 0.17+" and nothing enforced it. Debian bookworm
+    /// ships 0.14, and someone installing from source as the README describes
+    /// would get it. That matters more than a version number usually does:
+    /// `is_incomplete` reads a field out of `backup --json`, and the shape of
+    /// that output is a contract with a specific restic. An older one produces a
+    /// different shape, `is_incomplete` sees nothing, and a partial backup
+    /// reports success -- the false-success class this project's history exists
+    /// to prevent.
+    ///
+    /// Returns `Ok(None)` when the version cannot be determined, because
+    /// refusing to run over an unparsed version string would be worse than the
+    /// risk it guards against.
+    pub fn version_problem(&self) -> Result<Option<String>, EngineError> {
+        let out = self.run(&["version"], Some(Duration::from_secs(20)))?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        let Some((major, minor)) = parse_version(&text) else {
+            return Ok(None);
+        };
+        // 0.17 is the floor the README states.
+        if (major, minor) < (0, 17) {
+            return Ok(Some(format!(
+                "restic {major}.{minor} is older than 0.17, which peerbackup needs.\n  \
+                 It reads the summary of `backup --json` to tell a complete backup \
+                 from one\n  that could not read everything, and older versions do \
+                 not report it the same way,\n  so a partial backup would be recorded \
+                 as a success."
+            )));
+        }
+        Ok(None)
+    }
+
     /// Create the repository. Not on the trait: it is setup, not a backup
     /// operation, and only `peer add` ever calls it.
     pub fn init_repo(&self) -> Result<(), EngineError> {
@@ -662,6 +695,16 @@ fn is_incomplete(combined: &str) -> bool {
     }
 }
 
+/// `restic 0.19.1 compiled with go1.26.4 on linux/amd64` -> `(0, 19)`.
+fn parse_version(text: &str) -> Option<(u32, u32)> {
+    let rest = text.trim().strip_prefix("restic ")?;
+    let num = rest.split_whitespace().next()?;
+    let mut parts = num.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    Some((major, minor))
+}
+
 /// `backup --json` is line-delimited; the summary line carries `snapshot_id`.
 fn parse_snapshot_id(stdout: &str) -> Option<SnapshotId> {
     stdout.lines().rev().find_map(|l| {
@@ -865,6 +908,20 @@ mod tests {
             dashdash < flag,
             "the guard must precede the value: {argv:?}"
         );
+    }
+
+    #[test]
+    fn a_restic_version_string_is_read_correctly() {
+        assert_eq!(
+            parse_version("restic 0.19.1 compiled with go1.26.4 on linux/amd64"),
+            Some((0, 19))
+        );
+        assert_eq!(parse_version("restic 0.14.0\n"), Some((0, 14)));
+        assert_eq!(parse_version("restic 1.0.0"), Some((1, 0)));
+        // Anything unrecognised yields no opinion rather than a refusal.
+        assert_eq!(parse_version("not restic at all"), None);
+        assert_eq!(parse_version("restic vNext"), None);
+        assert_eq!(parse_version(""), None);
     }
 
     #[test]
