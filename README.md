@@ -176,9 +176,14 @@ url = "rest:https://me:PASSWORD@alice.example.org:8000/me/"
 
 Passwords are stored separately in `~/.config/peerbackup/secrets/`, mode 0600.
 
+Every setting has a default, so a config only needs the ones you are changing.
+The values above are the defaults.
+
 Settings are checked when the file is read, so a value that cannot mean what it
 says is refused by name rather than quietly turned into something else. The
-windows must be non-zero, and `verify_subset_pct` must be between 1 and 100.
+windows must be non-zero, and `verify_subset_pct` must be between 1 and 100. A
+key that is not one of these is refused too, rather than ignored: a typo you
+cannot see is worse than one that stops the command.
 
 ### Timeouts
 
