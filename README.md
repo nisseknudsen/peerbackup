@@ -48,6 +48,16 @@ peerbackup backup      # send a backup
 peerbackup status      # is everything still fine?
 ```
 
+That URL contains the password. On a command line it goes into your shell
+history and into `ps` for the life of the call, and in a container it stays in
+`docker inspect` forever. Pass `-` to read it from stdin instead:
+
+```sh
+peerbackup connect - --source /srv/data < invite.txt
+```
+
+`peer add` takes `-` the same way.
+
 ### The same two, in Docker
 
 ```sh
@@ -65,8 +75,12 @@ docker run --rm \
   -v ~/.config/peerbackup:/config \
   -v ~/.local/share/peerbackup:/state \
   -v /srv/data:/srv/data:ro \
-  peerbackup connect 'rest:http://...' --source /srv/data
+  -i peerbackup connect - --source /srv/data < invite.txt
 ```
+
+`-` and `-i` rather than the URL as an argument: anything in `docker run`'s
+command line is kept in the container's metadata and comes back out of
+`docker inspect` for as long as the container exists.
 
 Source directories must be mounted at the same paths they have on the host. See
 [Docker](#docker-sending-backups) below for why.
@@ -452,6 +466,12 @@ them more.
 A directory in `sources` is gone, unreadable, or in Docker was not mounted.
 peerbackup refuses rather than backing up less than you asked for, because
 restic on its own would save a snapshot anyway and report success.
+
+**`peer add` refuses because restic is too old.**
+peerbackup reads the summary of `backup --json` to tell a complete backup from
+one that could not read everything, and versions before 0.17 do not report it the
+same way. On an older distribution, install restic from its own release rather
+than the package manager.
 
 **restic output ends with what looks like a crash.**
 restic appends its own error-location trace to ordinary failures. The real

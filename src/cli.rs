@@ -236,6 +236,7 @@ pub fn connect(
     }
     cfg.save().map_err(err("could not save config"))?;
 
+    let url = &url_arg(url)?;
     let name = match name {
         Some(n) => n.to_owned(),
         None => peer_name_from_url(url).ok_or(
@@ -293,6 +294,29 @@ fn peer_name_from_url(url: &str) -> Option<String> {
 
 // ----------------------------------------------------------------------- peer
 
+/// The repository URL, read from stdin when the argument is `-`.
+///
+/// The URL carries the peer's password. Passed on a command line it lands in
+/// shell history, in `ps` for the life of the call, and -- when peerbackup runs
+/// in a container, which is how the README documents it -- permanently in
+/// `docker inspect .Config.Cmd`. The host side of this same codebase already
+/// refuses argv for this secret and pipes it to `htpasswd` on stdin; the client
+/// side did the opposite and the README taught it.
+fn url_arg(url: &str) -> Result<String, String> {
+    if url != "-" {
+        return Ok(url.to_owned());
+    }
+    let mut s = String::new();
+    io::stdin()
+        .read_line(&mut s)
+        .map_err(err("could not read the URL from stdin"))?;
+    let s = s.trim();
+    if s.is_empty() {
+        return Err("nothing arrived on stdin. Pipe the URL in, or pass it as an argument".into());
+    }
+    Ok(s.to_owned())
+}
+
 /// Add a peer and prove the whole path works before trusting it.
 ///
 /// The first backup is the canary, which is small. If the URL, credentials,
@@ -302,6 +326,7 @@ pub fn peer_add(name: &str, url: &str, ca_cert: Option<PathBuf>) -> Res {
     // Validate before the name reaches a path. Everything downstream takes a
     // PeerName, so this is the only place the raw argument exists.
     let name = PeerName::new(name)?;
+    let url = &url_arg(url)?;
     let mut cfg = Config::load().map_err(err("could not read config"))?;
     if cfg.peer(&name).is_some() {
         return Err(format!("peer '{name}' already exists"));
@@ -319,6 +344,28 @@ pub fn peer_add(name: &str, url: &str, ca_cert: Option<PathBuf>) -> Res {
         ca_cert,
     };
     let engine = engine_for(&peer);
+    // Checked here, once, at the point where the engine is first used for real.
+    // `peer add` is the command that runs before any data is sent, so it is the
+    // cheapest place to find out that restic is too old to tell a complete
+    // backup from a partial one.
+    match engine.version_problem() {
+        Ok(Some(why)) => return Err(why),
+        Ok(None) => {}
+        Err(e) => {
+            // restic exits non-zero with nothing on stderr for some failures, so
+            // the message can be empty. "could not run restic: " and then
+            // nothing is worse than saying only the part we are sure of.
+            let detail = e.to_string();
+            return Err(if detail.trim().is_empty() {
+                format!(
+                    "could not run `{} version`. Is restic installed and on PATH?",
+                    engine.binary.display()
+                )
+            } else {
+                format!("could not run restic: {detail}")
+            });
+        }
+    }
     let canary = Canary::load_or_create().map_err(err("could not read the canary"))?;
 
     println!("Setting up repository...");

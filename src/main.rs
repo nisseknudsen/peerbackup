@@ -29,7 +29,12 @@ struct Cli {
 enum Command {
     /// Set up everything and connect to a peer, in one step
     Connect {
-        /// Repository URL your peer gave you
+        /// Repository URL your peer gave you, or `-` to read it from stdin
+        ///
+        /// The URL carries the password. On a command line it goes into shell
+        /// history, into `ps` for the life of the call, and -- if you run this
+        /// in a container, as the README describes -- permanently into
+        /// `docker inspect`. `-` avoids all three.
         url: String,
         /// A directory to back up. Repeat for more than one.
         #[arg(long = "source", required = true)]
@@ -99,6 +104,9 @@ enum PeerCmd {
         /// Short name, e.g. alice
         name: String,
         /// Repository URL, e.g. rest:https://me:pw@alice.example.org:51515/me/
+        ///
+        /// `-` reads it from stdin instead, keeping the password out of shell
+        /// history, out of `ps`, and out of `docker inspect`.
         url: String,
         /// Certificate file, if they use a self-signed one
         #[arg(long)]
