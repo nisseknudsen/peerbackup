@@ -237,10 +237,10 @@ pub fn connect(
     }
     cfg.save().map_err(err("could not save config"))?;
 
-    let url = &complete_url(url)?;
+    let url = complete_url(url)?;
     let name = match name {
         Some(n) => n.to_owned(),
-        None => peer_name_from_url(url).ok_or(
+        None => peer_name_from_url(url.as_str()).ok_or(
             "could not work out a name for this peer from the URL; pass --name, e.g. --name alice",
         )?,
     };
@@ -249,7 +249,7 @@ pub fn connect(
     // abandon the one-command path for `init` + `peer add` -- which the README
     // never said, because its TLS section tells them to pass `--cacert` "when
     // connecting".
-    peer_add(&name, url, ca_cert)?;
+    peer_add_completed(&name, &url, ca_cert)?;
 
     println!();
     println!("Backing up:");
@@ -312,20 +312,43 @@ fn peer_name_from_url(url: &str) -> Option<String> {
 /// A URL that already contains a password is accepted rather than refused --
 /// someone will have an older invite, and a hard error there helps nobody --
 /// but it says what it cost.
-fn complete_url(url: &str) -> Result<String, String> {
+/// A repository URL with its password in it, ready to hand to restic.
+///
+/// A newtype for the same reason [`PeerName`] is one: [`complete_url`] is the
+/// only way to make one, and nothing accepts one and completes it again. So the
+/// "has this been completed" question is answered by the compiler rather than by
+/// whoever reads the call graph.
+///
+/// It was not, and `connect` completed the URL and then handed the result to
+/// `peer_add`, which completed it a second time. The URL came out correct --
+/// completion leaves an already-complete URL alone -- but the second pass saw a
+/// password and warned about it. So a user who did exactly the right thing, and
+/// typed their password into a prompt, was told it was now in their shell
+/// history. Telling someone they leaked a credential when they did not is worse
+/// than saying nothing.
+pub struct RepoUrl(String);
+
+impl RepoUrl {
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+fn complete_url(url: &str) -> Result<RepoUrl, String> {
     if redact::url_has_password(url) {
         eprintln!(
             "warning: that URL has the password in it, so it is now in your shell \
              history\n  and was visible in `ps` while this ran. Newer invites keep \
              them apart."
         );
-        return Ok(url.to_owned());
+        return Ok(RepoUrl(url.to_owned()));
     }
     let password = read_secret(&format!("Password for {}: ", redact::url(url)))?;
     if password.is_empty() {
         return Err("no password given, so there is nothing to connect with".into());
     }
-    Ok(redact::url_with_password(url, &password))
+    Ok(RepoUrl(redact::url_with_password(url, &password)))
 }
 
 /// Read a secret without echoing it, or from stdin when there is no terminal.
@@ -385,10 +408,17 @@ fn disable_echo() -> Option<libc::termios> {
 /// certificate or the friend's disk space are wrong, that surfaces in seconds
 /// rather than several hours into a first real backup.
 pub fn peer_add(name: &str, url: &str, ca_cert: Option<PathBuf>) -> Res {
+    peer_add_completed(name, &complete_url(url)?, ca_cert)
+}
+
+/// The same, once the password has been collected.
+///
+/// `connect` calls this rather than [`peer_add`] because it has already asked.
+fn peer_add_completed(name: &str, url: &RepoUrl, ca_cert: Option<PathBuf>) -> Res {
     // Validate before the name reaches a path. Everything downstream takes a
     // PeerName, so this is the only place the raw argument exists.
     let name = PeerName::new(name)?;
-    let url = &complete_url(url)?;
+    let url = url.as_str();
     let mut cfg = Config::load().map_err(err("could not read config"))?;
     if cfg.peer(&name).is_some() {
         return Err(format!("peer '{name}' already exists"));
@@ -1443,6 +1473,45 @@ pub fn warn_if_recovery_stale() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_url_is_completed_exactly_once_on_the_way_through_connect() {
+        // `connect` completed the URL and then handed the result to `peer_add`,
+        // which completed it again. The URL came out correct, because completing
+        // an already-complete URL leaves it alone -- but the second pass saw a
+        // password and warned that it was in the user's shell history. They had
+        // typed it into a prompt. Telling someone they leaked a credential when
+        // they did not is worse than saying nothing.
+        //
+        // Asserted on the type rather than by counting warnings: `RepoUrl` can
+        // only be made by `complete_url`, and nothing takes one and completes it
+        // again, so `connect` handing its `RepoUrl` to `peer_add_completed` is
+        // the compiler's guarantee rather than a comment's.
+        //
+        // What is left to check is the property that made the double call
+        // harmless-looking and therefore easy to miss.
+        let raw = "rest:https://nisse@storage.example/nisse/";
+        let once = redact::url_with_password(raw, "hunter2");
+        assert_eq!(once, "rest:https://nisse:hunter2@storage.example/nisse/");
+        assert_eq!(
+            redact::url_with_password(&once, "somethingelse"),
+            once,
+            "completing twice must be a no-op, or the second password would win"
+        );
+    }
+
+    #[test]
+    fn a_username_only_url_is_not_mistaken_for_one_carrying_a_password() {
+        // The predicate the warning hangs on. `nisse@host` is a username and
+        // nothing secret, which is the shape every invite has had since the
+        // password moved out of the URL.
+        assert!(!redact::url_has_password(
+            "rest:https://nisse@storage.finchleg.com/nisse/"
+        ));
+        assert!(redact::url_has_password(
+            "rest:https://nisse:pw@storage.finchleg.com/nisse/"
+        ));
+    }
 
     #[test]
     fn peer_names_come_from_the_url_host() {
