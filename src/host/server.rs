@@ -221,29 +221,7 @@ pub fn quickstart(ctx: &Ctx, peer: &PeerName, o: &ServerOpts) -> Res {
                  PB_GID, or run\n       this without sudo -- quickstart does not need it.",
             );
         }
-        let ports = format!("{}:8000", o.port);
-        let volume = format!("{}:/data", o.data.display());
-        let options = format!(
-            "OPTIONS=--private-repos --append-only --max-size {}",
-            o.max_size
-        );
-        let run_args = [
-            "run",
-            "-d",
-            "--name",
-            &o.container,
-            "--restart",
-            "unless-stopped",
-            "--user",
-            &user,
-            "-p",
-            &ports,
-            "-v",
-            &volume,
-            "-e",
-            &options,
-            REST_SERVER_IMAGE,
-        ];
+        let run_args = server_run_args(o, &user);
         if ctx.would(&format!("docker {}", run_args.join(" "))) {
             ctx.info("");
             ctx.info(&format!(
@@ -347,6 +325,52 @@ pub fn quickstart(ctx: &Ctx, peer: &PeerName, o: &ServerOpts) -> Res {
     ctx.info("internet: see the README.");
     Ok(())
 }
+
+/// The `docker run` arguments for the rest-server container.
+///
+/// A function so the arguments can be asserted on without starting anything.
+fn server_run_args(o: &ServerOpts, user: &str) -> Vec<String> {
+    vec![
+        "run".into(),
+        "-d".into(),
+        "--name".into(),
+        o.container.clone(),
+        "--restart".into(),
+        "unless-stopped".into(),
+        "--user".into(),
+        user.to_owned(),
+        "-p".into(),
+        format!("{}:8000", o.port),
+        "-v".into(),
+        format!("{}:/data", o.data.display()),
+        "-e".into(),
+        format!(
+            "OPTIONS=--private-repos --append-only --max-size {}",
+            o.max_size
+        ),
+        "-e".into(),
+        SERVE_HTTP1_ONLY.into(),
+        REST_SERVER_IMAGE.into(),
+    ]
+}
+
+/// Stop rest-server offering HTTP/2.
+///
+/// HTTP/2 multiplexes every parallel upload onto one TCP connection, and one
+/// connection to a peer 170ms away carries about 55 Mbit/s however much
+/// bandwidth either end has. Forcing HTTP/1.1 on the same link measured about
+/// four times that, with restic using one socket per concurrent upload.
+///
+/// It has to be fixed here, on the server. restic configures HTTP/2 through
+/// `golang.org/x/net/http2`, which puts `h2` in the TLS ALPN offer
+/// unconditionally and never consults `GODEBUG=http2client=0`; there is no
+/// restic option either. But ALPN is the server's choice. rest-server uses the
+/// standard library's built-in HTTP/2, which does honour `http2server=0`, and a
+/// server that does not offer `h2` leaves the client on HTTP/1.1.
+///
+/// This only governs a rest-server terminating TLS itself. A reverse proxy in
+/// front of it negotiates ALPN on its own, and the README covers that case.
+const SERVE_HTTP1_ONLY: &str = "GODEBUG=http2server=0";
 
 /// Create a login, restart, and verify it before handing it to anyone.
 ///
@@ -770,6 +794,30 @@ mod tests {
     #[test]
     fn a_missing_directory_is_not_writable() {
         assert!(!writable(std::path::Path::new("/nope/not/here")));
+    }
+
+    #[test]
+    fn the_server_is_started_without_http2() {
+        // HTTP/2 puts every upload on one TCP connection, which caps a distant
+        // peer at a fraction of the link. restic's client cannot be told to
+        // avoid it, so the server must not offer it.
+        let o = ServerOpts {
+            port: 51515,
+            data: PathBuf::from("/srv/data"),
+            container: "peerbackup-rest".into(),
+            max_size: 1,
+        };
+        let args = server_run_args(&o, "1000:1000");
+        let pos = args
+            .iter()
+            .position(|a| a == "GODEBUG=http2server=0")
+            .expect("the server must be told not to offer HTTP/2");
+        assert_eq!(
+            args[pos - 1],
+            "-e",
+            "it must arrive as an environment variable"
+        );
+        assert_eq!(args.last().unwrap(), REST_SERVER_IMAGE, "image stays last");
     }
 
     #[test]

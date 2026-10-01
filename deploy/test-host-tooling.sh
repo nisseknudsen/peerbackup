@@ -243,14 +243,14 @@ fi
 # A size limit the operator set deliberately must never be silently replaced by
 # a default. This used to be passed straight through to the server, which died
 # on it; now it is refused before docker is touched, which is the better place.
-OUT=$(PB_MAX_SIZE=not-a-number "${HOST[@]}" quickstart tester 2>&1)
+OUT=$(PB_DATA="$WORK/badsize" PB_MAX_SIZE=not-a-number "${HOST[@]}" quickstart tester 2>&1)
 echo "$OUT" | grep -qi 'PB_MAX_SIZE' \
   && ok "an unparseable PB_MAX_SIZE is refused by name" \
   || bad "PB_MAX_SIZE=not-a-number was not rejected: $OUT"
 echo "$OUT" | grep -q "Ready. Send both" \
   && bad "printed a peer URL despite a bad size limit" \
   || ok "no URL printed when the size limit is unusable"
-OUT=$(PB_MAX_SIZE=10G PB_CONTAINER=pb-size-probe "${HOST[@]}" quickstart tester 2>&1)
+OUT=$(PB_DATA="$WORK/sizeprobe" PB_MAX_SIZE=10G PB_CONTAINER=pb-size-probe "${HOST[@]}" quickstart tester 2>&1)
 echo "$OUT" | grep -qi 'PB_MAX_SIZE' \
   && bad "rejected a valid size string: $OUT" \
   || ok "PB_MAX_SIZE accepts a human size like 10G"
@@ -315,7 +315,7 @@ hdr "the invite keeps the address and the password apart"
 # A password on a command line lands in shell history, in `ps`, and permanently
 # in `docker inspect`. The invite used to be one URL with the password in it, so
 # the only way to use it was to paste it onto a command line.
-OUT=$(PB_CONTAINER=pb-invite-probe PB_PORT=51598 "${HOST[@]}" quickstart invitee 2>&1)
+OUT=$(PB_DATA="$WORK/invite" PB_CONTAINER=pb-invite-probe PB_PORT=51598 "${HOST[@]}" quickstart invitee 2>&1)
 if echo "$OUT" | grep -qE 'URL: +rest:http://invitee@'; then
   ok "the invite URL carries a username and no password"
 else
@@ -348,6 +348,14 @@ if grep -qE '^[[:space:]]+command:' "$COMPOSE"; then
   bad "compose uses command: — the image takes config via env, this will fail at runc"
 else
   ok "compose does not pass flags as command args"
+fi
+# HTTP/2 puts every upload on one TCP connection and caps a distant peer at a
+# fraction of the link. restic's client cannot be told to avoid it, so the
+# server must not offer it.
+if grep -qE '^[[:space:]]+GODEBUG:[[:space:]]+http2server=0' "$COMPOSE"; then
+  ok "compose turns HTTP/2 off on the server"
+else
+  bad "compose leaves HTTP/2 on, which caps a distant peer at one TCP connection"
 fi
 
 hdr "systemd unit — the guard must actually be wired in"
