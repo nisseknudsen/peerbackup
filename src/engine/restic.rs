@@ -86,41 +86,6 @@ fn extra_opts() -> Result<Vec<String>, std::io::Error> {
     Ok(out)
 }
 
-/// Turn off HTTP/2 in restic's Go HTTP client.
-///
-/// restic calls `http2.ConfigureTransports` unconditionally
-/// (`internal/backend/http_transport.go`) and offers no flag to undo it, so
-/// over TLS it always negotiates HTTP/2. HTTP/2 then multiplexes every parallel
-/// request onto **one** TCP connection, and one TCP connection to a distant
-/// peer is a throughput ceiling no amount of upload concurrency can lift:
-/// measured at about 58 Mbit/s over a 170ms link, against roughly 1 Gbit of
-/// available bandwidth on both ends.
-///
-/// That is the wrong trade for this program specifically. peerbackup exists to
-/// push large amounts of data to a friend's server which is, by construction,
-/// somewhere else. restic's own default suits a nearby or local backend, where
-/// multiplexing costs nothing; ours is the case where it costs almost
-/// everything. Under HTTP/1.1 restic opens up to `rest.connections` sockets and
-/// each gets its own congestion window.
-///
-/// A peerbase tunnel is unaffected either way, since restic then talks plain
-/// HTTP to loopback and Go does not use HTTP/2 without TLS.
-///
-/// `GODEBUG` is a comma-separated list, so an inherited value is extended
-/// rather than replaced -- and a caller who has already said something about
-/// `http2client` has their choice left alone, which is the escape hatch.
-///
-/// Known publicly: <https://forum.restic.net/t/restic-rest-server-and-tcp-multiplexing/10803>
-fn godebug() -> String {
-    const OFF: &str = "http2client=0";
-    match std::env::var("GODEBUG") {
-        Ok(existing) if existing.contains("http2client") => existing,
-        Ok(existing) if existing.trim().is_empty() => OFF.to_owned(),
-        Ok(existing) => format!("{existing},{OFF}"),
-        Err(_) => OFF.to_owned(),
-    }
-}
-
 /// A restic invocation, and the short-lived files it needs on disk.
 ///
 /// The files must outlive the child process and not one moment longer, which is
@@ -256,7 +221,6 @@ impl ResticEngine {
         ] {
             c.env_remove(k);
         }
-        c.env("GODEBUG", godebug());
         for opt in extra_opts()? {
             c.arg(opt);
         }
@@ -1194,47 +1158,6 @@ mod tests {
 
         unsafe { std::env::remove_var("PEERBACKUP_RESTIC_OPTS") };
         assert!(extra_opts().unwrap().is_empty());
-    }
-
-    #[test]
-    fn http2_is_turned_off_for_the_restic_child() {
-        // restic calls `http2.ConfigureTransports` unconditionally and has no
-        // flag to undo it, so over TLS it negotiates HTTP/2 and multiplexes
-        // every parallel upload onto one TCP connection. Measured on a 170ms
-        // link that caps the whole backup at about 58 Mbit/s against a gigabit
-        // on both ends.
-        let e = ResticEngine::new("rest:https://host/me/", "/tmp/pw");
-        let inv = e.command(&["snapshots"]).unwrap();
-        let godebug = inv
-            .command
-            .get_envs()
-            .find(|(k, _)| *k == "GODEBUG")
-            .and_then(|(_, v)| v)
-            .map(|v| v.to_string_lossy().into_owned())
-            .expect("GODEBUG must be set");
-        assert!(godebug.contains("http2client=0"), "got {godebug}");
-    }
-
-    #[test]
-    fn an_inherited_godebug_is_extended_rather_than_replaced() {
-        // It is a comma-separated list, and clobbering someone's unrelated
-        // setting to fix throughput would be a poor trade.
-        //
-        // SAFETY: GODEBUG is read by nothing else in this binary, and these
-        // assertions do not run concurrently with another reader of it.
-        unsafe { std::env::set_var("GODEBUG", "madvdontneed=1") };
-        assert_eq!(godebug(), "madvdontneed=1,http2client=0");
-
-        // A caller who already said something about http2client keeps it. This
-        // is the escape hatch for anyone who wants HTTP/2 back.
-        unsafe { std::env::set_var("GODEBUG", "http2client=1") };
-        assert_eq!(godebug(), "http2client=1");
-
-        unsafe { std::env::set_var("GODEBUG", "") };
-        assert_eq!(godebug(), "http2client=0");
-
-        unsafe { std::env::remove_var("GODEBUG") };
-        assert_eq!(godebug(), "http2client=0");
     }
 
     #[test]

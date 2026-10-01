@@ -32,6 +32,13 @@ services:
       #                    Their cleanup then needs a maintenance window; see
       #                    the README.
       #   --max-size       total bytes across all peers on this server
+      # No HTTP/2. It multiplexes every parallel upload onto one TCP
+      # connection, which caps a distant peer at a fraction of the link -- about
+      # 55 Mbit/s at 170ms against roughly four times that on HTTP/1.1. restic's
+      # client cannot be told to avoid it, but ALPN is the server's choice. Only
+      # applies when this container terminates TLS; a reverse proxy in front
+      # negotiates on its own (see the README).
+      GODEBUG: http2server=0
       OPTIONS: >-
         --private-repos
         --append-only

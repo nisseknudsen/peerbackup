@@ -86,6 +86,7 @@ docker run -d --name peerbackup-rest --restart unless-stopped \
   --user "$(id -u):$(id -g)" -p 51515:8000 \
   -v /srv/peerbackup-data:/data \
   -e OPTIONS="--private-repos --append-only --max-size 536870912000" \
+  -e GODEBUG=http2server=0 \
   restic/rest-server:0.14.0 \
   && docker exec -it peerbackup-rest create_user alice \
   && docker restart peerbackup-rest
@@ -234,26 +235,29 @@ cannot see is worse than one that stops the command.
 
 ### Throughput to a distant peer
 
-restic enables HTTP/2 unconditionally and offers no flag to turn it off, so over
-TLS it always negotiates it. HTTP/2 then multiplexes every parallel upload onto
-one TCP connection, and one connection to a peer 170ms away carries about
-58 Mbit/s however much bandwidth either end has. peerbackup therefore runs
-restic with `GODEBUG=http2client=0`, which puts it back on HTTP/1.1 with one
-socket per concurrent upload. Set `http2client` yourself in `GODEBUG` if you
-want it back.
+HTTP/2 caps a distant peer far below its link. It multiplexes every parallel
+upload onto one TCP connection, and one connection 170ms away carried about
+55 Mbit/s between two gigabit lines; HTTP/1.1 on the same link carried about
+four times that, one socket per concurrent upload.
 
-If a backup is still slower than the link should allow, the next thing to
-measure is how fast the *sources* can be read, not the network. restic keeps two
-open pack files per blob type and uploads up to `rest.connections` (five) at a
-time, so a backup can only go as fast as it can fill packs. Backing up a few
-gigabytes from a tmpfs separates the two:
+restic cannot be told to avoid HTTP/2, so this is fixed on the **host**. The
+protocol is the server's choice, and the server peerbackup runs does not offer
+HTTP/2. If you use `quickstart` or the shipped `compose.yml`, there is nothing to
+do.
+
+If a reverse proxy terminates TLS in front of rest-server, the proxy chooses
+instead, and you need to turn HTTP/2 off there for the peerbackup hostname. In
+nginx that means no `http2` on that server or its `listen` line; Caddy and
+Traefik have equivalent settings (`protocols` and TLS `alpnProtocols`). Check the
+result from anywhere:
 
 ```sh
-# If this is much faster than your real sources, the disk is the limit.
-mkdir -p /dev/shm/pbtest && head -c 2G /dev/urandom > /dev/shm/pbtest/blob.bin
+echo | openssl s_client -connect your-host:443 -alpn h2,http/1.1 2>/dev/null \
+  | grep 'ALPN protocol'      # should say http/1.1
 ```
 
-More connections help on a long link, at the cost of memory and server load:
+Once a peer is on HTTP/1.1, more connections help on a long link, at the cost of
+memory and server load:
 
 ```sh
 PEERBACKUP_RESTIC_OPTS="-o rest.connections=10" peerbackup backup
@@ -480,6 +484,7 @@ docker run --rm -d --name peerbackup-maint \
   --user "$(id -u):$(id -g)" -p 51515:8000 \
   -v "${PB_DATA:-$HOME/.local/share/peerbackup-data}:/data" \
   -e OPTIONS="--private-repos --max-size ${PB_MAX_SIZE:-536870912000}" \
+  -e GODEBUG=http2server=0 \
   restic/rest-server:0.14.0
 # peer runs their cleanup, then:
 docker rm -f peerbackup-maint
