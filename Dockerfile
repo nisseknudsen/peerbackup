@@ -74,7 +74,17 @@ RUN set -eu; \
     install -m 0755 "$f" /usr/local/bin/restic
 
 FROM alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc
-RUN apk add --no-cache ca-certificates
+# tini, because peerbackup runs as PID 1 here and PID 1 has no default signal
+# dispositions: a signal with no handler installed is ignored rather than
+# terminating the process. So `docker stop` and `systemctl stop` hung for the
+# full ten-second grace period and then SIGKILLed, which kills peerbackup
+# without killing the restic it spawned -- and an abandoned restic leaves its
+# repository lock behind for the next run to trip over.
+#
+# `-g` signals the whole process group, so restic gets the SIGTERM too and
+# removes its own lock on the way out. `docker run --init` does the same thing
+# and is what this replaces; baking it in means nobody has to know that.
+RUN apk add --no-cache ca-certificates tini
 COPY --from=restic /usr/local/bin/restic /usr/local/bin/restic
 COPY --from=build /src/target/release/peerbackup /usr/local/bin/peerbackup
 
@@ -107,5 +117,5 @@ VOLUME ["/config", "/state"]
 
 USER peerbackup
 
-ENTRYPOINT ["peerbackup"]
+ENTRYPOINT ["/sbin/tini", "-g", "--", "peerbackup"]
 CMD ["status"]

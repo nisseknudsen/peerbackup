@@ -232,6 +232,33 @@ windows must be non-zero, and `verify_subset_pct` must be between 1 and 100. A
 key that is not one of these is refused too, rather than ignored: a typo you
 cannot see is worse than one that stops the command.
 
+### Throughput to a distant peer
+
+restic enables HTTP/2 unconditionally and offers no flag to turn it off, so over
+TLS it always negotiates it. HTTP/2 then multiplexes every parallel upload onto
+one TCP connection, and one connection to a peer 170ms away carries about
+58 Mbit/s however much bandwidth either end has. peerbackup therefore runs
+restic with `GODEBUG=http2client=0`, which puts it back on HTTP/1.1 with one
+socket per concurrent upload. Set `http2client` yourself in `GODEBUG` if you
+want it back.
+
+If a backup is still slower than the link should allow, the next thing to
+measure is how fast the *sources* can be read, not the network. restic keeps two
+open pack files per blob type and uploads up to `rest.connections` (five) at a
+time, so a backup can only go as fast as it can fill packs. Backing up a few
+gigabytes from a tmpfs separates the two:
+
+```sh
+# If this is much faster than your real sources, the disk is the limit.
+mkdir -p /dev/shm/pbtest && head -c 2G /dev/urandom > /dev/shm/pbtest/blob.bin
+```
+
+More connections help on a long link, at the cost of memory and server load:
+
+```sh
+PEERBACKUP_RESTIC_OPTS="-o rest.connections=10" peerbackup backup
+```
+
 ### Timeouts
 
 restic retries transport failures with exponential backoff and no overall
@@ -508,6 +535,12 @@ Source directories can be mounted read-only.
 
 Pass `--user` matching whoever owns the files you are backing up, or restic
 cannot read them. Any uid works, including one with no account inside the image.
+
+The image runs peerbackup under `tini`, so `docker stop` and `systemctl stop`
+work. Without it peerbackup is PID 1, and PID 1 ignores any signal it has no
+handler for, so a stop waited out the grace period and then SIGKILLed -- which
+killed peerbackup without killing restic and left its repository lock behind.
+`docker run --init` did the same job and is no longer needed.
 
 ### Restoring
 
