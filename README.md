@@ -53,6 +53,10 @@ anyone on the path can read the credential and then append to or read your
 friend's repository. Forward the port to the internet only behind [TLS](#tls) or
 a reverse proxy that terminates it. On a LAN or over a VPN, plain HTTP is fine.
 
+Already running Traefik, Caddy or nginx? Put peerbackup behind it, and read
+[Behind a reverse proxy](#behind-a-reverse-proxy) first: one proxy setting decides
+how fast your friends can upload to you.
+
 ### Send: back up to that URL
 
 ```sh
@@ -245,16 +249,9 @@ protocol is the server's choice, and the server peerbackup runs does not offer
 HTTP/2. If you use `quickstart` or the shipped `compose.yml`, there is nothing to
 do.
 
-If a reverse proxy terminates TLS in front of rest-server, the proxy chooses
-instead, and you need to turn HTTP/2 off there for the peerbackup hostname. In
-nginx that means no `http2` on that server or its `listen` line; Caddy and
-Traefik have equivalent settings (`protocols` and TLS `alpnProtocols`). Check the
-result from anywhere:
-
-```sh
-echo | openssl s_client -connect your-host:443 -alpn h2,http/1.1 2>/dev/null \
-  | grep 'ALPN protocol'      # should say http/1.1
-```
+If a reverse proxy terminates TLS in front of rest-server, which is the usual
+homelab setup, the proxy decides instead. See
+[Behind a reverse proxy](#behind-a-reverse-proxy) for Traefik, Caddy and nginx.
 
 Once a peer is on HTTP/1.1, more connections help on a long link, at the cost of
 memory and server load:
@@ -324,10 +321,98 @@ they are two ways to run the same server, not two servers. Moving from one to
 the other means `docker rm -f peerbackup-rest` first. `quickstart` also has no
 way to pass `PB_EXTRA_OPTIONS`, so TLS means using compose.
 
+### Behind a reverse proxy
+
+Most homelab servers already run Traefik, Caddy or nginx with a certificate for
+everything else on the box. That works fine, and you can skip the TLS section
+below entirely: leave `PB_EXTRA_OPTIONS` unset and let the proxy terminate TLS
+the way it does for your other services.
+
+- Point the proxy at rest-server's plain HTTP port: `peerbackup-rest:8000` if the
+  proxy shares a Docker network with it, otherwise the published port.
+- Do not publish `51515` to the internet. Only the proxy's `80` and `443` need to
+  be reachable, and `PB_BIND=127.0.0.1` keeps the published port off other
+  interfaces.
+- The invite URL loses the port: `rest:https://alice@your-domain.example/alice/`.
+
+**Then turn off HTTP/2 for the peerbackup hostname.** This one setting decides how
+fast your friends can upload to you. HTTP/2 puts every parallel upload on a
+single TCP connection, and a single connection to a peer far away is slow
+however fast both lines are: about 55 Mbit/s at 170ms between two gigabit
+connections, against roughly four times that on HTTP/1.1.
+
+The protocol is chosen during the TLS handshake, so whoever holds the certificate
+decides it. Behind a proxy that is the proxy, and the proxy config is the only
+thing to change. restic cannot be told to avoid HTTP/2 from its side.
+
+| Setup | Who decides | What to change |
+|---|---|---|
+| A proxy holds the certificate | The proxy | The proxy, as below |
+| rest-server runs `--tls` itself | rest-server | Nothing; `compose.yml` already sets `GODEBUG=http2server=0` |
+| Plain HTTP, no TLS anywhere | Nobody | Nothing; HTTP/2 needs TLS |
+
+**Traefik** scopes this per hostname, so your other sites keep HTTP/2. Declare a
+TLS option in the dynamic file configuration, since Traefik does not accept TLS
+options from Docker labels, and attach it to the peerbackup router:
+
+```yaml
+# dynamic configuration file
+tls:
+  options:
+    http1only:
+      alpnProtocols:
+        - http/1.1
+        - acme-tls/1   # keep if you use the TLS-ALPN certificate challenge
+```
+
+```yaml
+# on the peerbackup router; labels can reference it
+- traefik.http.routers.peerbackup.tls.options=http1only@file
+```
+
+Give peerbackup a hostname of its own. If another router on the same hostname
+uses different TLS options, Traefik discards both and silently falls back to its
+defaults, which brings HTTP/2 back.
+
+**Caddy** sets this per listening port, not per site, so it applies to every site
+on that port:
+
+```
+{
+	servers :443 {
+		protocols h1
+	}
+}
+```
+
+If other sites share that Caddy and you want to keep HTTP/2 for them, serve
+peerbackup on a port of its own with its own `servers :8443 { protocols h1 }`
+block, and put that port in the invite URL.
+
+**nginx** only speaks HTTP/2 where you asked for it: remove `http2 on;` from the
+peerbackup `server` block, and `http2` from its `listen` line on older versions.
+
+**Check it** from anywhere after reloading the proxy. It should say `http/1.1`:
+
+```sh
+echo | openssl s_client -connect your-domain.example:443 -alpn h2,http/1.1 2>/dev/null \
+  | grep 'ALPN protocol'
+```
+
+If your proxy routes on Docker's `HEALTHCHECK`, note that `compose.yml`'s check
+looks for any HTTP status line rather than a specific code. With
+`--private-repos` the server answers `401` on `/` forever, and busybox `wget`
+exits `1` for that exactly as it does for nothing listening, so a check for one
+exact code marks a working server unhealthy and the route silently disappears.
+
 ### TLS
 
 Backups are encrypted before upload, but the login password is sent with every
 request. Use TLS on anything reachable from the internet.
+
+This section is for rest-server holding the certificate itself. If a reverse
+proxy already does that for your other services, use
+[Behind a reverse proxy](#behind-a-reverse-proxy) instead.
 
 The container runs as `PB_UID`, not as root, so it needs a copy of the
 certificate it can actually read. Let's Encrypt keeps the live directory at
@@ -369,25 +454,11 @@ peerbackup connect 'rest:https://alice@host/alice/' --source /srv/data \
 
 `peerbackup peer add` takes the same flag.
 
-**Already running a reverse proxy** (Traefik, Caddy, nginx...) with its own
-certificate for other services on this host? Skip the above entirely — leave
-`PB_EXTRA_OPTIONS` unset, point the proxy at the container's plain HTTP port
-(`8000` inside the container), and let it terminate TLS the way it does
-everything else. Don't publish `8000`/`51515` to the internet in this case;
-only the proxy's `80`/`443` need to be reachable. The invite URL loses the
-port: `rest:https://alice@your-domain.example/alice/`.
-
 Set `PB_HEALTHCHECK_SCHEME=https` alongside `PB_EXTRA_OPTIONS`. Without it the
 check still passes, but for the wrong reason: Go answers a plaintext request to a
 TLS port with `HTTP/1.0 400 Bad Request`, which contains the status line it looks
 for. The container would read healthy on the strength of a handshake failure, and
 keep doing so with a certificate the server could not load.
-
-That check looks for any HTTP status line rather than a specific code, which
-matters if your proxy routes on Docker's `HEALTHCHECK`. With `--private-repos`
-the server answers `401` on `/` forever, and busybox `wget` exits `1` for that
-exactly as it does for nothing listening -- so a check for one exact code marks a
-working server unhealthy and the route silently disappears.
 
 ### A size limit per peer
 
