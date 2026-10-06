@@ -1506,10 +1506,10 @@ mod tests {
         // nothing secret, which is the shape every invite has had since the
         // password moved out of the URL.
         assert!(!redact::url_has_password(
-            "rest:https://nisse@storage.finchleg.com/nisse/"
+            "rest:https://nisse@storage.example/nisse/"
         ));
         assert!(redact::url_has_password(
-            "rest:https://nisse:pw@storage.finchleg.com/nisse/"
+            "rest:https://nisse:pw@storage.example/nisse/"
         ));
     }
 
