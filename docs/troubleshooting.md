@@ -32,9 +32,10 @@ are overdue, run `peerbackup verify`. A peer whose last attempt failed is listed
 with the reason.
 
 **`verify` exits with 2.**
-Nothing could be checked, most often because the peer was unreachable. This
-says nothing about the data itself, but a peer unreachable every night is worth
-an alert.
+No peer could be checked at all, most often because they were unreachable. This
+says nothing about the data itself. Note that `verify` exits 0 if at least one
+peer was checked, so a single unreachable peer does not show up here; `status`,
+which exits 1 for any peer that is not `ok`, does.
 
 **restic output ends with what looks like a crash.**
 restic appends a trace of where an error happened to ordinary failures.
@@ -46,6 +47,17 @@ message is the line above it.
 **A peer gets `401 Unauthorized` with the right password.**
 rest-server reads logins only at startup. Restart it, or add logins with
 `peerbackup host adduser`, which restarts it for you.
+
+**`host adduser` says nothing is answering, on a server with TLS.**
+A known issue: its final check uses plain HTTP, which a TLS server rejects. The
+login was created. See the note in [hosting.md](hosting.md#tls) for how to
+confirm it.
+
+**A friend ran `peer remove` and asks you to run `host release`, which says
+there is no grant.**
+`host release` is for per-peer storage areas. On a `quickstart` or compose
+server, remove the peer as described in
+[hosting.md](hosting.md#removing-a-peer).
 
 **A peer reports `507 Insufficient Storage`.**
 They have reached their size limit. Either they remove old backups (which needs

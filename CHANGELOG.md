@@ -16,10 +16,10 @@ First public release.
   step and checks the connection by uploading a test file and reading it back.
 - `verify` reads back a configurable share of the stored data, restores a test
   file and compares its digest, and checks that the peer still lists the most
-  recent snapshot. It exits 1 when data came back wrong and 2 when nothing
-  could be checked.
+  recent snapshot. It exits 1 on damage or error, and 2 when no peer could be
+  checked at all.
 - `status` summarises every peer from locally recorded results, without
-  contacting them.
+  contacting them, and exits non-zero unless every peer is `ok`.
 - `restore` (latest backup, or a chosen snapshot) and `snapshots`.
 - `recovery export` writes repository addresses, passwords and plain restic
   commands to a file, so backups can be restored without peerbackup. Commands

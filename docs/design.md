@@ -44,19 +44,19 @@ Every check ends in one of three states:
 
 | State | Meaning | Shown as |
 |---|---|---|
-| Good | Data was read back and was correct | `ok` |
-| Bad | Data was read back and was wrong | `FAILED` |
-| Unknown | Nothing could be read back | `unchecked` |
+| Good | Checked, and correct | `ok` |
+| Bad | Data was read back and was wrong, or the host no longer has a backup it accepted | `FAILED` |
+| Unknown | Could not check | `unchecked` |
 
 An unreachable peer, a full disk or a wrong login produces Unknown, never Bad.
-Only data that was actually read and found wrong is reported as a failure. This
-keeps `FAILED` meaningful: treating a network outage as corruption would teach
-people to ignore it.
+Only positive evidence of a problem is reported as a failure. This keeps
+`FAILED` meaningful: treating a network outage as corruption would teach people
+to ignore it.
 
 Unknown is not treated as fine either. A peer whose checks are older than the
 windows in the config is shown as `unchecked` and makes `status` exit non-zero,
-and `verify` exits 2 when it cannot check a peer at all. A peer that has been
-unreachable for weeks is not silent.
+and `verify` exits 2 when it could not check any peer at all. A peer that has
+been unreachable for weeks is not silent.
 
 ## Security model
 

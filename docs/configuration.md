@@ -10,9 +10,12 @@ environment variables peerbackup reads. Hosting settings are in
 |---|---|---|
 | `~/.config/peerbackup/config.toml` | Settings and peers | `PEERBACKUP_CONFIG_DIR` |
 | `~/.config/peerbackup/secrets/<peer>` | Each peer's encryption password | follows the config directory |
-| `~/.local/share/peerbackup/` | Recorded check results, test files, restic's cache, the default recovery file | `PEERBACKUP_STATE_DIR` |
+| `~/.local/share/peerbackup/` | Recorded check results, test files, the default recovery file | `PEERBACKUP_STATE_DIR` |
 
 The config and every secret are written readable only by you (mode 0600).
+
+restic keeps its cache in its usual place, `~/.cache/restic`. (The container
+image moves it to `/state/cache`.)
 
 ## The config file
 
@@ -29,8 +32,8 @@ subset_days = 10
 canary_days = 35
 
 [[peer]]
-name = "alice"
-url = "rest:http://alice:LOGIN-PASSWORD@your-host:51515/alice/"
+name = "bob"
+url = "rest:http://alice:LOGIN-PASSWORD@bob.example.net:51515/alice/"
 # ca_cert = "/path/to/ca.pem"   # only for a self-signed certificate
 ```
 
@@ -46,8 +49,13 @@ Every setting has a default, so a file only needs the ones you change.
 | `canary_days` | `35` | Same, for the last successful test-file restore. |
 
 Settings are validated when the file is read. A value that cannot work (a zero
-window, a percentage outside 1–100) and any key that is not in this table are
-refused with an error naming them, rather than being ignored or adjusted.
+window, a percentage outside 1–100), or a key under `[settings]` that is not in
+this table, is refused with an error naming it, rather than being ignored or
+adjusted.
+
+Keys under `[[peer]]` are not checked this way, so a misspelling there is
+silently ignored. The certificate key is `ca_cert`, although the command-line
+flag is `--cacert`.
 
 ### Two passwords per peer
 
@@ -68,7 +76,7 @@ If the host uses a certificate your system does not trust, get a copy of it from
 them and pass it when connecting:
 
 ```sh
-peerbackup connect 'rest:https://alice@host/alice/' --source /srv/data --cacert /path/to/ca.pem
+peerbackup connect 'rest:https://alice@bob.example.net/alice/' --source /srv/data --cacert /path/to/ca.pem
 ```
 
 `peer add` takes the same flag. It is stored as `ca_cert` for that peer.
@@ -79,7 +87,7 @@ When there is no terminal, `connect` and `peer add` read the password from
 standard input instead of prompting:
 
 ```sh
-peerbackup connect 'rest:http://alice@your-host:51515/alice/' --source /srv/data < password.txt
+peerbackup connect 'rest:http://alice@bob.example.net:51515/alice/' --source /srv/data < password.txt
 ```
 
 Avoid putting the password in the URL on the command line. It ends up in your
@@ -97,21 +105,18 @@ Override the others with these variables, in seconds:
 | Variable | Default | Limits |
 |---|---|---|
 | `PEERBACKUP_PROBE_TIMEOUT` | 20 | Checking whether a peer answers at all |
-| `PEERBACKUP_LIST_TIMEOUT` | 120 | `snapshots`, and creating a repository |
-| `PEERBACKUP_CANARY_TIMEOUT` | 1800 | Fetching the test file during `verify` |
+| `PEERBACKUP_LIST_TIMEOUT` | 120 | Listing snapshots (in `snapshots`, `verify` and `restore`), and creating a repository |
+| `PEERBACKUP_CANARY_TIMEOUT` | 1800 | Downloading the test file (in `verify`, `connect` and `peer add`) |
 | `PEERBACKUP_VERIFY_TIMEOUT` | 3600 | Reading data back during `verify` |
 
 ## Throughput to a distant peer
 
-Over HTTP/2, all of restic's parallel uploads share one TCP connection, and a
-single connection to a distant peer is slow regardless of bandwidth. In one
-measurement between two gigabit lines 170 ms apart, HTTP/2 carried about
-55 Mbit/s and HTTP/1.1 about four times that.
-
-restic has no option to avoid HTTP/2, so this is decided by the **host**. The
-server set up by `host quickstart` and the shipped `compose.yml` does not offer
-HTTP/2, so there is nothing to do. If the host runs a reverse proxy in front of
-it, the proxy decides; see [hosting.md](hosting.md#reverse-proxy).
+Uploads to a distant peer are much slower over HTTP/2 than over HTTP/1.1,
+because HTTP/2 puts all of restic's parallel uploads on one TCP connection.
+restic cannot opt out, so this is decided by the **host**: the server set up by
+`host quickstart` or `compose.yml` does not offer HTTP/2, and a host running a
+reverse proxy has to turn it off there. See
+[hosting.md](hosting.md#turn-off-http2-for-the-peerbackup-hostname).
 
 Once a peer uses HTTP/1.1, more connections can help on a long link, at the cost
 of memory on both sides:

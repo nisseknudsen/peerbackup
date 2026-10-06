@@ -21,9 +21,10 @@ If peerbackup is gone, restic alone can restore everything.
 - [Requirements](#requirements)
 - [Installation](#installation)
 - [Quick start](#quick-start)
+- [Restoring](#restoring)
 - [Commands](#commands)
 - [Configuration](#configuration)
-- [Scheduling](#scheduling)
+- [Scheduling and alerts](#scheduling-and-alerts)
 - [Documentation](#documentation)
 - [Development](#development)
 - [License](#license)
@@ -36,15 +37,16 @@ restores the data with restic alone. Until 1.0.0, a minor release may include
 breaking changes; see the [changelog](CHANGELOG.md).
 
 Not implemented yet: a built-in scheduler (use a systemd timer or cron, as
-[below](#scheduling)), and retention or pruning of old backups.
+[below](#scheduling-and-alerts)), and automatic removal of old backups (it can
+be done by hand; see [docs/restore.md](docs/restore.md#removing-old-backups)).
 
 ## Requirements
 
 | Role | Needs |
 |---|---|
 | Sending backups | Linux (amd64 or arm64) and [restic](https://restic.readthedocs.io/en/stable/020_installation.html) 0.17 or newer, or Docker |
-| Hosting for a friend | Linux and Docker |
-| Per-peer storage limits | Root, and ext4, xfs or btrfs on local storage |
+| Hosting for a friend | Linux, Docker and `curl` |
+| Per-peer storage limits (optional) | Root, systemd, util-linux, e2fsprogs, and ext4, xfs or btrfs on local storage |
 | Building from source | Rust 1.88+ |
 
 Distribution packages of restic are often older than 0.17 (Debian 12 ships
@@ -73,7 +75,10 @@ tar -xzf "peerbackup-$VERSION-linux-$ARCH.tar.gz"
 sudo install -m 0755 "peerbackup-$VERSION-linux-$ARCH/peerbackup" /usr/local/bin/
 ```
 
-Each release also carries a build provenance attestation. With the
+The tarball also contains the documentation, `compose.yml` and the systemd unit
+used for [hosting](docs/hosting.md).
+
+Each release carries a build provenance attestation. With the
 [GitHub CLI](https://cli.github.com/), you can check that a download was built
 by this repository's release workflow:
 
@@ -87,8 +92,8 @@ gh attestation verify "peerbackup-$VERSION-linux-$ARCH.tar.gz" --repo nisseknuds
 docker pull ghcr.io/nisseknudsen/peerbackup:latest
 ```
 
-The image is built for `linux/amd64` and `linux/arm64` and includes restic. Tags
-are the exact version (`0.1.0`), the minor line (`0.1`), and `latest`. See
+Built for `linux/amd64` and `linux/arm64`, with restic included. Tags are the
+exact version (`0.1.0`), the minor line (`0.1`), and `latest`. See
 [docs/docker.md](docs/docker.md) for how to run it.
 
 ### From source
@@ -100,11 +105,18 @@ cargo build --release --locked
 sudo install -m 0755 target/release/peerbackup /usr/local/bin/
 ```
 
+### Upgrading
+
+Replace the binary, or pull the new image. Configuration and recorded results
+carry over. Read the [changelog](CHANGELOG.md) first: until 1.0.0, a new minor
+version may change behaviour.
+
 ## Quick start
 
-One person hosts, the other sends. Both can do both, for each other.
+Two friends, Bob and Alice. Bob has spare disk space and hosts; Alice backs up
+to him. Each can also do the reverse for the other.
 
-### 1. Host: give a friend some space
+### 1. Bob: give Alice some space
 
 ```sh
 peerbackup host quickstart alice
@@ -116,30 +128,39 @@ creates a login for `alice`, checks that it works, and prints an invite:
 ```
 Ready. Send both of these to alice, over something you trust:
 
-  URL:      rest:http://alice@your-host:51515/alice/
+  URL:      rest:http://alice@bob.example.net:51515/alice/
   Password: <generated>
 
 They run:
-  peerbackup connect 'rest:http://alice@your-host:51515/alice/' --source /path/to/back/up
+  peerbackup connect 'rest:http://alice@bob.example.net:51515/alice/' --source /path/to/back/up
 
 and paste the password when it asks.
+
+Storage:   /home/bob/.local/share/peerbackup-data
+Port 51515 must reach this machine. Use TLS if it is exposed to the
+internet: see the README.
 ```
 
-It needs no root. Storage goes to `~/.local/share/peerbackup-data` (change it
-with `PB_DATA=`), and the server listens on port 51515 (change it with
-`PB_PORT=`).
+- The host part of the URL is this machine's hostname (`hostname -f`). If Alice
+  cannot reach it by that name, give her an address she can reach instead, and
+  make sure port 51515 is open or forwarded to this machine.
+- `quickstart` needs no root, but your user must be able to use Docker, which is
+  root-equivalent access to the machine.
+- Storage goes to `~/.local/share/peerbackup-data` (change it with `PB_DATA=`),
+  and the port is 51515 (change it with `PB_PORT=`). The server restarts on its
+  own after a reboot.
 
 > **Use TLS before exposing the port to the internet.** The invite URL is plain
 > HTTP, which sends the login password with every request. Backups stay
 > encrypted either way, but anyone on the network path could read the login and
-> then read or add to your friend's repository. On a LAN or a VPN, plain HTTP is
-> fine. Otherwise, put the server behind a reverse proxy or give it a
-> certificate: see [docs/hosting.md](docs/hosting.md#tls).
+> then read or add to Alice's repository. On a LAN or a VPN, plain HTTP is fine.
+> Otherwise, put the server behind a reverse proxy or give it a certificate: see
+> [docs/hosting.md](docs/hosting.md#tls).
 
-### 2. Send: connect and back up
+### 2. Alice: connect and back up
 
 ```sh
-peerbackup connect 'rest:http://alice@your-host:51515/alice/' --source /srv/data
+peerbackup connect 'rest:http://alice@bob.example.net:51515/alice/' --source /srv/data
 ```
 
 `connect` asks for the password, creates the repository, uploads a small test
@@ -147,7 +168,8 @@ file, downloads it again and compares it. A wrong address or password fails
 within seconds rather than hours into the first backup. Repeat `--source` to
 back up several directories.
 
-Then:
+On Alice's side the peer is named after the host, so this one is `bob`. Pass
+`--name` to choose another name.
 
 ```sh
 peerbackup backup     # send a backup to every peer
@@ -155,16 +177,32 @@ peerbackup verify     # read data back and check it
 peerbackup status     # summary per peer
 ```
 
-### 3. Save your recovery file
+### 3. Alice: save the recovery file
 
 ```sh
 peerbackup recovery export
 ```
 
 This writes every repository address and password, with ready-to-run restic
-commands, to a file. Keep a copy somewhere other than the machine you are
-backing up. **Without it, nobody can decrypt your backups, including you.**
-peerbackup warns when the file is out of date with your configuration.
+commands, to `~/.local/share/peerbackup/recovery.txt` (or `--out <file>`).
+**Without it, nobody can decrypt your backups, including you.** Print it or copy
+it somewhere other than the machine you are backing up, then delete the local
+copy. peerbackup warns when the file is out of date with your configuration.
+
+## Restoring
+
+```sh
+peerbackup snapshots bob                 # list the backups on a peer
+peerbackup restore bob /tmp/restored     # restore the latest one
+peerbackup restore bob /tmp/restored --snapshot 4d14d8df
+```
+
+Files are restored under their original paths, so `/srv/data` comes back as
+`/tmp/restored/srv/data`. The restore also contains peerbackup's small test
+files, under the path of its state directory.
+
+Restoring single files, restoring after losing the machine, and restoring with
+restic alone are covered in [docs/restore.md](docs/restore.md).
 
 ## Commands
 
@@ -188,29 +226,42 @@ Hosting:
 | Command | Does |
 |---|---|
 | `host quickstart <peer>` | Start a server and add a peer, without root |
-| `host adduser <peer>` | Add a login, restart the server, check the login works |
+| `host adduser <peer> [<password>]` | Add a login (generated unless given), restart the server, check the login works |
 | `host provision <peer> <size>` | Create a storage area with its own size limit (root) |
 | `host release <peer>` | Delete a peer's storage area and their backups (root) |
 | `host list [<peer>]` | Storage areas, sizes and usage |
 | `host guard` | Exit non-zero unless every storage area is mounted |
 | `host doctor` | Check this machine is set up to host |
-| `host up\|down` | `docker compose up -d` / `down` with the shipped `compose.yml` |
+| `host up\|down` | `docker compose up -d` / `down`, using `compose.yml` |
 
 Every `host` command accepts `--dry-run`, which prints what it would do and
 changes nothing. Run `peerbackup <command> --help` for the details of each.
+
+### Status
 
 `status` reads results recorded locally and does not contact peers, so it is
 instant and works offline:
 
 ```
+$ peerbackup status
 PEER         STATE       BACKED UP    CHECKED      TEST FILE    READ BACK
-alice        ok          2h ago       1d ago       3d ago       1%
-bob          unchecked   6h ago       12d ago      40d ago      -
+bob          ok          2h ago       20h ago      3d ago       1%
+carol        unchecked   5h ago       12d ago      12d ago      -
+
+Not checked recently: carol. Run `peerbackup verify`.
+error: 1 peer(s) have not been checked within their windows (carol)
 ```
 
-`unchecked` means the latest results are older than the configured windows, not
-that anything is wrong. A peer shows `FAILED` only when data was read back and
-did not match.
+- `ok`: a backup, a data read-back and a test-file restore have all succeeded
+  within their windows (see [configuration](docs/configuration.md#the-config-file)).
+- `unchecked`: at least one of those has not succeeded recently. That can mean
+  checks are simply overdue, that no backup has reached the peer yet, or that
+  recent attempts failed; `status` prints which, and what to run.
+- `FAILED`: data was read back and was wrong, or the peer no longer has a backup
+  it previously accepted.
+
+`status` exits 0 only when every peer is `ok`, which makes it the command to
+alert on.
 
 ## Configuration
 
@@ -219,12 +270,12 @@ default, so the file only needs what you change:
 
 ```toml
 [settings]
-sources = ["/srv/data", "/home/me/documents"]
-upload_limit_kib = 5000     # upload limit in KiB/s; 0 means none
+sources = ["/srv/data", "/home/alice/documents"]
+upload_limit_kib = 5000     # upload limit in KiB/s; the default 0 means none
 
 [[peer]]
-name = "alice"
-url = "rest:http://alice:LOGIN-PASSWORD@your-host:51515/alice/"
+name = "bob"
+url = "rest:http://alice:LOGIN-PASSWORD@bob.example.net:51515/alice/"
 ```
 
 Each peer has two passwords, and they do different jobs:
@@ -239,17 +290,24 @@ Each peer has two passwords, and they do different jobs:
 All settings, timeouts and tuning for distant peers are in
 [docs/configuration.md](docs/configuration.md).
 
-## Scheduling
+## Scheduling and alerts
 
-peerbackup has no scheduler of its own. A systemd timer works well:
+peerbackup has no scheduler of its own. A systemd timer works well. Run it as
+the user who ran `connect`, since that is whose configuration it reads:
 
 ```ini
 # /etc/systemd/system/peerbackup.service
+[Unit]
+Description=peerbackup
+
 [Service]
 Type=oneshot
-# The leading "-" lets verify run even if a backup to one peer failed.
+User=alice
+# "-" lets the next step run when this one fails. `status` runs last and
+# decides whether the unit succeeds.
 ExecStart=-/usr/local/bin/peerbackup backup
-ExecStart=/usr/local/bin/peerbackup verify
+ExecStart=-/usr/local/bin/peerbackup verify
+ExecStart=/usr/local/bin/peerbackup status
 ```
 
 ```ini
@@ -267,21 +325,28 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now peerbackup.timer
 ```
 
-`verify` uses its exit code to tell its two kinds of failure apart, so you can
-alert on them differently:
+The unit fails when any peer is not `ok`, so alert on that, for example with
+`OnFailure=` or your monitoring of failed units. A single failed backup does not
+fail it straight away; a peer that keeps failing does, once its results are
+older than `liveness_hours` (48 by default).
 
-| Exit | Meaning |
-|---|---|
-| 0 | Data was read back and was correct |
-| 1 | Data was read back and was wrong |
-| 2 | Nothing could be read back (for example, the peer was unreachable) |
+Exit codes, for scripts:
+
+| Command | 0 | 1 | 2 |
+|---|---|---|---|
+| `status` | every peer is `ok` | any peer is not `ok`, or an error | |
+| `verify` | no damage found, and at least one peer was checked | damage found, or an error such as a bad config | no peer could be checked at all |
+
+`verify` exits 0 when one peer is unreachable but another was checked, so use
+`status`, not `verify`, to notice a single peer going quiet.
 
 ## Documentation
 
 | Document | Covers |
 |---|---|
+| [docs/restore.md](docs/restore.md) | Restoring single files, after losing the machine, with restic alone; removing old backups |
 | [docs/configuration.md](docs/configuration.md) | Every setting, timeouts, throughput to distant peers, environment variables |
-| [docs/hosting.md](docs/hosting.md) | Running a server long-term: reverse proxies, TLS, per-peer storage limits, systemd, maintenance windows |
+| [docs/hosting.md](docs/hosting.md) | Running a server long-term: reverse proxies, TLS, per-peer storage limits, systemd, removing peers |
 | [docs/docker.md](docs/docker.md) | Running the client and the host in Docker |
 | [docs/troubleshooting.md](docs/troubleshooting.md) | Common errors and what to do about them |
 | [docs/design.md](docs/design.md) | How verification works, the security model, and design decisions |

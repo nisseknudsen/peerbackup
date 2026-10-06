@@ -6,14 +6,20 @@ runs the upstream rest-server image; see [Hosting](#hosting) below.
 
 ## Sending backups
 
+Create the config and state directories first. Docker creates a missing
+bind-mount source owned by root, and the container, which runs as you, then
+cannot write to it.
+
 ```sh
+mkdir -p ~/.config/peerbackup ~/.local/share/peerbackup
+
 docker run --rm -i \
   --user "$(id -u):$(id -g)" \
   -v ~/.config/peerbackup:/config \
   -v ~/.local/share/peerbackup:/state \
   -v /srv/data:/srv/data:ro \
   ghcr.io/nisseknudsen/peerbackup \
-  connect 'rest:http://alice@your-host:51515/alice/' --source /srv/data < password.txt
+  connect 'rest:http://alice@bob.example.net:51515/alice/' --source /srv/data < password.txt
 ```
 
 After that, the same mounts with `backup`, `verify` or `status` in place of
@@ -69,7 +75,7 @@ docker run --rm \
   -v ~/.config/peerbackup:/config \
   -v ~/.local/share/peerbackup:/state \
   -v /tmp/restored:/restored \
-  ghcr.io/nisseknudsen/peerbackup restore alice /restored
+  ghcr.io/nisseknudsen/peerbackup restore bob /restored
 ```
 
 Files are restored under their original paths, so this produces
@@ -78,7 +84,7 @@ Files are restored under their original paths, so this produces
 ### Scheduling
 
 Run the container from a systemd timer or cron the same way as the binary (see
-the [README](../README.md#scheduling)), with `docker run --rm` and the mounts
+the [README](../README.md#scheduling-and-alerts)), with `docker run --rm` and the mounts
 above as the command.
 
 ## Hosting

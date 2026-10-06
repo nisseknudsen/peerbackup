@@ -1,8 +1,5 @@
 # Security policy
 
-peerbackup handles repository passwords and decides whether backups are
-intact, so security reports are taken seriously.
-
 ## Reporting a vulnerability
 
 Please do not open a public issue. Report it privately through GitHub instead:
