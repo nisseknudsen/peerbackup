@@ -332,6 +332,15 @@ if echo "$OUT" | grep -q "connect 'rest:http://invitee@"; then
 else
   bad "the suggested connect command is not password-free"
 fi
+# Once. `adduser` used to print it as well, under "this is the only time it is
+# shown", which the invite then contradicted a few lines later.
+PW=$(echo "$OUT" | sed -n 's/^ *Password: *//p' | head -1)
+if [ -n "$PW" ] && [ "$(grep -o -- "$PW" <<<"$OUT" | wc -l)" -eq 1 ]; then
+  ok "the password appears exactly once"
+else
+  bad "the password appears $(grep -o -- "${PW:-x}" <<<"$OUT" | wc -l) times"
+  echo "$OUT" | sed 's/^/        /' | head -8
+fi
 docker rm -f pb-invite-probe >/dev/null 2>&1 || true
 
 hdr "QUIET never hides a generated password"
