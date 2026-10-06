@@ -6,42 +6,92 @@
 # a configured source is missing, so a forgotten mount fails immediately rather
 # than producing a backup without your data in it.
 
-# No `--target`: the rust:alpine images are already musl-hosted, so the default
-# target is the static one on whatever architecture is building. Naming
-# x86_64-unknown-linux-musl outright meant the image could not be built for
-# arm64 at all, which rules out a fair share of the homeservers this is for.
+# Supported platforms: linux/amd64 and linux/arm64.
+#
+# Needs BuildKit, which has been Docker's default builder since 23.0. The legacy
+# builder (DOCKER_BUILDKIT=0) does not set $BUILDPLATFORM and stops at the first
+# line with a platform parse error -- loudly, before anything is built.
+#
+# The build stage runs on the machine doing the build ($BUILDPLATFORM) and
+# cross-compiles to the requested one ($TARGETARCH). Compiling Rust under QEMU
+# for an arm64 image took long enough to be the slowest thing in the pipeline,
+# and it is unnecessary: the binary is static musl, so the only cross tool it
+# needs is a linker, and the toolchain already ships one in rust-lld. No cross
+# gcc, no extra packages.
+#
 # Pinned by digest, not by tag, for the same reason restic is pinned by
 # checksum: `rust:1.88-alpine` is a moving target that upstream can repoint
 # under you. These are manifest-list digests, so multi-architecture builds still
 # resolve to the right image. To bump one:
 #   docker buildx imagetools inspect rust:1.88-alpine
-FROM rust:1.88-alpine@sha256:9dfaae478ecd298b6b5a039e1f2cc4fc040fc818a2de9aa78fa714dea036574d AS build
+FROM --platform=$BUILDPLATFORM rust:1.88-alpine@sha256:9dfaae478ecd298b6b5a039e1f2cc4fc040fc818a2de9aa78fa714dea036574d AS build
+ARG TARGETARCH
 RUN apk add --no-cache musl-dev
+# The Rust target for the requested platform, written to a file so the later
+# RUN steps agree on it.
+#
+# TARGETARCH is required rather than defaulted from `uname -m`. This stage runs
+# on the build platform, so uname reports the build machine -- a fallback here
+# would compile an amd64 binary for an arm64 image and say nothing.
+#
+# rust-lld is the linker only when cross-compiling. This image's host triple is
+# itself a musl one, and cargo applies a target's linker setting to host builds
+# too when the two triples match -- so setting it unconditionally also linked
+# the proc-macro crates (serde_derive, clap_derive) with rust-lld, and those are
+# dynamic libraries that need the system linker. A native build keeps cc.
+RUN set -eu; \
+    case "${TARGETARCH:-}" in \
+      amd64) t=x86_64-unknown-linux-musl ;; \
+      arm64) t=aarch64-unknown-linux-musl ;; \
+      "")    echo "TARGETARCH is not set: build with BuildKit (docker buildx build)" >&2; exit 1 ;; \
+      *)     echo "unsupported architecture '$TARGETARCH': peerbackup builds for amd64 and arm64" >&2; exit 1 ;; \
+    esac; \
+    host="$(rustc -vV | sed -n 's/^host: //p')"; \
+    if [ "$t" = "$host" ]; then \
+      : > /rust-env; \
+    else \
+      rustup target add "$t"; \
+      echo "export CARGO_TARGET_$(echo "$t" | tr 'a-z-' 'A-Z_')_LINKER=rust-lld" > /rust-env; \
+    fi; \
+    echo "$t" > /rust-target
 WORKDIR /src
 # Dependencies first, against a stub main, so editing src does not rebuild the
 # whole tree. Cargo.lock is copied with it, so the cached layer is invalidated
 # by a dependency change and by nothing else.
 COPY Cargo.toml Cargo.lock ./
 RUN mkdir -p src && echo 'fn main() {}' > src/main.rs \
- && cargo build --release \
+ && . /rust-env && cargo build --release --locked --target "$(cat /rust-target)" \
  && rm -rf src
 COPY src ./src
 # Cargo decides on mtime, and COPY can preserve one older than the stub build.
-RUN touch src/main.rs && cargo build --release
+RUN touch src/main.rs \
+ && . /rust-env && cargo build --release --locked --target "$(cat /rust-target)" \
+ && install -D -m 0755 "target/$(cat /rust-target)/release/peerbackup" /out/peerbackup
 
-# restic stays pinned by checksum, per architecture. Only the checksum actually
-# verified upstream is recorded here: a build for an architecture with no pinned
-# digest fails loudly rather than falling back to an unverified download, which
-# would quietly drop the property this pinning exists for. To add one, take the
-# value from the release's own SHA256SUMS and put it below.
-FROM alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc AS restic
-# No default. BuildKit sets TARGETARCH; the classic builder does not, and a
-# default of amd64 meant `DOCKER_BUILDKIT=0 docker build` on an arm64 host
-# downloaded the amd64 restic, verified it against its own correct checksum, and
-# installed it next to an arm64 peerbackup. The failure then surfaced as
-# `exec format error` at backup time rather than at build time. Falling back to
-# the machine's own architecture is right for the classic builder and is never
-# consulted under BuildKit.
+# The binary alone. The release workflow exports this stage with
+# `--target binary --output type=local` and publishes what comes out, then
+# builds the image from the same builder. The build stage is cached between the
+# two, so the binary on the releases page and the binary in the image are the
+# same bytes -- and the workflow checks that they are before tagging anything.
+FROM scratch AS binary
+COPY --from=build /out/peerbackup /peerbackup
+
+# restic stays pinned by checksum, per architecture. Both values below were
+# checked against restic's own SHA256SUMS for the release, and that file's
+# signature against restic's release key (CF8F18F2844575973F79D4E191A6868BD3F7A907).
+# A build for an architecture with no pinned digest fails loudly rather than
+# falling back to an unverified download, which would quietly drop the property
+# this pinning exists for.
+#
+# Runs on the build platform too: it only downloads and verifies a file for the
+# target architecture, and never executes it, so there is nothing to emulate.
+FROM --platform=$BUILDPLATFORM alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc AS restic
+# Required, never defaulted. A default of amd64 once meant an arm64 build fetched
+# the amd64 restic, verified it against its own correct checksum, and installed
+# it next to an arm64 peerbackup -- which surfaced as `exec format error` at
+# backup time rather than at build time. Falling back to `uname -m` would now be
+# worse still: this stage runs on the build platform, so uname names the build
+# machine, not the image being built.
 ARG TARGETARCH
 ARG RESTIC_VERSION=0.19.1
 ARG RESTIC_SHA256_amd64=f415415624dcc452f2a02b8c33641791a8c6d6d3b65bbb3543fcf9a25151585c
@@ -49,11 +99,8 @@ ARG RESTIC_SHA256_arm64=a5f64aaab53d51e311fa3829124c5b703f2d14cf187d8640b6be3b2b
 RUN set -eu; \
     arch="${TARGETARCH:-}"; \
     if [ -z "$arch" ]; then \
-      case "$(uname -m)" in \
-        x86_64)  arch=amd64 ;; \
-        aarch64) arch=arm64 ;; \
-        *)       arch="$(uname -m)" ;; \
-      esac; \
+      echo "TARGETARCH is not set: build with BuildKit (docker buildx build)" >&2; \
+      exit 1; \
     fi; \
     case "$arch" in \
       amd64) sha="$RESTIC_SHA256_amd64" ;; \
@@ -86,7 +133,7 @@ FROM alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6
 # and is what this replaces; baking it in means nobody has to know that.
 RUN apk add --no-cache ca-certificates tini
 COPY --from=restic /usr/local/bin/restic /usr/local/bin/restic
-COPY --from=build /src/target/release/peerbackup /usr/local/bin/peerbackup
+COPY --from=binary /peerbackup /usr/local/bin/peerbackup
 
 # Config and recorded results live here. Both must be mounted, or every run
 # starts from nothing and status has no history to report.
