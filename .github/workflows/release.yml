@@ -168,7 +168,14 @@ jobs:
           for arch in amd64 arm64; do
             name="peerbackup-${VERSION}-linux-${arch}"
             install -D -m 0755 "out/linux_${arch}/peerbackup" "stage/$name/peerbackup"
-            install -m 0644 LICENSE README.md "stage/$name/"
+            install -m 0644 LICENSE README.md CHANGELOG.md SECURITY.md RELEASING.md "stage/$name/"
+            # What docs/hosting.md tells a host to install. Without these, the
+            # hosting guide only worked from a git checkout, and `host up`
+            # looks for compose.yml beside you.
+            install -m 0644 compose.yml deploy/systemd/peerbackup-rest.service "stage/$name/"
+            # So the README's links resolve offline, from the tarball.
+            install -d -m 0755 "stage/$name/docs"
+            install -m 0644 docs/*.md "stage/$name/docs/"
             tar --sort=name --owner=0 --group=0 --numeric-owner --mtime="@$epoch" \
               -C stage -cf - "$name" | gzip -9n > "dist/$name.tar.gz"
           done
