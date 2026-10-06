@@ -411,10 +411,14 @@ pub fn adduser(
         ));
     }
 
+    // `info`, not `say`: QUIET silences progress chatter, and this is not
+    // chatter, it is the result. Under `say`, `QUIET=1 host adduser alice`
+    // created a login and never showed its password, which is stored nowhere
+    // in plaintext -- a working login nobody could use.
     if generated {
-        ctx.say(&format!("generated password for '{peer}': {pw}"));
-        ctx.say("send it over a channel you trust, apart from the URL. It is not stored");
-        ctx.say("anywhere in plaintext, so this is the only time it is shown.");
+        ctx.info(&format!("generated password for '{peer}': {pw}"));
+        ctx.info("send it over a channel you trust, apart from the URL. It is not stored");
+        ctx.info("anywhere in plaintext, so this is the only time it is shown.");
     }
 
     if ctx.would(&format!(

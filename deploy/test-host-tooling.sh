@@ -334,6 +334,18 @@ else
 fi
 docker rm -f pb-invite-probe >/dev/null 2>&1 || true
 
+hdr "QUIET never hides a generated password"
+# The password `adduser` generates is stored nowhere in plaintext; printing it
+# is the command's result. It used to go through the same switch as progress
+# chatter, so QUIET=1 created a login and never showed anyone its password.
+OUT=$(QUIET=1 PB_CONTAINER=pb-quiet-probe "${HOST[@]}" adduser quietpeer --dry-run 2>&1)
+if echo "$OUT" | grep -qE "generated password for 'quietpeer': [A-Za-z0-9]{16,}"; then
+  ok "QUIET=1 still prints the generated password"
+else
+  bad "QUIET=1 hid the generated password"
+  echo "$OUT" | sed 's/^/        /' | tail -6
+fi
+
 hdr "compose.yml"
 COMPOSE="$(dirname "$0")/../compose.yml"
 grep -q 'user:' "$COMPOSE" && ok "compose sets user (host can read its own data)" \
