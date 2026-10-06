@@ -291,7 +291,10 @@ pub fn quickstart(ctx: &Ctx, peer: &PeerName, o: &ServerOpts) -> Res {
         return Ok(());
     }
 
-    let pw = adduser(ctx, peer, None, o).map_err(|e| {
+    // The invite below prints the password. Letting `adduser` print it too
+    // showed it twice, the first time under "this is the only time it is
+    // shown" -- which the invite then contradicted.
+    let pw = adduser(ctx, peer, None, o, ShowPassword::No).map_err(|e| {
         format!("server is running but the login for '{peer}' could not be created\n       {e}")
     })?;
     let pw = pw.ok_or_else(|| format!("no password was generated for '{peer}'"))?;
@@ -372,6 +375,13 @@ fn server_run_args(o: &ServerOpts, user: &str) -> Vec<String> {
 /// front of it negotiates ALPN on its own, and the README covers that case.
 const SERVE_HTTP1_ONLY: &str = "GODEBUG=http2server=0";
 
+/// Whether [`adduser`] prints a password it generated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShowPassword {
+    Yes,
+    No,
+}
+
 /// Create a login, restart, and verify it before handing it to anyone.
 ///
 /// rest-server loads .htpasswd ONCE at startup and never reloads it. Its own
@@ -381,11 +391,15 @@ const SERVE_HTTP1_ONLY: &str = "GODEBUG=http2server=0";
 ///
 /// So this exists purely to make the correct sequence unavoidable. Returns the
 /// generated password when it generated one.
+///
+/// `show` decides whether a generated password is printed here. `host adduser`
+/// prints it; `quickstart` prints it once, in the invite, instead.
 pub fn adduser(
     ctx: &Ctx,
     peer: &PeerName,
     password: Option<&str>,
     o: &ServerOpts,
+    show: ShowPassword,
 ) -> Result<Option<String>, String> {
     let (pw, generated) = match password {
         Some(p) => (check_password(p)?.to_owned(), false),
@@ -411,10 +425,14 @@ pub fn adduser(
         ));
     }
 
-    if generated {
-        ctx.say(&format!("generated password for '{peer}': {pw}"));
-        ctx.say("send it over a channel you trust, apart from the URL. It is not stored");
-        ctx.say("anywhere in plaintext, so this is the only time it is shown.");
+    // `info`, not `say`: QUIET silences progress chatter, and this is not
+    // chatter, it is the result. Under `say`, `QUIET=1 host adduser alice`
+    // created a login and never showed its password, which is stored nowhere
+    // in plaintext -- a working login nobody could use.
+    if generated && show == ShowPassword::Yes {
+        ctx.info(&format!("generated password for '{peer}': {pw}"));
+        ctx.info("send it over a channel you trust, apart from the URL. It is not stored");
+        ctx.info("anywhere in plaintext, so this is the only time it is shown.");
     }
 
     if ctx.would(&format!(

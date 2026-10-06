@@ -195,6 +195,7 @@ fn run_host(cmd: HostCmd, flags: host::Flags) -> Res {
             &peer,
             password.as_deref(),
             &host::server::ServerOpts::from_env()?,
+            host::server::ShowPassword::Yes,
         )
         .map(|_| ()),
         HostCmd::Release { peer } => host::grant::release(&ctx, &peer),

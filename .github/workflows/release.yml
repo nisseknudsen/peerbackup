@@ -1,0 +1,306 @@
+name: Release
+
+# Publishes a release when a version tag is pushed:
+#
+#   * static binaries for linux/amd64 and linux/arm64, as tarballs, with SHA256SUMS
+#   * a multi-arch image at ghcr.io/<owner>/peerbackup
+#   * a GitHub release whose notes are that version's CHANGELOG.md section
+#
+# See RELEASING.md for the branch model and the steps that lead up to a tag.
+#
+# Run it by hand (Actions -> Release -> Run workflow) for a rehearsal: it builds
+# both platforms, runs every check below, and publishes nothing. Worth doing
+# once before the first real tag, since a release pipeline is otherwise only
+# ever tested by releasing.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+# Never cancel a release partway: a half-published release is worse than a slow
+# one. A second push of the same tag waits instead.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+# Nothing by default; each job asks for exactly what it uses.
+permissions: {}
+
+env:
+  PLATFORMS: linux/amd64,linux/arm64
+  # The same pins as ci.yml, which checks that they agree. QEMU is needed only
+  # for the few RUN steps in the arm64 runtime stage and for running the arm64
+  # image during verification; the Rust build itself cross-compiles natively.
+  BINFMT_IMAGE: tonistiigi/binfmt:qemu-v10.2.3@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0
+  BUILDKIT_IMAGE: moby/buildkit:v0.25.1@sha256:79cc6476ab1a3371c9afd8b44e7c55610057c43e18d9b39b68e2b0c2475cc1b6
+
+jobs:
+  validate:
+    name: validate the tag
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      rehearsal: ${{ steps.meta.outputs.rehearsal }}
+      version: ${{ steps.meta.outputs.version }}
+      prerelease: ${{ steps.meta.outputs.prerelease }}
+      latest: ${{ steps.meta.outputs.latest }}
+      image_tags: ${{ steps.meta.outputs.image_tags }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          # Every branch and tag: the release-branch check and the floating
+          # image tags both need to see them.
+          fetch-depth: 0
+
+      - name: work out what is being released
+        id: meta
+        env:
+          EVENT: ${{ github.event_name }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          cargo_version=$(grep -m1 -oP '^version = "\K[^"]+' Cargo.toml)
+
+          if [ "$EVENT" = workflow_dispatch ]; then
+            echo "Rehearsal: building $cargo_version from $GITHUB_REF, publishing nothing."
+            {
+              echo "rehearsal=true"
+              echo "version=$cargo_version"
+              echo "prerelease=false"
+              echo "latest=false"
+              echo "image_tags="
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          meta=$(git tag -l 'v*' | .github/scripts/release.sh meta "$TAG" "$cargo_version")
+          echo "$meta"
+          { echo "rehearsal=false"; echo "$meta"; } >> "$GITHUB_OUTPUT"
+          version=$(sed -n 's/^version=//p' <<<"$meta")
+          branch=$(sed -n 's/^branch=//p' <<<"$meta")
+
+          # The branch model is only real if it is enforced: a release is cut
+          # from its release branch, never straight from main.
+          if ! git rev-parse -q --verify "refs/remotes/origin/$branch" >/dev/null; then
+            echo "::error::$TAG needs a $branch branch to be tagged from, and there is none. See RELEASING.md."
+            exit 1
+          fi
+          commit=$(git rev-parse "$TAG^{commit}")
+          if ! git merge-base --is-ancestor "$commit" "origin/$branch"; then
+            echo "::error::$TAG points at $commit, which is not on $branch. Tag the release branch, not main."
+            exit 1
+          fi
+
+          # Fail here, in seconds, rather than after the full test suite.
+          .github/scripts/release.sh notes "$version" < CHANGELOG.md > /dev/null
+
+  # Nothing is published from a commit that has not passed the whole suite,
+  # including the disaster-recovery test and the arm64 checks.
+  ci:
+    name: full test suite
+    needs: validate
+    permissions:
+      contents: read
+    uses: ./.github/workflows/ci.yml
+
+  publish:
+    name: build, verify, publish
+    needs: [validate, ci]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write      # create the GitHub release and upload its assets
+      packages: write      # push to ghcr.io
+      id-token: write      # sign provenance attestations
+      attestations: write  # store them
+    env:
+      REHEARSAL: ${{ needs.validate.outputs.rehearsal }}
+      VERSION: ${{ needs.validate.outputs.version }}
+      PRERELEASE: ${{ needs.validate.outputs.prerelease }}
+      LATEST: ${{ needs.validate.outputs.latest }}
+      IMAGE_TAGS: ${{ needs.validate.outputs.image_tags }}
+      TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: set up QEMU and a pinned BuildKit
+        run: |
+          set -euo pipefail
+          docker run --privileged --rm "$BINFMT_IMAGE" --install arm64
+          docker buildx create --name release --driver docker-container \
+            --driver-opt "image=$BUILDKIT_IMAGE" --use
+          docker buildx inspect --bootstrap
+          # ghcr.io wants lowercase, and repository names need not be.
+          echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+
+      # The `binary` stage of the Dockerfile, exported. The image below is built
+      # by the same builder, so its build stage comes from this cache and the
+      # two carry the same bytes.
+      - name: build the binaries
+        run: |
+          set -euo pipefail
+          docker buildx build --platform "$PLATFORMS" --target binary \
+            --output type=local,dest=out .
+          # Captured, then matched: `file | grep -q` under pipefail can fail on
+          # SIGPIPE when grep exits before its writer has finished.
+          for want in "amd64 x86-64" "arm64 aarch64"; do
+            arch=${want% *} machine=${want#* }
+            desc=$(file "out/linux_$arch/peerbackup")
+            echo "$desc"
+            [[ $desc == *"$machine"*static* ]] \
+              || { echo "::error::linux/$arch binary is not a static $machine executable"; exit 1; }
+          done
+          # QEMU is registered, so the arm64 binary runs here too.
+          for arch in amd64 arm64; do
+            got=$("out/linux_$arch/peerbackup" --version)
+            [ "$got" = "peerbackup $VERSION" ] \
+              || { echo "::error::linux/$arch binary reports '$got', expected 'peerbackup $VERSION'"; exit 1; }
+          done
+
+      - name: package
+        run: |
+          set -euo pipefail
+          # Timestamps and ownership pinned to the commit, so the tarballs are
+          # reproducible from the same source.
+          epoch=$(git log -1 --format=%ct)
+          mkdir -p dist stage
+          for arch in amd64 arm64; do
+            name="peerbackup-${VERSION}-linux-${arch}"
+            install -D -m 0755 "out/linux_${arch}/peerbackup" "stage/$name/peerbackup"
+            install -m 0644 LICENSE README.md CHANGELOG.md SECURITY.md RELEASING.md "stage/$name/"
+            # What docs/hosting.md tells a host to install. Without these, the
+            # hosting guide only worked from a git checkout, and `host up`
+            # looks for compose.yml beside you.
+            install -m 0644 compose.yml deploy/systemd/peerbackup-rest.service "stage/$name/"
+            # So the README's links resolve offline, from the tarball.
+            install -d -m 0755 "stage/$name/docs"
+            install -m 0644 docs/*.md "stage/$name/docs/"
+            tar --sort=name --owner=0 --group=0 --numeric-owner --mtime="@$epoch" \
+              -C stage -cf - "$name" | gzip -9n > "dist/$name.tar.gz"
+          done
+          (cd dist && sha256sum -- *.tar.gz > SHA256SUMS)
+          {
+            echo "### peerbackup $VERSION"
+            echo '```'
+            cat dist/SHA256SUMS
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # A rehearsal loads each platform locally instead of pushing, so the same
+      # checks run against the same build without touching the registry.
+      - name: build the image (rehearsal)
+        if: env.REHEARSAL == 'true'
+        run: |
+          set -euo pipefail
+          for arch in amd64 arm64; do
+            docker buildx build --platform "linux/$arch" --load -t "peerbackup:rehearsal-$arch" .
+          done
+          .github/scripts/check-image.sh "$VERSION" out \
+            linux/amd64=peerbackup:rehearsal-amd64 linux/arm64=peerbackup:rehearsal-arm64
+          echo "Rehearsal complete: both platforms built and verified. Nothing was published." \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+
+      # Pushed by digest, with no tag. Nothing anyone can pull by name exists
+      # until the checks below have passed against what was actually pushed.
+      - name: push the image, untagged
+        id: push
+        if: env.REHEARSAL == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          echo "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          description=$(grep -m1 -oP '^description = "\K[^"]+' Cargo.toml)
+          license=$(grep -m1 -oP '^license = "\K[^"]+' Cargo.toml)
+          source="https://github.com/$GITHUB_REPOSITORY"
+          # `source` is also what links the package to this repository on
+          # ghcr.io. Labels go on each image, annotations on the index, which
+          # is what the registry shows for a multi-arch image.
+          docker buildx build --platform "$PLATFORMS" \
+            --provenance=false --sbom=false \
+            --label "org.opencontainers.image.title=peerbackup" \
+            --label "org.opencontainers.image.description=$description" \
+            --label "org.opencontainers.image.source=$source" \
+            --label "org.opencontainers.image.version=$VERSION" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --label "org.opencontainers.image.licenses=$license" \
+            --annotation "index:org.opencontainers.image.description=$description" \
+            --annotation "index:org.opencontainers.image.source=$source" \
+            --annotation "index:org.opencontainers.image.licenses=$license" \
+            --output "type=image,name=$IMAGE,push-by-digest=true,name-canonical=true,push=true" \
+            --metadata-file meta.json .
+          digest=$(jq -r '."containerimage.digest"' meta.json)
+          [[ $digest == sha256:* ]] || { echo "::error::no digest in build metadata"; cat meta.json; exit 1; }
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "Pushed $IMAGE@$digest (untagged)"
+
+      - name: verify the pushed image
+        if: env.REHEARSAL == 'false'
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          set -euo pipefail
+          PULL=1 .github/scripts/check-image.sh "$VERSION" out \
+            "linux/amd64=$IMAGE@$DIGEST" "linux/arm64=$IMAGE@$DIGEST"
+
+      # Provenance needs artifact attestations, which GitHub offers on private
+      # repositories only under Enterprise Cloud. Skipped while this repository
+      # is private, rather than failing the release.
+      - name: attest the binaries
+        if: env.REHEARSAL == 'false' && !github.event.repository.private
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/*.tar.gz
+
+      - name: attest the image
+        if: env.REHEARSAL == 'false' && !github.event.repository.private
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+
+      - name: note skipped attestations
+        if: env.REHEARSAL == 'false' && github.event.repository.private
+        run: |
+          echo "::warning::Provenance attestations skipped: this repository is private. They run automatically once it is public."
+
+      # Draft first. If anything after this fails, the release stays a draft
+      # nobody can see, and the image stays untagged.
+      - name: draft the GitHub release
+        if: env.REHEARSAL == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          .github/scripts/release.sh notes "$VERSION" < CHANGELOG.md > notes.md
+          args=(--draft --verify-tag --title "peerbackup $VERSION" --notes-file notes.md)
+          [ "$PRERELEASE" = true ] && args+=(--prerelease)
+          gh release create "$TAG" "${args[@]}" dist/*
+
+      - name: tag the image
+        if: env.REHEARSAL == 'false'
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          set -euo pipefail
+          args=()
+          for t in $IMAGE_TAGS; do args+=(-t "$IMAGE:$t"); done
+          docker buildx imagetools create "${args[@]}" "$IMAGE@$DIGEST"
+          {
+            echo "### Image"
+            echo "\`$IMAGE@$DIGEST\`"
+            echo
+            for t in $IMAGE_TAGS; do echo "- \`$IMAGE:$t\`"; done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: publish the release
+        if: env.REHEARSAL == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # `latest` is computed, not assumed: a patch to an older line must not
+          # become the release GitHub shows first.
+          gh release edit "$TAG" --draft=false --latest="$LATEST"

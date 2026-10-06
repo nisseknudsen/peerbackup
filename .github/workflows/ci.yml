@@ -2,13 +2,17 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, "release/**"]
   pull_request:
   workflow_dispatch:
+  # The release workflow runs this whole file before publishing anything.
+  workflow_call:
 
 # A branch push and its pull request used to fire the same seven jobs twice, and
 # a second push while the first was still running left both racing. `push` is
-# now main only; branches are covered by their pull request.
+# main and the release branches only; other branches are covered by their pull
+# request. Release branches are pushed to directly when a fix is backported, so
+# they are tested on push like main.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -28,6 +32,9 @@ env:
   # Pinned, checksum-verified. A backup tool should not float its engine version.
   RESTIC_VERSION: "0.19.1"
   RESTIC_SHA256: "f415415624dcc452f2a02b8c33641791a8c6d6d3b65bbb3543fcf9a25151585c"
+  # Shared with release.yml; the `pins` job checks the two agree.
+  BINFMT_IMAGE: tonistiigi/binfmt:qemu-v10.2.3@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0
+  BUILDKIT_IMAGE: moby/buildkit:v0.25.1@sha256:79cc6476ab1a3371c9afd8b44e7c55610057c43e18d9b39b68e2b0c2475cc1b6
 
 jobs:
   pins:
@@ -53,6 +60,11 @@ jobs:
           check Dockerfile "RESTIC_SHA256_amd64=${RESTIC_SHA256}"
           check .github/workflows/spike.yml "${RESTIC_VERSION}"
           check .github/workflows/spike.yml "${RESTIC_SHA256}"
+          # CI builds the arm64 image with these, and the release builds the
+          # one it publishes with them. If they drift, CI is no longer testing
+          # what ships.
+          check .github/workflows/release.yml "BINFMT_IMAGE: ${BINFMT_IMAGE}"
+          check .github/workflows/release.yml "BUILDKIT_IMAGE: ${BUILDKIT_IMAGE}"
           exit "$fail"
       # Same argument for the toolchain: the README promises 1.88 and only the
       # Dockerfile ever compiles with it.
@@ -60,7 +72,9 @@ jobs:
         run: |
           set -euo pipefail
           msrv=$(grep -oP 'rust-version = "\K[^"]+' Cargo.toml)
-          grep -qF "FROM rust:${msrv}-alpine" Dockerfile \
+          # Matches with or without `--platform=...`: the build stage runs on
+          # the build platform and cross-compiles.
+          grep -qE "^FROM (--platform=\S+ )?rust:${msrv//./\\.}-alpine" Dockerfile \
             || { echo "::error::Cargo.toml says rust-version ${msrv}, Dockerfile disagrees"; exit 1; }
           grep -qF "Rust ${msrv}+" README.md \
             || { echo "::error::README does not state Rust ${msrv}+"; exit 1; }
@@ -101,7 +115,29 @@ jobs:
             spike/lifecycle-spike.sh \
             tests/end_to_end.sh \
             tests/docker.sh \
-            tests/lib/scratch.sh
+            tests/lib/scratch.sh \
+            .github/scripts/release.sh \
+            .github/scripts/release.test.sh \
+            .github/scripts/check-image.sh
+
+  release-scripts:
+    name: release tooling
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      # Tag validation and the floating image tags. A wrong `latest` does not
+      # fail anything: everyone pulling it just silently gets an older line.
+      - run: .github/scripts/release.test.sh
+      # On a release branch the CHANGELOG has to have an entry for the version
+      # about to be tagged, or the release fails after the full test suite
+      # instead of before it. Not on main: main collects changes under
+      # [Unreleased] until a release branch is cut.
+      - name: CHANGELOG has an entry for the version in Cargo.toml
+        if: startsWith(github.ref, 'refs/heads/release/') || startsWith(github.base_ref, 'release/') || startsWith(github.ref, 'refs/tags/')
+        run: |
+          set -euo pipefail
+          v=$(grep -m1 -oP '^version = "\K[^"]+' Cargo.toml)
+          .github/scripts/release.sh notes "$v" < CHANGELOG.md
 
   rust:
     name: rust (fmt, clippy, tests)
@@ -130,6 +166,62 @@ jobs:
       - name: cargo test
         run: cargo test
         timeout-minutes: 5
+
+  # arm64 is a supported platform, so it is tested, not only built. The test
+  # binary is cross-compiled (static musl, linked with the toolchain's own
+  # rust-lld) and run under QEMU, registered with binfmt so it executes like
+  # any other program.
+  arm64:
+    name: unit tests on arm64 (emulated)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable, resolved 2026-09-09
+        with:
+          targets: aarch64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: aarch64-unknown-linux-musl
+      - name: register QEMU
+        run: docker run --privileged --rm "$BINFMT_IMAGE" --install arm64
+      - name: cargo test (aarch64-unknown-linux-musl)
+        run: cargo test --locked --target aarch64-unknown-linux-musl
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: rust-lld
+        timeout-minutes: 10
+
+  # The release job's build and checks, minus the publishing, so a broken
+  # Dockerfile or a mismatched restic shows up on the pull request that caused
+  # it rather than on release day.
+  image-platforms:
+    name: image for amd64 and arm64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - name: set up QEMU and a pinned BuildKit
+        run: |
+          set -euo pipefail
+          docker run --privileged --rm "$BINFMT_IMAGE" --install arm64
+          docker buildx create --name ci --driver docker-container \
+            --driver-opt "image=$BUILDKIT_IMAGE" --use
+          docker buildx inspect --bootstrap
+      - name: build the binaries, as a release would
+        run: |
+          docker buildx build --platform linux/amd64,linux/arm64 --target binary \
+            --output type=local,dest=out .
+      - name: build each platform's image
+        run: |
+          set -euo pipefail
+          for arch in amd64 arm64; do
+            docker buildx build --platform "linux/$arch" --load -t "peerbackup:ci-$arch" .
+          done
+      - name: each image holds the release binary, runs, and has a matching restic
+        run: |
+          set -euo pipefail
+          v=$(grep -m1 -oP '^version = "\K[^"]+' Cargo.toml)
+          .github/scripts/check-image.sh "$v" out \
+            linux/amd64=peerbackup:ci-amd64 linux/arm64=peerbackup:ci-arm64
+        timeout-minutes: 15
 
   audit:
     name: dependency advisories
