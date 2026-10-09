@@ -17,10 +17,11 @@ refuses a tag that does not match it.
 | Branch | Purpose |
 |---|---|
 | `main` | Development. Every change lands here first, through a pull request. |
-| `release/vX.Y` | One per minor version, cut from `main` when `X.Y.0` is released. Receives backported fixes only, and is where every `X.Y.Z` tag is made. |
+| `release/vX.Y.Z` | One per release, where its `vX.Y.Z` tag is made. `X.Y.0` is cut from `main`; a patch `X.Y.Z` is cut from the previous release of its line and receives backported fixes only. |
 
 The release workflow enforces this: a tag must point at a commit on its own
-`release/vX.Y` branch, or nothing is published. CI runs on pushes to `main` and
+`release/vX.Y.Z` branch, or nothing is published. A prerelease `vX.Y.Z-rc.N`
+uses the branch of the release it leads up to, `release/vX.Y.Z`. CI runs on pushes to `main` and
 to every `release/*` branch.
 
 ## What a release publishes
@@ -90,8 +91,8 @@ From an up-to-date `main`, with CI green:
 
    ```sh
    git switch main && git pull
-   git switch -c release/vX.Y
-   git push -u origin release/vX.Y
+   git switch -c release/vX.Y.0
+   git push -u origin release/vX.Y.0
    git tag -a vX.Y.0 -m "peerbackup X.Y.0"
    git push origin vX.Y.0
    ```
@@ -105,15 +106,17 @@ From an up-to-date `main`, with CI green:
 
 1. Land the fix on `main` first, through a normal pull request.
 
-2. Backport it to the release branch, bump the version, and date the changelog:
+2. Cut the patch's branch from the previous release of the line, backport the
+   fix, bump the version, and date the changelog:
 
    ```sh
-   git switch release/vX.Y && git pull
+   git fetch --tags
+   git switch -c release/vX.Y.Z vX.Y.(Z-1)
    git cherry-pick -x <commit-on-main>
    # Cargo.toml: version = "X.Y.Z"; then `cargo check`
    # CHANGELOG.md: add "## [X.Y.Z] - YYYY-MM-DD" with the fix
    git commit -am "Release X.Y.Z"
-   git push
+   git push -u origin release/vX.Y.Z
    ```
 
    Wait for CI on the release branch.
@@ -129,7 +132,7 @@ From an up-to-date `main`, with CI green:
 
 ## Prereleases
 
-Tag `vX.Y.0-rc.N` on `release/vX.Y`, with `Cargo.toml` set to `X.Y.0-rc.N` and
+Tag `vX.Y.0-rc.N` on `release/vX.Y.0`, with `Cargo.toml` set to `X.Y.0-rc.N` and
 a dated `## [X.Y.0-rc.N]` changelog entry. It is published as a GitHub
 prerelease, and the image gets only its exact tag.
 

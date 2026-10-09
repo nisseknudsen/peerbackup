@@ -385,7 +385,7 @@ sudo ./deploy/test-provision-root.sh
 ./deploy/test-provision-root.sh --in-container
 ```
 
-Releases are cut from `release/vX.Y` branches; see [RELEASING.md](RELEASING.md).
+Each release is cut from its own `release/vX.Y.Z` branch; see [RELEASING.md](RELEASING.md).
 
 ## License
 
