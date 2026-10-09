@@ -67,9 +67,11 @@ expect_refused "" "" "empty tag"
 echo
 echo "=== other outputs ==="
 out=$("$R" meta v0.3.0-beta.2 0.3.0-beta.2 </dev/null)
-grep -qx 'branch=release/v0.3' <<<"$out" && ok "release branch is release/vMAJOR.MINOR" || bad "branch: $out"
+grep -qx 'branch=release/v0.3.0' <<<"$out" && ok "a prerelease is cut from its release's branch" || bad "branch: $out"
 grep -qx 'prerelease=true' <<<"$out" && ok "a -beta tag is a prerelease" || bad "prerelease: $out"
 grep -qx 'version=0.3.0-beta.2' <<<"$out" && ok "version drops the v" || bad "version: $out"
+out=$("$R" meta v0.1.4 0.1.4 </dev/null)
+grep -qx 'branch=release/v0.1.4' <<<"$out" && ok "release branch is release/vMAJOR.MINOR.PATCH" || bad "branch: $out"
 
 echo
 echo "=== changelog notes ==="

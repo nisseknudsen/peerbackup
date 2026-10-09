@@ -61,7 +61,10 @@ meta() {
   fi
 
   echo "version=$version"
-  echo "branch=release/v$major.$minor"
+  # One branch per release, named for it. A prerelease shares the branch of the
+  # release it leads up to, so v0.3.0-rc.1 and v0.3.0 both come from
+  # release/v0.3.0.
+  echo "branch=release/v${version%%-*}"
   echo "prerelease=$prerelease"
   echo "latest=$latest"
   echo "image_tags=$tags"
