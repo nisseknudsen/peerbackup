@@ -26,6 +26,22 @@ die() { echo "error: $*" >&2; exit 1; }
 [ $# -ge 3 ] || die "usage: check-image.sh VERSION BINDIR PLATFORM=REF..."
 version=$1 bindir=$2; shift 2
 
+# The manifest digest for linux/ARCH inside the index REF, or REF's own digest
+# when it is a single-platform manifest already.
+platform_digest() {
+  local raw digest
+  raw=$(docker buildx imagetools inspect --raw "$1")
+  if jq -e '.manifests' >/dev/null <<<"$raw"; then
+    digest=$(jq -r --arg arch "$2" 'first(.manifests[]
+      | select(.platform.os == "linux" and .platform.architecture == $arch)
+      | .digest) // empty' <<<"$raw")
+    [ -n "$digest" ] || die "$1 has no linux/$2 image"
+    echo "$digest"
+  else
+    echo "${1#*@}"
+  fi
+}
+
 fail=0
 for pair in "$@"; do
   platform=${pair%%=*} ref=${pair#*=}
@@ -34,9 +50,18 @@ for pair in "$@"; do
   want_bin="$bindir/linux_$arch/peerbackup"
   [ -f "$want_bin" ] || die "no exported binary at $want_bin"
 
-  echo "--- $platform: $ref"
   if [ "${PULL:-0}" = 1 ]; then
+    # An index digest names every platform at once, and the classic image store
+    # binds a digest to a single local image: pulling the same index again for a
+    # second platform fails with "cannot overwrite digest". Check each platform
+    # by its own manifest digest instead, which is also the more exact claim.
+    if [[ $ref == *@sha256:* ]]; then
+      ref=${ref%@*}@$(platform_digest "$ref" "$arch")
+    fi
+    echo "--- $platform: $ref"
     docker pull -q --platform "$platform" "$ref" >/dev/null
+  else
+    echo "--- $platform: $ref"
   fi
 
   cid=$(docker create --platform "$platform" "$ref")
