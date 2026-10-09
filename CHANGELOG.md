@@ -7,6 +7,8 @@ minor version (0.x.0) may include breaking changes; patch versions never do.
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-10-08
+
 First public release.
 
 ### Added
