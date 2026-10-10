@@ -7,6 +7,14 @@ minor version (0.x.0) may include breaking changes; patch versions never do.
 
 ## [Unreleased]
 
+### Security
+
+- `host list`, `host guard` and `host doctor` escape directory names read from
+  the grant root before printing them. That directory is owned by the account
+  the server runs as, so a name carrying terminal control sequences could
+  erase or forge rows in the output the operator reads. Valid peer names print
+  unchanged; anything else is shown escaped and flagged.
+
 ## [0.1.0] - 2026-10-08
 
 First public release.
