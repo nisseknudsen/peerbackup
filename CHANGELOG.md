@@ -7,6 +7,15 @@ minor version (0.x.0) may include breaking changes; patch versions never do.
 
 ## [Unreleased]
 
+### Security
+
+- `recovery export --out` (and every other private write) now creates its
+  temp file with a random name, exclusively and without following symlinks.
+  The old `<name>.tmp.<pid>` name was predictable and the open followed a
+  pre-planted symlink or reused a pre-planted file, so another local account
+  able to write the chosen output directory could capture or redirect the
+  plaintext repository passwords.
+
 ## [0.1.0] - 2026-10-08
 
 First public release.
