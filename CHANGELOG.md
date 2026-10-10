@@ -7,6 +7,14 @@ minor version (0.x.0) may include breaking changes; patch versions never do.
 
 ## [Unreleased]
 
+### Security
+
+- Evidence records identify a repository by its URL without the login
+  password. A password rotation on the host (`host adduser --force`) no longer
+  orphans the client's history, so a standing failed verdict stays visible and
+  `verify` keeps the baseline it uses to notice a dropped snapshot. Records
+  written under the old identity are still matched.
+
 ## [0.1.0] - 2026-10-08
 
 First public release.

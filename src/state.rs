@@ -257,9 +257,40 @@ pub enum Verdict {
 /// credentials and this value is written to a file and printed in diagnostics.
 /// Sixteen hex characters is 64 bits, which is far more than enough to tell one
 /// friend's server from another's.
+///
+/// Hashed with the password removed. The id used to cover the whole URL, so a
+/// login rotation on the host (`host adduser --force`, after which the client
+/// has to put the new password in its config or its backups stop) gave the
+/// same repository a new identity. Every record written before the rotation
+/// then matched nothing: a standing `Bad` stopped being reported and
+/// `last_backup_snapshot` lost the baseline the snapshot-presence check needs,
+/// so a host that rolled a repository back and then rotated the login was
+/// never noticed. The server, user, port and path are what make a repository
+/// the same one; the password is the part the host can change under us.
 #[must_use]
 pub fn repo_id(url: &str) -> String {
+    sha256_bytes(crate::redact::url_without_password(url).as_bytes())
+        .chars()
+        .take(16)
+        .collect()
+}
+
+/// The id records carried before the password was excluded: the hash of the
+/// full URL. Still matched, so upgrading does not itself orphan every record
+/// already on disk -- which would discard exactly the standing `Bad` verdicts
+/// the change exists to preserve.
+#[must_use]
+pub fn legacy_repo_id(url: &str) -> String {
     sha256_bytes(url.as_bytes()).chars().take(16).collect()
+}
+
+/// Does a record's `repo` name the repository at `url`, under either keying?
+///
+/// `None` is not a match: a record with no id predates ids altogether, and the
+/// callers decide separately what that is worth.
+#[must_use]
+pub fn same_repo(record_repo: Option<&str>, url: &str) -> bool {
+    record_repo.is_some_and(|r| r == repo_id(url) || r == legacy_repo_id(url))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -626,10 +657,12 @@ pub fn status(cfg: &Config, records: &[Record], now_ts: u64) -> Vec<PeerStatus> 
     cfg.peers
         .iter()
         .map(|peer| {
-            let id = repo_id(&peer.url);
             let mine: Vec<&Record> = records
                 .iter()
-                .filter(|r| r.peer == peer.name && r.repo.as_ref().is_none_or(|r| *r == id))
+                .filter(|r| {
+                    r.peer == peer.name
+                        && (r.repo.is_none() || same_repo(r.repo.as_deref(), &peer.url))
+                })
                 .collect();
             // Freshness needs to know the record was about *this* repository.
             // Damage does not: an unrefuted `Bad` under this name is worth
@@ -637,7 +670,7 @@ pub fn status(cfg: &Config, records: &[Record], now_ts: u64) -> Vec<PeerStatus> 
             let confirmed: Vec<&Record> = mine
                 .iter()
                 .copied()
-                .filter(|r| r.repo.as_deref() == Some(id.as_str()))
+                .filter(|r| same_repo(r.repo.as_deref(), &peer.url))
                 .collect();
 
             // Damage of a given kind that nothing has since refuted, folded in
@@ -856,6 +889,108 @@ mod tests {
         assert_eq!(
             status(&cfg_with_peer(), &recs, NOW)[0].state,
             PeerState::Good
+        );
+    }
+
+    #[test]
+    fn a_login_password_rotation_keeps_the_standing_bad_and_the_baseline() {
+        // `host adduser --force` gives the peer a new login password and the
+        // client has to put it in its config or its backups stop. The id used
+        // to cover the whole URL, so that one change orphaned every record:
+        // a standing `Bad` vanished and the rollback baseline was lost -- the
+        // one host-controlled lever that reset the client's checks on the host.
+        const OLD: &str = "rest:http://alice:OLDPASS@bob.example.net:51515/alice/";
+        const NEW: &str = "rest:http://alice:NEWPASS@bob.example.net:51515/alice/";
+        assert_eq!(repo_id(OLD), repo_id(NEW), "the password is not identity");
+
+        let mut old_url = Config::default();
+        old_url.peers.push(Peer {
+            name: PeerName::new("alice").unwrap(),
+            url: OLD.into(),
+            ca_cert: None,
+        });
+        let mut rotated = Config::default();
+        rotated.peers.push(Peer {
+            name: PeerName::new("alice").unwrap(),
+            url: NEW.into(),
+            ca_cert: None,
+        });
+        let recs = vec![
+            Record {
+                snapshot: Some("deadbeefcafe0001".into()),
+                repo: Some(repo_id(OLD)),
+                ..rec(Kind::Backup, Verdict::Good, NOW - 7200)
+            },
+            Record {
+                repo: Some(repo_id(OLD)),
+                ..detailed(
+                    Kind::Canary,
+                    Verdict::Bad,
+                    NOW - 3600,
+                    "canary digest mismatch",
+                )
+            },
+        ];
+        let before = &status(&old_url, &recs, NOW)[0];
+        assert_eq!(before.state, PeerState::Bad);
+        let after = &status(&rotated, &recs, NOW)[0];
+        assert_eq!(after.state, PeerState::Bad, "{:?}", after.problem);
+        assert_eq!(after.problem.as_deref(), Some("canary digest mismatch"));
+        assert_eq!(
+            after.last_backup, before.last_backup,
+            "the backup baseline survives the rotation"
+        );
+    }
+
+    #[test]
+    fn records_written_under_the_old_full_url_id_are_still_matched() {
+        // The upgrade must not itself orphan every record on disk, or the
+        // standing `Bad` verdicts it exists to preserve are lost once.
+        const URL: &str = "rest:http://alice:pw@bob.example.net:51515/alice/";
+        let mut cfg = Config::default();
+        cfg.peers.push(Peer {
+            name: PeerName::new("alice").unwrap(),
+            url: URL.into(),
+            ca_cert: None,
+        });
+        assert_ne!(legacy_repo_id(URL), repo_id(URL));
+        assert!(same_repo(Some(&legacy_repo_id(URL)), URL));
+        assert!(same_repo(Some(&repo_id(URL)), URL));
+        assert!(!same_repo(None, URL));
+        let recs = vec![
+            Record {
+                repo: Some(legacy_repo_id(URL)),
+                ..rec(Kind::Backup, Verdict::Good, NOW - 3600)
+            },
+            Record {
+                repo: Some(legacy_repo_id(URL)),
+                ..detailed(Kind::Subset, Verdict::Bad, NOW - 1800, "pack hash mismatch")
+            },
+        ];
+        let r = &status(&cfg, &recs, NOW)[0];
+        assert_eq!(r.state, PeerState::Bad);
+        assert!(r.last_backup.is_some(), "legacy-id freshness still counts");
+    }
+
+    #[test]
+    fn a_different_server_port_or_path_is_still_a_different_repository() {
+        // Dropping the password from the identity must not collapse anything
+        // else: `peer remove alice` + `peer add alice <other friend>` still
+        // starts with a clean history.
+        const A: &str = "rest:http://alice:pw@bob.example.net:51515/alice/";
+        for other in [
+            "rest:http://alice:pw@carol.example.net:51515/alice/",
+            "rest:http://alice:pw@bob.example.net:51516/alice/",
+            "rest:http://alice:pw@bob.example.net:51515/alice2/",
+            "rest:http://alice2:pw@bob.example.net:51515/alice/",
+            "rest:https://alice:pw@bob.example.net:51515/alice/",
+        ] {
+            assert_ne!(repo_id(A), repo_id(other), "{other}");
+        }
+        // An `@` in the path is not a credential separator.
+        assert_eq!(
+            repo_id("rest:http://bob.example.net:51515/me@home/"),
+            legacy_repo_id("rest:http://bob.example.net:51515/me@home/")
         );
     }
 
