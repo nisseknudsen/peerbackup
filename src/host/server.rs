@@ -236,7 +236,7 @@ pub fn quickstart(ctx: &Ctx, peer: &PeerName, o: &ServerOpts) -> Res {
         if !out.status.success() {
             return Err(format!(
                 "docker could not start the server. Full error:\n{}",
-                String::from_utf8_lossy(&out.stderr).trim()
+                crate::redact::message(String::from_utf8_lossy(&out.stderr).trim())
             ));
         }
 
@@ -262,7 +262,9 @@ pub fn quickstart(ctx: &Ctx, peer: &PeerName, o: &ServerOpts) -> Res {
                     .into_iter()
                     .rev()
                 {
-                    eprintln!("  {line}");
+                    // The container's own output; fold it like any other
+                    // text a lower-trust party wrote (see `warn`).
+                    eprintln!("  {}", crate::redact::detail(line));
                 }
             }
             let _ = Command::new("docker")
