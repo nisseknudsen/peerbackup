@@ -82,6 +82,42 @@ fn has_login(container: &str, peer: &PeerName) -> bool {
         .is_ok_and(|o| o.status.success())
 }
 
+/// Does this container publish its port 8000 on an address the loopback check
+/// in [`adduser`] will actually reach?
+///
+/// The check sends the peer's fresh password, in clear, to `127.0.0.1:<port>`
+/// and treats a 404 or 200 as proof the login works. Nothing used to confirm
+/// that the container was what answered. With compose started on a specific
+/// interface (`PB_BIND=192.0.2.1`), or `sudo peerbackup host adduser` falling
+/// back to port 51515 while the unit runs the server elsewhere, `127.0.0.1:<port>`
+/// is free for any local account to bind: it received the credential, answered
+/// 404, and the operator was told "verified" and handed the same credential to
+/// the friend. So before the secret goes anywhere, ask docker where the
+/// container's port 8000 is published and refuse unless that covers loopback.
+///
+/// `None` when docker cannot be asked, which the caller treats as "not
+/// published": a missing answer must not let the secret out.
+fn container_publishes_on_loopback(container: &str, port: u16) -> bool {
+    Command::new("docker")
+        .args(["port", container, "8000"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .is_some_and(|o| publishes_on_loopback(&String::from_utf8_lossy(&o.stdout), port))
+}
+
+/// Read `docker port <container> 8000` output: one `host:port` per line, such
+/// as `0.0.0.0:51515` or `[::]:51515`. Only a wildcard or explicit loopback
+/// IPv4 binding on exactly `port` counts, because that is where the check
+/// connects; an IPv6-only or interface-specific binding does not.
+fn publishes_on_loopback(docker_port_output: &str, port: u16) -> bool {
+    let want = format!(":{port}");
+    docker_port_output.lines().any(|l| {
+        let l = l.trim();
+        l.ends_with(&want) && (l.starts_with("0.0.0.0:") || l.starts_with("127.0.0.1:"))
+    })
+}
+
 /// Where a running container's `/data` actually comes from on the host.
 ///
 /// Returns `None` when docker cannot be asked or the container has no such
@@ -505,6 +541,19 @@ pub fn adduser(
         return Ok(generated.then_some(pw));
     }
 
+    // The password is about to be sent over plain HTTP to 127.0.0.1:<port>.
+    // Make sure that is the container and not whatever else is listening
+    // there; see `container_publishes_on_loopback`.
+    if !container_publishes_on_loopback(&o.container, o.port) {
+        return Err(format!(
+            "'{}' does not publish port {} on this machine's loopback address, so the new\n       \
+             login cannot be checked safely from here (and was not sent anywhere).\n       \
+             The login was written; check where the server listens and set PB_PORT\n       \
+             (and PB_BIND, for compose) to match:   docker port {} 8000",
+            o.container, o.port, o.container
+        ));
+    }
+
     // 404 means authenticated but no repository yet, which is exactly right for
     // a fresh grant. 200 means they already have one.
     let mut code = String::new();
@@ -728,6 +777,29 @@ fn hostname() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_login_check_only_targets_a_port_the_container_publishes_on_loopback() {
+        // The check sends the fresh password to 127.0.0.1:<port> in clear and
+        // accepts any 404/200. If the container is not what holds that port,
+        // any local account can be. These are `docker port <c> 8000` outputs.
+        assert!(publishes_on_loopback("0.0.0.0:51515\n", 51515));
+        assert!(publishes_on_loopback("0.0.0.0:51515\n[::]:51515\n", 51515));
+        assert!(publishes_on_loopback("127.0.0.1:51515\n", 51515));
+        // A specific interface leaves loopback free for someone else.
+        assert!(!publishes_on_loopback("192.0.2.1:51515\n", 51515));
+        // IPv6-only is not where the check connects.
+        assert!(!publishes_on_loopback("[::]:51515\n", 51515));
+        // The wrong port (PB_PORT mismatch, e.g. sudo dropping it) is the
+        // documented way to end up checking a port nobody holds.
+        assert!(!publishes_on_loopback("0.0.0.0:51516\n", 51515));
+        assert!(!publishes_on_loopback("0.0.0.0:151515\n", 51515));
+        assert!(!publishes_on_loopback("", 51515));
+        assert!(!publishes_on_loopback(
+            "Error: No such container: x\n",
+            51515
+        ));
+    }
 
     #[test]
     fn a_port_nobody_listens_on_reads_as_free() {
