@@ -256,7 +256,9 @@ fn main() {
     };
 
     if let Err(e) = result {
-        eprintln!("error: {e}");
+        // Backstop: every error string that reaches here may embed a
+        // subprocess's stderr, so nothing in it may move the cursor.
+        eprintln!("error: {}", redact::message(&e));
         std::process::exit(1);
     }
     if nag_after {

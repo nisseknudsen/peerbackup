@@ -7,6 +7,14 @@ minor version (0.x.0) may include breaking changes; patch versions never do.
 
 ## [Unreleased]
 
+### Security
+
+- The host commands fold terminal control characters out of subprocess output
+  before printing it: the stderr of commands run inside the server container
+  by `host adduser`, the container log shown when `host quickstart` fails, and
+  the stderr embedded in command errors. A compromised container could
+  otherwise erase or forge lines on the operator's terminal.
+
 ## [0.1.0] - 2026-10-08
 
 First public release.
