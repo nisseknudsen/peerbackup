@@ -633,7 +633,7 @@ fn compose_file(override_path: Option<PathBuf>) -> Result<PathBuf, String> {
 /// `host adduser <peer> <password>` path, where the value comes from a human.
 fn check_password(pw: &str) -> Result<&str, String> {
     if pw.is_empty() {
-        return Err("the password is empty; omit the argument to generate one".into());
+        return Err("the password is empty; leave it out to have one generated".into());
     }
     if let Some(c) = pw.chars().find(|c| c.is_control()) {
         return Err(format!(

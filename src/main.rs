@@ -159,8 +159,13 @@ enum HostCmd {
     /// Create a login, restart the server, and verify it works
     Adduser {
         peer: PeerName,
-        /// Leave empty to generate one
+        /// Leave empty to generate one. Prefer --password-stdin to choose one:
+        /// an argument is visible in `ps` and kept in shell history
         password: Option<String>,
+        /// Choose the password without putting it on the command line: prompts
+        /// on a terminal, reads one line from stdin otherwise
+        #[arg(long, conflicts_with = "password")]
+        password_stdin: bool,
     },
     /// Destroy a grant and give the capacity back (needs root)
     Release { peer: PeerName },
@@ -190,14 +195,40 @@ fn run_host(cmd: HostCmd, flags: host::Flags) -> Res {
             host::server::quickstart(&ctx, &peer, &host::server::ServerOpts::from_env()?)
         }
         HostCmd::Provision { peer, size } => host::grant::provision(&ctx, &peer, &size),
-        HostCmd::Adduser { peer, password } => host::server::adduser(
-            &ctx,
-            &peer,
-            password.as_deref(),
-            &host::server::ServerOpts::from_env()?,
-            host::server::ShowPassword::Yes,
-        )
-        .map(|_| ()),
+        HostCmd::Adduser {
+            peer,
+            password,
+            password_stdin,
+        } => {
+            // The login password is something `docs/design.md` says to protect,
+            // and everything downstream of here keeps it off argv: it reaches
+            // htpasswd on stdin and curl in a config file. Taking it as an
+            // argument undid that at the front door, where it sits in
+            // /proc/<pid>/cmdline for every local user to read while the
+            // container restarts, and in shell history after. Still accepted,
+            // for the scripts that pass it, but it says what it cost -- the same
+            // deal `connect` gives a URL with the password in it.
+            let password = if password_stdin {
+                Some(cli::read_secret(&format!("Password for '{peer}': "))?)
+            } else {
+                if password.is_some() {
+                    eprintln!(
+                        "warning: that password was on the command line, so it is now in \
+                         your shell\n  history and was visible in `ps` while this ran. Use \
+                         --password-stdin,\n  or omit it to have one generated."
+                    );
+                }
+                password
+            };
+            host::server::adduser(
+                &ctx,
+                &peer,
+                password.as_deref(),
+                &host::server::ServerOpts::from_env()?,
+                host::server::ShowPassword::Yes,
+            )
+            .map(|_| ())
+        }
         HostCmd::Release { peer } => host::grant::release(&ctx, &peer),
         HostCmd::List { peer } => host::grant::list(&ctx, peer.as_ref().map(PeerName::as_str)),
         HostCmd::Guard => host::grant::guard(&ctx),

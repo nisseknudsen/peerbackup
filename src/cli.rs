@@ -356,7 +356,7 @@ fn complete_url(url: &str) -> Result<RepoUrl, String> {
 /// The non-terminal path is what makes this scriptable:
 /// `peerbackup connect <url> --source /srv/data < password.txt`, the same shape
 /// as `docker login --password-stdin`.
-fn read_secret(prompt: &str) -> Result<String, String> {
+pub(crate) fn read_secret(prompt: &str) -> Result<String, String> {
     use std::io::BufRead;
 
     // SAFETY: isatty inspects a file descriptor and cannot fail in a way that

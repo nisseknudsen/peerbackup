@@ -226,7 +226,7 @@ Hosting:
 | Command | Does |
 |---|---|
 | `host quickstart <peer>` | Start a server and add a peer, without root |
-| `host adduser <peer> [<password>]` | Add a login (generated unless given), restart the server, check the login works |
+| `host adduser <peer> [--password-stdin]` | Add a login (generated unless you choose one), restart the server, check the login works |
 | `host provision <peer> <size>` | Create a storage area with its own size limit (root) |
 | `host release <peer>` | Delete a peer's storage area and their backups (root) |
 | `host list [<peer>]` | Storage areas, sizes and usage |
