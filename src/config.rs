@@ -347,6 +347,18 @@ pub fn create_dir_private(dir: &Path) -> io::Result<()> {
 /// reader sees either the old file or the new one. The temp file goes in the
 /// same directory for that reason: rename across filesystems is not atomic and
 /// fails with EXDEV.
+///
+/// **The temp file is ours alone.** `recovery export --out` lets the user name
+/// any existing directory, including one another local account can write to.
+/// The temp name used to be `<name>.tmp.<pid>`, which that account can predict
+/// (the pid is in `/proc`), and it was opened with `O_CREAT|O_TRUNC`, which
+/// follows a symlink and reuses a file that is already there. A symlink planted
+/// at that name sent the plaintext passwords wherever it pointed, and a planted
+/// regular file received them at whatever mode its owner chose, with `mode(0600)`
+/// silently ignored because the file already existed. So the name now carries a
+/// random token and the file is opened `O_EXCL|O_NOFOLLOW`: anything already at
+/// that path, link or file, is refused rather than written through. The same
+/// discipline `SecretFile` in the engine already applies for the same reason.
 pub fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
     use std::io::Write;
 
@@ -354,22 +366,43 @@ pub fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
     create_dir_private(parent)?;
 
     // Append to the file name rather than replacing its extension.
-    // `with_extension` would turn both `al.ice` and `al.bob` into `al.tmp.PID`,
+    // `with_extension` would turn both `al.ice` and `al.bob` into `al.tmp.X`,
     // so two peers written concurrently would clobber each other's temp file.
     let name = path
         .file_name()
         .ok_or_else(|| io::Error::other(format!("{} has no file name to write", path.display())))?;
-    let mut tmp_name = name.to_os_string();
-    tmp_name.push(format!(".tmp.{}", std::process::id()));
-    let tmp = path.with_file_name(tmp_name);
 
-    let write = || -> io::Result<()> {
-        let mut f = fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&tmp)?;
+    // Collisions with a sixteen-character random token do not happen by
+    // accident; a handful of retries covers the deliberate case where someone
+    // is spraying names into the directory, and then we give up loudly rather
+    // than write through whatever they put there.
+    let (tmp, mut f) = {
+        let mut opened = None;
+        for _ in 0..8 {
+            let mut tmp_name = name.to_os_string();
+            tmp_name.push(format!(".tmp.{}", random_token(16)?));
+            let tmp = path.with_file_name(tmp_name);
+            match open_exclusive_private(&tmp) {
+                Ok(f) => {
+                    opened = Some((tmp, f));
+                    break;
+                }
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        opened.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "could not create a fresh temp file next to {}: every name tried already exists",
+                    path.display()
+                ),
+            )
+        })?
+    };
+
+    let write = |f: &mut fs::File| -> io::Result<()> {
         f.write_all(bytes)?;
         f.sync_all()?;
         fs::rename(&tmp, path)?;
@@ -378,9 +411,23 @@ pub fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
         fs::File::open(parent)?.sync_all()
     };
 
-    write().inspect_err(|_| {
+    write(&mut f).inspect_err(|_| {
         let _ = fs::remove_file(&tmp);
     })
+}
+
+/// Create a brand-new 0600 file at `path`, refusing anything already there.
+///
+/// `create_new` is `O_CREAT|O_EXCL`: an existing entry, symlink or not, fails
+/// with `AlreadyExists` instead of being opened. `O_NOFOLLOW` is belt and
+/// braces for the same case, so the guarantee does not rest on one flag.
+fn open_exclusive_private(path: &Path) -> io::Result<fs::File> {
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .mode(0o600)
+        .open(path)
 }
 
 /// Random alphanumeric string from the kernel.
@@ -697,6 +744,81 @@ verify_subset_pc = 50
         assert!(
             toml::from_str::<Config>(&text).is_ok(),
             "a stray temp file must not affect reading config.toml"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_planted_symlink_or_file_at_the_temp_path_is_refused_not_written_through() {
+        // The threat: `recovery export --out <shared dir>` writes every
+        // repository password, and another local account can pre-create the
+        // temp path. The old `<name>.tmp.<pid>` name was predictable and the
+        // open followed symlinks and reused existing files, so the plaintext
+        // went wherever the planted entry pointed.
+        let dir = std::env::temp_dir().join(format!("pb-plant-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let loot = dir.join("loot");
+        fs::write(&loot, b"attacker-owned").unwrap();
+
+        // The exclusive open refuses a symlink ...
+        let link = dir.join("recovery.txt.tmp.planted-link");
+        std::os::unix::fs::symlink(&loot, &link).unwrap();
+        let e = open_exclusive_private(&link).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::AlreadyExists, "{e}");
+        assert_eq!(
+            fs::read(&loot).unwrap(),
+            b"attacker-owned",
+            "loot untouched"
+        );
+
+        // ... and a pre-existing regular file at whatever mode its owner chose.
+        let planted = dir.join("recovery.txt.tmp.planted-file");
+        fs::write(&planted, b"").unwrap();
+        fs::set_permissions(&planted, fs::Permissions::from_mode(0o666)).unwrap();
+        let e = open_exclusive_private(&planted).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::AlreadyExists, "{e}");
+        assert_eq!(fs::read(&planted).unwrap(), b"", "planted file untouched");
+
+        // The full write still succeeds alongside them, lands 0600, and leaves
+        // no temp file of its own behind.
+        let out = dir.join("recovery.txt");
+        write_private(&out, b"ALL-THE-PASSWORDS").unwrap();
+        assert_eq!(fs::read(&out).unwrap(), b"ALL-THE-PASSWORDS");
+        assert_eq!(
+            fs::metadata(&out).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(!fs::symlink_metadata(&out).unwrap().file_type().is_symlink());
+        assert_eq!(fs::read(&loot).unwrap(), b"attacker-owned");
+        let strays: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp.") && !n.contains("planted"))
+            .collect();
+        assert!(strays.is_empty(), "left temp files behind: {strays:?}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_temp_name_is_not_predictable_from_the_pid() {
+        // Two writes of the same file must not share a temp name, and the name
+        // must not be `<name>.tmp.<pid>`: that is what let another account
+        // plant an entry ahead of time.
+        let dir = std::env::temp_dir().join(format!("pb-tmprand-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let predictable = dir.join(format!("secret.tmp.{}", std::process::id()));
+        // Plant the old predictable name as a symlink to somewhere else; a
+        // write that still used it would fail (O_EXCL) or, worse, follow it.
+        std::os::unix::fs::symlink(dir.join("elsewhere"), &predictable).unwrap();
+        write_private(&dir.join("secret"), b"one").unwrap();
+        write_private(&dir.join("secret"), b"two").unwrap();
+        assert_eq!(fs::read_to_string(dir.join("secret")).unwrap(), "two");
+        assert!(
+            !dir.join("elsewhere").exists(),
+            "nothing may be written through the planted predictable name"
         );
         let _ = fs::remove_dir_all(&dir);
     }

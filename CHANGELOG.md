@@ -14,6 +14,12 @@ minor version (0.x.0) may include breaking changes; patch versions never do.
   orphans the client's history, so a standing failed verdict stays visible and
   `verify` keeps the baseline it uses to notice a dropped snapshot. Records
   written under the old identity are still matched.
+- `recovery export --out` (and every other private write) now creates its
+  temp file with a random name, exclusively and without following symlinks.
+  The old `<name>.tmp.<pid>` name was predictable and the open followed a
+  pre-planted symlink or reused a pre-planted file, so another local account
+  able to write the chosen output directory could capture or redirect the
+  plaintext repository passwords.
 - `host adduser` (and `host quickstart`) confirm with `docker port` that the
   server container publishes its port on this machine's loopback address
   before sending the new login password there to verify it. Previously any
