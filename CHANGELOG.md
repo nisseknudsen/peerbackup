@@ -7,6 +7,19 @@ minor version (0.x.0) may include breaking changes; patch versions never do.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-12
+
+A security-hardening release from a full audit of 0.1.0. No new features;
+client state from 0.1.0 is picked up as is.
+
+### Changed
+
+- `host adduser` now refuses to verify a new login when the server container
+  does not publish its port on this machine's loopback address, for example
+  when compose binds to one LAN interface or `PB_PORT` does not match. The
+  login is still written but is not sent anywhere; set `PB_PORT` (and
+  `PB_BIND`, for compose) to match `docker port peerbackup-rest 8000`.
+
 ### Security
 
 - The host commands fold terminal control characters out of subprocess output
