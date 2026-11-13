@@ -14,6 +14,12 @@ minor version (0.x.0) may include breaking changes; patch versions never do.
   the server runs as, so a name carrying terminal control sequences could
   erase or forge rows in the output the operator reads. Valid peer names print
   unchanged; anything else is shown escaped and flagged.
+- `recovery export --out` (and every other private write) now creates its
+  temp file with a random name, exclusively and without following symlinks.
+  The old `<name>.tmp.<pid>` name was predictable and the open followed a
+  pre-planted symlink or reused a pre-planted file, so another local account
+  able to write the chosen output directory could capture or redirect the
+  plaintext repository passwords.
 - `host adduser` (and `host quickstart`) confirm with `docker port` that the
   server container publishes its port on this machine's loopback address
   before sending the new login password there to verify it. Previously any
