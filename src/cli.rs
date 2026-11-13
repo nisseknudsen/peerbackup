@@ -957,8 +957,9 @@ impl From<String> for VerifyFailure {
 ///
 /// Matched on the repository id as well as the name, so a peer whose URL now
 /// points somewhere else is not asked for a snapshot a different server made.
+/// The id excludes the login password (see `state::repo_id`), so a rotated
+/// login does not lose the baseline this check depends on.
 fn last_backup_snapshot(records: &[Record], peer: &Peer) -> Option<String> {
-    let id = crate::state::repo_id(&peer.url);
     records
         .iter()
         .rev()
@@ -966,7 +967,7 @@ fn last_backup_snapshot(records: &[Record], peer: &Peer) -> Option<String> {
             r.peer == peer.name
                 && r.kind == Kind::Backup
                 && r.verdict == Verdict::Good
-                && r.repo.as_deref() == Some(id.as_str())
+                && crate::state::same_repo(r.repo.as_deref(), &peer.url)
                 && r.snapshot.is_some()
         })
         .and_then(|r| r.snapshot.clone())
