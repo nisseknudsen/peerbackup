@@ -93,7 +93,7 @@ if out=$(PB_PORT=9999 PB_CONTAINER=peerbackup-rest $PB_HOST adduser dave davepw 
 else
   ok "adduser fails when it cannot confirm the credential works"
 fi
-echo "$out" | grep -qi 'could not confirm' && ok "and says so" || bad "unclear message: $out"
+echo "$out" | grep -qi 'does not publish port 9999' && ok "and says why: the container does not publish that port" || bad "unclear message: $out"
 
 hdr "--private-repos isolation"
 code=$(curl -s -o /dev/null -w '%{http_code}' -u alice:alicepw "$BASE/bob/config")
