@@ -595,11 +595,22 @@ mod tests {
         assert!(!env_flag(key).unwrap(), "unset is a no");
     }
 
+    /// Held by every test that calls `Ctx::from_env`. It reads a whole set of
+    /// variables, and the out-of-range test sets some of them to values it
+    /// refuses, so without this a parallel run made the others fail at random.
+    static CTX_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn ctx_env_lock() -> std::sync::MutexGuard<'static, ()> {
+        // A failed assertion in one test must not cascade into the others.
+        CTX_ENV.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     #[test]
     fn the_command_line_can_ask_for_a_dry_run_and_for_force() {
         // Every command that needs these also needs root, and sudo resets the
         // environment, so `DRY_RUN=1 sudo peerbackup host provision alice 500G`
         // -- the ordering people type -- did a real provision.
+        let _env = ctx_env_lock();
         let c = Ctx::from_env(Flags {
             dry_run: true,
             force: true,
@@ -615,7 +626,10 @@ mod tests {
         // build scripts, and it was the only way to skip the prompt on the
         // command that permanently destroys a friend's backups.
         //
-        // SAFETY: `FORCE` is read by nothing else in this binary.
+        // SAFETY: `FORCE` is read by nothing else in this binary, and the
+        // other tests that read the environment through `Ctx::from_env` are
+        // held off by the lock.
+        let _env = ctx_env_lock();
         unsafe { std::env::set_var("FORCE", "1") };
         let c = Ctx::from_env(Flags::default()).unwrap();
         // SAFETY: as above.
@@ -661,7 +675,9 @@ mod tests {
         // by 1024^3, and release builds have overflow-checks on, so an absurd
         // value panicked. A percentage over 100 is also not a percentage.
         //
-        // SAFETY: these keys are read by nothing else in this binary.
+        // SAFETY: outside `Ctx::from_env` nothing reads these keys, and every
+        // test that calls it holds the lock, so none sees the values set here.
+        let _env = ctx_env_lock();
         unsafe { std::env::set_var("MAINTENANCE_RESERVE_PCT", "500") };
         assert!(Ctx::from_env(Flags::default()).is_err());
         unsafe { std::env::set_var("MAINTENANCE_RESERVE_PCT", "15") };

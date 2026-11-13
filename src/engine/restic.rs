@@ -55,9 +55,16 @@ pub enum Op {
 /// verification with nothing said about it. Refusing anything else keeps the
 /// knob to the thing it is for.
 fn extra_opts() -> Result<Vec<String>, std::io::Error> {
-    let Ok(raw) = std::env::var("PEERBACKUP_RESTIC_OPTS") else {
-        return Ok(Vec::new());
-    };
+    match std::env::var("PEERBACKUP_RESTIC_OPTS") {
+        Ok(raw) => parse_extra_opts(&raw),
+        Err(_) => Ok(Vec::new()),
+    }
+}
+
+/// The filter behind [`extra_opts`], apart from the environment so it can be
+/// tested without `set_var`: every test that builds a restic command reads
+/// this variable, so setting it in one test leaked into whichever ran beside it.
+fn parse_extra_opts(raw: &str) -> Result<Vec<String>, std::io::Error> {
     let mut out = Vec::new();
     let mut tokens = raw.split_whitespace();
     while let Some(tok) = tokens.next() {
@@ -1139,10 +1146,10 @@ mod tests {
         // make this a general flag injector, and `--insecure-tls` arriving that
         // way would disable certificate verification silently.
         //
-        // SAFETY: this variable is read by nothing else in this binary.
-        unsafe { std::env::set_var("PEERBACKUP_RESTIC_OPTS", "-o rest.connections=10") };
+        // This goes through the parser, not the environment: `set_var` here
+        // raced every other test that builds a restic command.
         assert_eq!(
-            extra_opts().unwrap(),
+            parse_extra_opts("-o rest.connections=10").unwrap(),
             vec!["-o".to_owned(), "rest.connections=10".to_owned()]
         );
 
@@ -1152,12 +1159,10 @@ mod tests {
             "-o --insecure-tls",
             "-o noequals",
         ] {
-            unsafe { std::env::set_var("PEERBACKUP_RESTIC_OPTS", bad) };
-            assert!(extra_opts().is_err(), "{bad:?} must be refused");
+            assert!(parse_extra_opts(bad).is_err(), "{bad:?} must be refused");
         }
 
-        unsafe { std::env::remove_var("PEERBACKUP_RESTIC_OPTS") };
-        assert!(extra_opts().unwrap().is_empty());
+        assert!(parse_extra_opts("").unwrap().is_empty());
     }
 
     #[test]
