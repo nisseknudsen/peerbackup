@@ -7,6 +7,8 @@ minor version (0.x.0) may include breaking changes; patch versions never do.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-12
+
 ### Security
 
 - The host commands fold terminal control characters out of subprocess output

@@ -1,6 +1,6 @@
 [package]
 name = "peerbackup"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 # Pinned for the same reason restic is pinned with a checksum in CI: a backup
 # tool that only builds on whatever the author happened to have installed is a
