@@ -21,6 +21,50 @@ use super::size::{human, parse_size};
 use super::{Ctx, Res, have, is_mountpoint, statfs, unit_name, warn};
 use crate::config::PeerName;
 
+/// A directory entry name under `mnt/`, made safe to print.
+///
+/// Names under `mnt/` are written by the PB_UID account, not by this program:
+/// `take_ownership` hands that directory to the unprivileged uid the server
+/// runs as, and the container has it bind-mounted read-write. `list`, `guard`
+/// and `doctor` read those names back and printed them raw, so a directory
+/// named `zz\x1b[1A\x1b[2K\r  ok  ...` erased the row above it -- the real
+/// grant's `NOT MOUNTED` -- and painted an `ok` in its place on the terminal
+/// the root operator was reading. The exit codes were right; the human was
+/// deceived. The client side folds peer-influenced text for exactly this
+/// reason (`redact`); the host side did not.
+///
+/// A valid peer name is shown as it is. Anything else is escaped, so every
+/// control character and non-ASCII code point becomes a visible `\u{..}`
+/// sequence, and flagged, because nothing this program created has such a
+/// name. The raw name is still what the filesystem lookups use.
+fn shown(name: &OsStr) -> String {
+    let s = name.to_string_lossy();
+    match PeerName::new(&s) {
+        Ok(p) => p.as_str().to_owned(),
+        Err(_) => format!("<unexpected entry {}>", s.escape_default()),
+    }
+}
+
+/// `path` for display, with every component below `base` passed through
+/// [`shown`]. `base` is a path this program chose (`mnt/`), so it is printed as
+/// is; everything under it came from the directory listing.
+fn shown_under(base: &Path, path: &Path) -> String {
+    let mut out = base.display().to_string();
+    if let Ok(rest) = path.strip_prefix(base) {
+        for c in rest.components() {
+            out.push('/');
+            out.push_str(&shown(c.as_os_str()));
+        }
+        out
+    } else {
+        // Not under `base` at all; still never print it raw.
+        path.components()
+            .map(|c| shown(c.as_os_str()))
+            .collect::<Vec<_>>()
+            .join("/")
+    }
+}
+
 /// Tools provisioning cannot do without, checked before anything is created.
 ///
 /// systemd-escape used to be missing silently: the unit name came back empty,
@@ -620,6 +664,10 @@ pub fn list(ctx: &Ctx, only: Option<&str>) -> Res {
             );
         }
         found = true;
+        // `peer` is the raw name, for the filesystem; `label` is what gets
+        // printed, because the name came from a directory another account
+        // writes to.
+        let label = shown(dir.file_name().unwrap_or_default());
         let img = ctx.image_of(&peer);
         let meta = std::fs::metadata(&img).ok();
         let imgsz = meta.as_ref().map_or(0, MetadataExt::size);
@@ -647,7 +695,7 @@ pub fn list(ctx: &Ctx, only: Option<&str>) -> Res {
         };
         if allocated * 100 < imgsz * 95 {
             warn(&format!(
-                "{peer}: the image claims {} but only {} is allocated on the host, \
+                "{label}: the image claims {} but only {} is allocated on the host, \
                  so it is no longer a hard reservation",
                 human(imgsz),
                 human(allocated)
@@ -656,7 +704,7 @@ pub fn list(ctx: &Ctx, only: Option<&str>) -> Res {
         let show = |v: u64| if unknown { "?".to_owned() } else { human(v) };
         println!(
             "{:<14} {:>12} {:>12} {:>12} {:>12}  {}",
-            peer,
+            label,
             human(imgsz),
             show(usable),
             show(reserve),
@@ -738,10 +786,11 @@ pub fn guard(ctx: &Ctx) -> Res {
 
     let mut bad = 0usize;
     for dir in &dirs {
+        // The entry name is PB_UID-written; print it escaped (see `shown`).
         if is_mountpoint(dir) {
-            println!("  ok       {}", dir.display());
+            println!("  ok       {}", shown_under(&mnt, dir));
         } else {
-            eprintln!("  NOT MOUNTED  {}", dir.display());
+            eprintln!("  NOT MOUNTED  {}", shown_under(&mnt, dir));
             bad += 1;
         }
     }
@@ -791,7 +840,8 @@ pub fn doctor(ctx: &Ctx) -> Res {
     // The gotcha that silently breaks quota monitoring: the rest-server image
     // runs as uid 0 and creates repositories 0700 root:root through the bind
     // mount, so the host owner cannot read their own data to measure it.
-    if let Ok(entries) = std::fs::read_dir(ctx.mnt()) {
+    let mnt = ctx.mnt();
+    if let Ok(entries) = std::fs::read_dir(&mnt) {
         for grant in entries.filter_map(|e| e.ok()).map(|e| e.path()) {
             if !grant.is_dir() {
                 continue;
@@ -802,7 +852,7 @@ pub fn doctor(ctx: &Ctx) -> Res {
                         warn(&format!(
                             "{} is not readable by this user -- the container is probably \
                              running without --user, which breaks quota monitoring",
-                            repo.display()
+                            shown_under(&mnt, &repo)
                         ));
                         problems += 1;
                         break;
@@ -818,7 +868,7 @@ pub fn doctor(ctx: &Ctx) -> Res {
     // An admin at 1001 chowning grants to 1001 while the service unit starts
     // rest-server as PB_UID=1000 gets EACCES on every write, 500s on the peer's
     // side, and a clean bill of health from every host command.
-    if let Ok(entries) = std::fs::read_dir(ctx.mnt()) {
+    if let Ok(entries) = std::fs::read_dir(&mnt) {
         let want = numeric_env(&["PB_UID"])?;
         for grant in entries.filter_map(Result::ok).map(|e| e.path()) {
             if !grant.is_dir() {
@@ -834,14 +884,14 @@ pub fn doctor(ctx: &Ctx) -> Res {
                 warn(&format!(
                     "{} is owned by uid {owner}, but PB_UID says the server runs as \
                      {w}.\n       The server will not be able to write to it.",
-                    grant.display()
+                    shown_under(&mnt, &grant)
                 ));
                 problems += 1;
             } else if want.is_none() {
                 ctx.say(&format!(
                     "{} is owned by uid {owner}; the server must run as that uid \
                      (PB_UID)",
-                    grant.display()
+                    shown_under(&mnt, &grant)
                 ));
             }
         }
@@ -890,6 +940,56 @@ fn first_numeric<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_directory_name_from_the_grant_root_cannot_repaint_the_terminal() {
+        // mnt/ is owned by the PB_UID account and bind-mounted into the
+        // container, so its entry names are chosen by whoever holds either. A
+        // name carrying ESC/CR/LF erased the row above it in `host list` and
+        // forged an `ok` line in `host guard` on the operator's terminal.
+        let hostile = [
+            "zz\x1b[1A\x1b[2K\r  ok       /srv/peerbackup/mnt/alice\x1b[K",
+            "zzz\nFORGED LINE FROM A DIRECTORY NAME",
+            "zz\x1b]0;title\x07\u{2028}x",
+            "a b",
+            "..",
+        ];
+        for name in hostile {
+            let s = shown(OsStr::new(name));
+            assert!(
+                !s.chars()
+                    .any(|c| c.is_control() || ('\u{80}'..='\u{9f}').contains(&c)),
+                "control byte survived in {s:?}"
+            );
+            assert!(!s.contains('\n') && !s.contains('\r'), "{s:?}");
+            assert!(s.starts_with("<unexpected entry "), "{s:?}");
+            assert!(s.is_ascii(), "non-ASCII must be escaped too: {s:?}");
+        }
+        // A real peer name is shown as it is, so the table is unchanged for
+        // every grant this program created.
+        for ok in ["alice", "bob-2", "a_b", "A1"] {
+            assert_eq!(shown(OsStr::new(ok)), ok);
+        }
+    }
+
+    #[test]
+    fn paths_under_the_grant_root_escape_only_the_listed_components() {
+        let mnt = Path::new("/srv/peerbackup/mnt");
+        assert_eq!(
+            shown_under(mnt, &mnt.join("alice")),
+            "/srv/peerbackup/mnt/alice"
+        );
+        let planted = mnt.join("zz\x1b[2K\rok").join("repo\n");
+        let s = shown_under(mnt, &planted);
+        assert!(
+            s.starts_with("/srv/peerbackup/mnt/<unexpected entry "),
+            "{s}"
+        );
+        assert!(!s.chars().any(char::is_control), "{s:?}");
+        // A path that is not under mnt at all is still never printed raw.
+        let s = shown_under(mnt, Path::new("/etc/\x1b[2Kshadow"));
+        assert!(!s.chars().any(char::is_control), "{s:?}");
+    }
 
     #[test]
     fn a_planted_symlink_cannot_become_a_mount_point() {
