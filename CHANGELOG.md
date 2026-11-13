@@ -14,6 +14,12 @@ minor version (0.x.0) may include breaking changes; patch versions never do.
   the server runs as, so a name carrying terminal control sequences could
   erase or forge rows in the output the operator reads. Valid peer names print
   unchanged; anything else is shown escaped and flagged.
+- `host adduser` (and `host quickstart`) confirm with `docker port` that the
+  server container publishes its port on this machine's loopback address
+  before sending the new login password there to verify it. Previously any
+  local process holding that port (compose bound to one interface, or a
+  PB_PORT mismatch) received the credential in clear and could answer in a
+  way that reported the login as verified.
 
 ## [0.1.0] - 2026-10-08
 
