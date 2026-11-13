@@ -14,6 +14,12 @@ minor version (0.x.0) may include breaking changes; patch versions never do.
   orphans the client's history, so a standing failed verdict stays visible and
   `verify` keeps the baseline it uses to notice a dropped snapshot. Records
   written under the old identity are still matched.
+- `host adduser` (and `host quickstart`) confirm with `docker port` that the
+  server container publishes its port on this machine's loopback address
+  before sending the new login password there to verify it. Previously any
+  local process holding that port (compose bound to one interface, or a
+  PB_PORT mismatch) received the credential in clear and could answer in a
+  way that reported the login as verified.
 
 ## [0.1.0] - 2026-10-08
 
