@@ -9,6 +9,11 @@ minor version (0.x.0) may include breaking changes; patch versions never do.
 
 ### Security
 
+- The host commands fold terminal control characters out of subprocess output
+  before printing it: the stderr of commands run inside the server container
+  by `host adduser`, the container log shown when `host quickstart` fails, and
+  the stderr embedded in command errors. A compromised container could
+  otherwise erase or forge lines on the operator's terminal.
 - `host list`, `host guard` and `host doctor` escape directory names read from
   the grant root before printing them. That directory is owned by the account
   the server runs as, so a name carrying terminal control sequences could

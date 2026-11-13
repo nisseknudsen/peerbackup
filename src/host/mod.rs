@@ -244,7 +244,10 @@ impl Ctx {
             if stderr.trim().is_empty() {
                 String::new()
             } else {
-                format!(": {}", stderr.trim())
+                // A tool's stderr is not ours to trust: `docker exec` relays
+                // text from inside the container. Folded before it can reach
+                // the terminal through the error path.
+                format!(": {}", crate::redact::message(stderr.trim()))
             }
         ))
     }
@@ -265,8 +268,18 @@ impl Ctx {
     }
 }
 
+/// Print a warning, with anything that could move the cursor folded out.
+///
+/// Subprocess output reaches this: the stderr of `docker exec ... htpasswd`,
+/// which runs inside the internet-facing container as the container's own uid,
+/// so a compromised server can choose its bytes. Printed raw, `ESC[1A ESC[2K`
+/// erased the real `generated password` line and painted a forged `verified`
+/// line in its place while the command exited 1. The client side folds every
+/// piece of peer-influenced text before printing it (`redact`); this is the
+/// host side's one shared sink, so the fold lives here. Newlines survive, as
+/// they do for restic's multi-line errors.
 pub fn warn(msg: &str) {
-    eprintln!("\x1b[33mwarn:\x1b[0m {msg}");
+    eprintln!("\x1b[33mwarn:\x1b[0m {}", crate::redact::message(msg));
 }
 
 pub fn is_root() -> bool {
@@ -479,6 +492,22 @@ mod tests {
             quiet: true,
             force: false,
         }
+    }
+
+    #[test]
+    fn a_failing_commands_stderr_cannot_carry_control_sequences_into_the_error() {
+        // `docker exec` relays stderr from inside the container, and the error
+        // string ends up on the operator's terminal. A cursor-up plus line-erase
+        // in it rewrote the lines above.
+        let e = ctx(false)
+            .run("sh", &["-c", "printf 'nope\\033[2K\\rforged' >&2; exit 3"])
+            .unwrap_err();
+        assert!(
+            !e.chars().any(|c| c.is_control() && c != '\n'),
+            "control characters survived: {e:?}"
+        );
+        assert!(e.contains("nope") && e.contains("forged"), "{e}");
+        assert!(e.contains("exit 3"), "{e}");
     }
 
     #[test]
