@@ -659,15 +659,33 @@ pub fn compose(ctx: &Ctx, up: bool) -> Res {
 
 // ------------------------------------------------------------------- plumbing
 
+/// Whether this process can create a file in `path`, found out by creating one.
+///
+/// The directory is the one handed to the server account, and quickstart gets
+/// run under sudo out of habit, so this is root creating a file somewhere a
+/// less trusted account can write. The probe used to be named after the pid
+/// and written with `fs::write`, which is `O_CREAT|O_TRUNC` and follows a
+/// symlink: a link planted at that name, one per plausible pid, had root
+/// truncate whatever it pointed at. So the name is random and the file is
+/// opened `O_EXCL|O_NOFOLLOW`, the same way `write_private` opens its temp
+/// file. Anything already at the name is refused, never written through.
 fn writable(path: &std::path::Path) -> bool {
-    let probe = path.join(format!(".peerbackup-write-test-{}", std::process::id()));
-    match std::fs::write(&probe, b"") {
-        Ok(()) => {
-            let _ = std::fs::remove_file(&probe);
-            true
+    for _ in 0..8 {
+        let Ok(token) = random_token(16) else {
+            return false;
+        };
+        let probe = path.join(format!(".peerbackup-write-test-{token}"));
+        match crate::config::open_exclusive_private(&probe) {
+            Ok(_) => {
+                // `remove_file` unlinks the name and does not follow a link.
+                let _ = std::fs::remove_file(&probe);
+                return true;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(_) => return false,
         }
-        Err(_) => false,
     }
+    false
 }
 
 fn docker_ok() -> bool {
@@ -881,6 +899,29 @@ mod tests {
         ] {
             assert_eq!(check_password(good).unwrap(), good);
         }
+    }
+
+    #[test]
+    fn the_write_probe_does_not_write_through_a_link_at_the_old_pid_name() {
+        let d = std::env::temp_dir().join(format!("pb-w-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let victim = d.join("victim");
+        std::fs::write(&victim, b"keep me").unwrap();
+        let planted = d.join(format!(".peerbackup-write-test-{}", std::process::id()));
+        std::os::unix::fs::symlink(&victim, &planted).unwrap();
+
+        assert!(writable(&d));
+        assert_eq!(
+            std::fs::read(&victim).unwrap(),
+            b"keep me",
+            "the probe truncated the file a planted link pointed at"
+        );
+        assert!(
+            planted.symlink_metadata().is_ok(),
+            "the probe must leave a name it did not create alone"
+        );
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

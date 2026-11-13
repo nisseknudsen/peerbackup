@@ -421,7 +421,7 @@ pub fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
 /// `create_new` is `O_CREAT|O_EXCL`: an existing entry, symlink or not, fails
 /// with `AlreadyExists` instead of being opened. `O_NOFOLLOW` is belt and
 /// braces for the same case, so the guarantee does not rest on one flag.
-fn open_exclusive_private(path: &Path) -> io::Result<fs::File> {
+pub(crate) fn open_exclusive_private(path: &Path) -> io::Result<fs::File> {
     fs::OpenOptions::new()
         .write(true)
         .create_new(true)
