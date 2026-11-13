@@ -14,6 +14,11 @@ minor version (0.x.0) may include breaking changes; patch versions never do.
   by `host adduser`, the container log shown when `host quickstart` fails, and
   the stderr embedded in command errors. A compromised container could
   otherwise erase or forge lines on the operator's terminal.
+- Evidence records identify a repository by its URL without the login
+  password. A password rotation on the host (`host adduser --force`) no longer
+  orphans the client's history, so a standing failed verdict stays visible and
+  `verify` keeps the baseline it uses to notice a dropped snapshot. Records
+  written under the old identity are still matched.
 - `recovery export --out` (and every other private write) now creates its
   temp file with a random name, exclusively and without following symlinks.
   The old `<name>.tmp.<pid>` name was predictable and the open followed a
