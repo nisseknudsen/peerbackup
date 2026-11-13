@@ -67,8 +67,12 @@ restart is rejected with `401`; `adduser` restarts the server and checks the new
 login before returning. Restarting interrupts any upload in progress; peers
 retry, but a large first backup has to resume.
 
-`host adduser <peer> <password>` sets a password you choose instead of
-generating one. For a peer that already has a login, `adduser` refuses unless
+`host adduser <peer> --password-stdin` sets a password you choose instead of
+generating one: it prompts without echo on a terminal, and reads one line from
+stdin otherwise (`... --password-stdin < password.txt`). The older
+`host adduser <peer> <password>` form still works but warns, because a password
+given as an argument is readable by every local user in `ps` while the command
+runs and stays in your shell history. For a peer that already has a login, `adduser` refuses unless
 you pass `--force`, which replaces their password; `quickstart` starts the
 server if needed, says the login exists, and leaves it alone.
 
