@@ -664,7 +664,7 @@ fn backup_in<E: BackupEngine>(
                     Verdict::Good,
                     None,
                     None,
-                    Some(snap.id.0.clone()),
+                    Some(snap.id.0),
                 )?;
             }
             Err(e) => {
