@@ -96,6 +96,37 @@ pub fn url_with_password(u: &str, password: &str) -> String {
     format!("{prefix}{user}:{escaped}{host}{rest}")
 }
 
+/// The URL with its password removed outright: scheme, user, host, port and
+/// path, nothing secret.
+///
+/// This is the stable identity of a repository. The password is the one part
+/// a host can change under the client -- `host adduser --force` rotates it,
+/// and the client must follow or its backups stop -- so anything keyed on the
+/// full URL forks the moment that happens. See `state::repo_id`.
+///
+/// Bounded to the authority segment like [`url`], so an `@` in the path is left
+/// alone. A URL with a username and no password, or no credentials at all, is
+/// returned unchanged. Slicing is safe despite the lint: `at` comes from
+/// `rfind`, which only ever returns a character boundary.
+#[allow(clippy::string_slice)]
+#[must_use]
+pub fn url_without_password(u: &str) -> String {
+    let Some((prefix, authority, rest)) = split_authority(u) else {
+        return u.to_owned();
+    };
+    let Some(at) = authority.rfind('@') else {
+        return u.to_owned();
+    };
+    let credentials = &authority[..at];
+    let Some(user) = credentials.split(':').next() else {
+        return u.to_owned();
+    };
+    if credentials.len() == user.len() {
+        return u.to_owned();
+    }
+    format!("{prefix}{user}{}{rest}", &authority[at..])
+}
+
 /// Hide the password in a repository URL before printing it.
 ///
 /// The separator is the *last* `@` in the authority segment, not the first.
