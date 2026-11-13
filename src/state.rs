@@ -89,7 +89,7 @@ impl Canary {
             src.read_exact(&mut buf)?;
             fs::write(&path, &buf)?;
             files.push(CanaryFile {
-                path: path.clone(),
+                path,
                 sha256: sha256_bytes(&buf),
             });
         }

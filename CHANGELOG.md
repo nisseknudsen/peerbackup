@@ -14,6 +14,12 @@ minor version (0.x.0) may include breaking changes; patch versions never do.
   by `host adduser`, the container log shown when `host quickstart` fails, and
   the stderr embedded in command errors. A compromised container could
   otherwise erase or forge lines on the operator's terminal.
+- `host adduser` (and `host quickstart`) confirm with `docker port` that the
+  server container publishes its port on this machine's loopback address
+  before sending the new login password there to verify it. Previously any
+  local process holding that port (compose bound to one interface, or a
+  PB_PORT mismatch) received the credential in clear and could answer in a
+  way that reported the login as verified.
 
 ## [0.1.0] - 2026-10-08
 
