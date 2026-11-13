@@ -14,6 +14,11 @@ minor version (0.x.0) may include breaking changes; patch versions never do.
   by `host adduser`, the container log shown when `host quickstart` fails, and
   the stderr embedded in command errors. A compromised container could
   otherwise erase or forge lines on the operator's terminal.
+- `host list`, `host guard` and `host doctor` escape directory names read from
+  the grant root before printing them. That directory is owned by the account
+  the server runs as, so a name carrying terminal control sequences could
+  erase or forge rows in the output the operator reads. Valid peer names print
+  unchanged; anything else is shown escaped and flagged.
 - Evidence records identify a repository by its URL without the login
   password. A password rotation on the host (`host adduser --force`) no longer
   orphans the client's history, so a standing failed verdict stays visible and
